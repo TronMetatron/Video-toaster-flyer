@@ -172,7 +172,7 @@ pub(super) fn line_fetch_plan_for_word(
     let mut control = base_control;
     let mut segment_idx = 0usize;
     for hpos in u32::from(BITPLANE_DDF_HARD_START)..=BITPLANE_FETCH_HARD_END {
-        let x = ((hpos as i32 - COPPER_WAIT_HPOS_FB0).max(0) as usize * 4).min(FB_WIDTH);
+        let x = ((hpos as i32 - copper_wait_hpos_fb0()).max(0) as usize * 4).min(FB_WIDTH);
         while segment_idx < control_segments.len() && control_segments[segment_idx].x <= x {
             control = control_segments[segment_idx].control;
             segment_idx += 1;
@@ -211,7 +211,7 @@ pub(super) fn line_fetch_plans_for_line(
     let mut control = base_control;
     let mut segment_idx = 0usize;
     for hpos in u32::from(BITPLANE_DDF_HARD_START)..=BITPLANE_FETCH_HARD_END {
-        let x = ((hpos as i32 - COPPER_WAIT_HPOS_FB0).max(0) as usize * 4).min(FB_WIDTH);
+        let x = ((hpos as i32 - copper_wait_hpos_fb0()).max(0) as usize * 4).min(FB_WIDTH);
         while segment_idx < control_segments.len() && control_segments[segment_idx].x <= x {
             control = control_segments[segment_idx].control;
             segment_idx += 1;
