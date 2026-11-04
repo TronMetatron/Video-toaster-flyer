@@ -687,10 +687,52 @@ pinned against the real 4.2 switcher are:
   with the CIA access's E-clock slip either way.
 
 The emulated 4.2 switcher passes its read-back self-test and calibration
-with this and comes up on its main screen. Not modelled yet: the extended
-headers' meaning beyond `OBR` (input muxes, keyer, mattes), the framestore
-as a video *output* (the Toaster's program output is not shown anywhere),
-video inputs, and the Flyer.
+with this and comes up on its main screen.
+
+#### The video side (`toaster/regs.rs`, `video.rs`, `composite.rs`, `media.rs`)
+
+The extended headers are latched registers (`Regs`), set to the switcher's
+own start-up values (`VTSetUp`) at power-on. The outputs follow the
+switcher's model of the card: one A/B fader. Program = A·(1−k) + B·k with A
+the `AM` mux and B the `BM` mux (EH2), Preview = the `PV` mux (EH1; position
+7 = a copy of Program). Mux positions 0-3 are the inputs, 4/5 framestore
+banks 0/1 played back ("DV1", "DV2"), 6 the encoder (the matte generator
+with EH1 `MATTE`, else the Amiga picture), 7 Program/MONO. The fader's k
+comes from EH4 `CDS`: the constant `CD` for cuts, fades and the T-bar (the
+switcher rewrites CD every field during an AUTO), a luma key on the `LK`
+source against EH68's clip, or per-pixel codes in the Amiga's AGA low
+nibbles for wipes and alpha keys (`DIB`: b1b0, `DIBGR`: b1b0g1r1 scaled by
+CD) and the genlock transparency for `PIXELSW`. The matte colour is EH3's
+MA/MB/MP code: the eight BKG colours exactly, others by the generator's
+model (luma from (MA+MB)/2, chroma from |MA−MB|, hue 11.25° per MP step).
+
+`G` bit 15 on a non-header line is `CERB`, "record this line". In write
+mode (EH0 `WERB` set, `ABSE` clear) the line's data is the Amiga's, as
+above; otherwise the card digitises the `IS` input into bank `OBR`: every
+field while live (`ABSE` set), four fields for a grab. Live, bank 0 plays
+the input straight through.
+
+Framestore bytes are 4fsc NTSC composite samples on the I and Q axes with a
+subcarrier-complemented second copy (`composite.rs`, measured off the
+`ColorBars` framestore: blanking 60, black 70, white 200, line-to-line
+subcarrier inversion), decoded to RGB by summing and differencing the two
+copies. Pictures are 752 x 480 from card pixel 12 and framestore line 1,
+the window the switcher's framestore loads use. Inputs are encoded the
+same way when digitised, so a grab reads back to the switcher as real
+samples.
+
+Inputs come from the host folder (`media.rs`): a worker thread per input
+plays the folder's files (stills decoded with the `image` crate, video
+through ffmpeg) into a two-frame channel, one frame taken per emulated
+frame. The outputs are published per frame into `videoslot::CardOutput`s,
+which the window layer shows as monitor windows (`card_monitors.rs`) and
+which record themselves (ZMBV AVI with a silent track, via `recorder.rs`)
+when asked.
+
+Not modelled yet: line-addressed framestore playback (`LINP` off: DVE and
+LUT effects), `QUAF`/`TRANSQUAD` digital effects, PED/GAIN/phase trims,
+the blanking interval of digitised lines (the AutoHue camera test reads the
+colour burst there), and the Flyer.
 
 ## Interlace (`video/deinterlace.rs`)
 

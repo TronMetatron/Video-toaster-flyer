@@ -893,22 +893,50 @@ that supplies its own sync sets this for as long as it is fitted.
 
 ```toml
 [video_slot]
-card = "toaster"   # "none" (default) or "toaster"
+card = "toaster"          # "none" (default) or "toaster"
+media = "D:/Toster/Amiga Toaster Files"   # the card's host folder
+# monitors = true         # Preview and Program monitor windows (default true)
+# preview_overlay = false # the switcher interface over Preview (default false)
 ```
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
 A4000's video slot: a card that watches the digital RGB output line by line
 and answers on the parallel port, as the real one does. The NewTek switcher
-(Toaster 4.x) then starts and passes its own card tests; the Toaster software
-and the Kickstart ROM are not included and must be supplied. The card
-supplies genlock sync while fitted (see `[chipset] genlock`). What the
-emulation covers so far -- the line-header protocol, the framestore, the
-read-back used by the switcher's self-test and calibration -- is described
-in [](../internals/video) and in `src/toaster.rs`; there is no video input
-yet, so the switcher's picture areas stay empty and AutoHue asks for a
-source on input 1 (Cancel it). `COPPERLINE_DIAG_TOASTER=1` logs the card's
-decoding of what the switcher draws; `=fields` also dumps one field's line
-headers in forty.
+(Toaster 4.x) then starts, passes its own card tests and runs; the Toaster
+software and the Kickstart ROM are not included and must be supplied. The
+card supplies genlock sync while fitted (see `[chipset] genlock`).
+
+`media` is the folder that stands in for the card's connectors (default:
+`Amiga Toaster Files` in Copperline's own folder). It is created with these
+subfolders on first use:
+
+- `Input 1` .. `Input 4`: what is plugged into each video input. Drop
+  video files or still pictures in; several play one after another in name
+  order and loop, and an empty folder is an unplugged input. Changes are
+  picked up while the machine runs. Stills (PNG, JPEG, BMP) need nothing
+  else; video files are decoded by ffmpeg, found as `ffmpeg.exe` (or
+  `ffmpeg`) in the folder itself, beside Copperline, or on the `PATH`.
+- `Output`: recordings of the Program output (AVI, see below).
+- `Flyer`: clips for the Video Flyer (not emulated yet).
+
+With `monitors` on, the card's two outputs open as windows of their own,
+each on a picture monitor: **Preview** and **Program**. Closing one only
+hides it; **Recording > Show Toaster Monitors** brings both back. In the
+Program window, `R` or the monitor's power button starts and stops
+recording the Program output into `Output` (the power lamp lights red while
+it runs); **Recording > Record Toaster Program** does the same. The monitor
+artwork can be replaced by a `monitor.png` in the media folder: the tube is
+found as the area around the picture's centre enclosed by a near-black gap.
+
+`preview_overlay` lets the switcher draw its interface over the Preview
+output when its own preference asks for it, as a one-monitor Toaster setup
+does. It is off by default because the interface has a window of its own.
+
+Headless screenshots (`--screenshot-after`) also save each output on its
+monitor beside the capture (`shot-preview.png`, `shot-program.png`).
+`COPPERLINE_DIAG_TOASTER=1` logs what the card decodes and the bus state it
+outputs; `=fields` also dumps one field's line headers in forty. How the
+card works is described in [](../internals/video) and in `src/toaster/`.
 
 ## `[display]`
 

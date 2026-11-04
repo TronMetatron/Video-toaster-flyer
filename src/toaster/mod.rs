@@ -54,6 +54,12 @@
 //! quad number on the wire; and ten quads of read pipeline put each of
 //! the `HS.default` read positions inside its label run.
 
+pub mod composite;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod media;
+pub mod regs;
+pub mod video;
+
 use crate::videoslot::{BeamPos, FieldPixels, LiveField, VideoSlotDevice};
 
 /// Pixels per framestore line (the AGA switcher's 768-wide bitmap).
@@ -84,6 +90,101 @@ const PIXEL0_LORES: i32 = 0x5A;
 /// synchronised) happens up to five clocks after the beam position it
 /// waited for; ten quads keeps at least four quads of margin either way.
 const READ_PIPELINE_PIXELS: i64 = 40;
+
+/// The extended headers as the switcher sets them up (`VTSetUp`), so the
+/// card shows something sensible before it has been told otherwise.
+const ELH_DEFAULTS: [(usize, Header); 10] = [
+    (
+        0,
+        Header {
+            r: 0x8E00,
+            g: 0x0500,
+            b: 0x0100,
+            i: 0x0F00,
+        },
+    ),
+    (
+        1,
+        Header {
+            r: 0x4800,
+            g: 0x0000,
+            b: 0x0F00,
+            i: 0x0F00,
+        },
+    ),
+    (
+        2,
+        Header {
+            r: 0xA000,
+            g: 0x0000,
+            b: 0x0000,
+            i: 0x0F00,
+        },
+    ),
+    (
+        3,
+        Header {
+            r: 0x6000,
+            g: 0x0000,
+            b: 0x0000,
+            i: 0x0F00,
+        },
+    ),
+    (
+        4,
+        Header {
+            r: 0x9F00,
+            g: 0x0F00,
+            b: 0x0700,
+            i: 0x0F00,
+        },
+    ),
+    (
+        5,
+        Header {
+            r: 0x5800,
+            g: 0x0800,
+            b: 0x0000,
+            i: 0x0F00,
+        },
+    ),
+    (
+        ELH_EH6_BASE + 8,
+        Header {
+            r: 0xB000,
+            g: 0x0800,
+            b: 0x0800,
+            i: 0x0F00,
+        },
+    ),
+    (
+        ELH_EH6_BASE + 9,
+        Header {
+            r: 0xB000,
+            g: 0x0800,
+            b: 0x0900,
+            i: 0x0F00,
+        },
+    ),
+    (
+        ELH_EH6_BASE + 0xA,
+        Header {
+            r: 0xB000,
+            g: 0x0800,
+            b: 0x0A00,
+            i: 0x0F00,
+        },
+    ),
+    (
+        ELH_EH6_BASE + 0xB,
+        Header {
+            r: 0xB000,
+            g: 0x0800,
+            b: 0x0B00,
+            i: 0x0F00,
+        },
+    ),
+];
 
 /// Number of extended line headers: EH0-EH5, EH60-EH6F, EH7.
 const ELH_COUNT: usize = 23;
@@ -135,7 +236,8 @@ impl Header {
             0b0110 => 3,
             0b1001 => 4,
             0b0101 => 5,
-            0b1011 => ELH_EH6_BASE + usize::from((self.r >> 8) & 0xF),
+            // EH6's page is in the B word (`VTI_E6x` = x << 8 there).
+            0b1011 => ELH_EH6_BASE + usize::from((self.b >> 8) & 0xF),
             0b0111 => ELH_EH7,
             _ => return None,
         };
@@ -196,9 +298,41 @@ pub struct Stats {
     pub port_bytes: u64,
 }
 
+/// The card's two framestore banks: `[bank][copy][line][pixel]` composite
+/// samples, the normal and the complemented copy of every line.
+pub struct FrameStore {
+    data: Vec<u8>,
+}
+
+impl FrameStore {
+    fn new() -> Self {
+        Self {
+            data: vec![0; BANKS * SIGNALS * LINES * LINE_PIXELS],
+        }
+    }
+
+    fn index(bank: usize, complemented: bool, line: usize, pixel: usize) -> usize {
+        ((bank * SIGNALS + usize::from(complemented)) * LINES + line) * LINE_PIXELS + pixel
+    }
+
+    /// One line of one copy of one bank.
+    pub fn line(&self, bank: usize, complemented: bool, line: usize) -> &[u8] {
+        let i = Self::index(bank & 1, complemented, line % LINES, 0);
+        &self.data[i..i + LINE_PIXELS]
+    }
+
+    pub fn line_mut(&mut self, bank: usize, complemented: bool, line: usize) -> &mut [u8] {
+        let i = Self::index(bank & 1, complemented, line % LINES, 0);
+        &mut self.data[i..i + LINE_PIXELS]
+    }
+}
+
 pub struct Toaster {
-    /// `[bank][signal][line][pixel]`.
-    frame_store: Vec<u8>,
+    frame_store: FrameStore,
+    video: video::Video,
+    /// Lines this field that asked the card to record its input (`CERB`
+    /// outside a framestore write).
+    record_lines: u32,
     /// Raw extended line headers, last value written.
     elh: [Header; ELH_COUNT],
     /// Seen a valid extended header: the switcher is driving the card.
@@ -210,6 +344,10 @@ pub struct Toaster {
     diag: bool,
     diag_lines_logged: u32,
     diag_fields: bool,
+    diag_outputs: String,
+    /// Show the switcher's interface over Preview when it asks to
+    /// (`USERON`, the Toaster's "preview overlay" for one-monitor setups).
+    preview_overlay: bool,
 }
 
 impl Default for Toaster {
@@ -219,10 +357,24 @@ impl Default for Toaster {
 }
 
 impl Toaster {
+    /// A card with no host folder: no inputs, outputs not recorded to a
+    /// folder of their own.
     pub fn new() -> Self {
+        Self::with_media(None)
+    }
+
+    /// A card whose connectors are the folders under `media_root`
+    /// (created if missing): see [`media`].
+    pub fn with_media(media_root: Option<std::path::PathBuf>) -> Self {
+        let mut elh = [Header::default(); ELH_COUNT];
+        for (index, header) in ELH_DEFAULTS {
+            elh[index] = header;
+        }
         Self {
-            frame_store: vec![0; BANKS * SIGNALS * LINES * LINE_PIXELS],
-            elh: [Header::default(); ELH_COUNT],
+            frame_store: FrameStore::new(),
+            video: video::Video::new(media_root),
+            record_lines: 0,
+            elh,
             active: false,
             scanned: None,
             stats: Stats::default(),
@@ -230,6 +382,8 @@ impl Toaster {
             diag_lines_logged: 0,
             diag_fields: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER")
                 .is_some_and(|v| v == "fields"),
+            diag_outputs: String::new(),
+            preview_overlay: false,
         }
     }
 
@@ -241,8 +395,16 @@ impl Toaster {
         self.elh[index]
     }
 
-    fn store_index(bank: usize, complemented: bool, line: usize, pixel: usize) -> usize {
-        ((bank * SIGNALS + usize::from(complemented)) * LINES + line) * LINE_PIXELS + pixel
+    /// Show the switcher's interface over the Preview output when it asks
+    /// for that (its "preview overlay", meant for a single composite
+    /// monitor). Off by default: the interface has a window of its own.
+    pub fn set_preview_overlay(&mut self, on: bool) {
+        self.preview_overlay = on;
+    }
+
+    /// The latched control registers.
+    pub fn regs(&self) -> regs::Regs<'_> {
+        regs::Regs { elh: &self.elh }
     }
 
     /// One framestore byte.
@@ -253,7 +415,7 @@ impl Toaster {
         line: usize,
         pixel: usize,
     ) -> u8 {
-        self.frame_store[Self::store_index(bank, complemented, line, pixel)]
+        self.frame_store.line(bank, complemented, line)[pixel]
     }
 
     /// Bank a write goes to: EH0 `OBR`.
@@ -308,8 +470,8 @@ impl Toaster {
         let bank = self.write_bank();
         let x0 = Self::pixel0_column(field);
         let step = field.canvas_scale as i64;
-        let base = Self::store_index(bank, complemented, line, 0);
-        for p in 0..LINE_PIXELS {
+        let store = self.frame_store.line_mut(bank, complemented, line);
+        for (p, byte) in store.iter_mut().enumerate() {
             let Ok(col) = usize::try_from(x0 + p as i64 * step) else {
                 continue;
             };
@@ -317,7 +479,6 @@ impl Toaster {
                 break;
             };
             let v = lines_of(pixel);
-            let byte = &mut self.frame_store[base + p];
             *byte = if high_nibble {
                 (*byte & 0x0F) | (v << 4)
             } else {
@@ -327,7 +488,7 @@ impl Toaster {
         self.stats.write_lines += 1;
         if self.diag && self.diag_lines_logged < 400 {
             self.diag_lines_logged += 1;
-            let bytes: Vec<u8> = (8..56).map(|p| self.frame_store[base + p]).collect();
+            let bytes: Vec<u8> = self.frame_store.line(bank, complemented, line)[8..56].to_vec();
             log::info!(
                 "toaster: write vpos={vpos} line={line} hi={high_nibble} comp={complemented} bank={bank} pixels 8.. {bytes:02X?}"
             );
@@ -357,12 +518,19 @@ impl Toaster {
                 self.elh[index] = header;
                 self.stats.elh_lines += 1;
             }
+            // `G` bit 15 is CERB, "record this line". In write mode (EH0
+            // WERB set, ABSE clear) what is recorded is the Amiga's data on
+            // the line; otherwise it is the input the IS mux selects: live
+            // video, or a grab.
             LineKind::Write {
                 line,
                 high_nibble,
                 complemented,
-            } if self.active => {
+            } if self.active && self.regs().write_mode() => {
                 self.store_write_line(field, vpos, line, high_nibble, complemented);
+            }
+            LineKind::Write { .. } if self.active => {
+                self.record_lines += 1;
             }
             LineKind::Read { .. } if self.active => {
                 self.stats.read_requests += 1;
@@ -450,6 +618,21 @@ impl VideoSlotDevice for Toaster {
             }
             self.take_line(field, vpos, header);
         }
+        // A field with CERB lines outside a framestore write digitised the
+        // IS input into the recording bank: live video, or a grab.
+        let record = std::mem::take(&mut self.record_lines) > 0;
+        self.video.set_live(record && self.regs().abse());
+        let frame_done = self.video.begin_field();
+        if frame_done {
+            self.produce_outputs(field);
+        }
+        if record {
+            self.record_input(field);
+        }
+    }
+
+    fn video_outputs(&self) -> Vec<std::sync::Arc<crate::videoslot::CardOutput>> {
+        self.video.outputs()
     }
 
     fn parallel_read(&mut self, live: &mut LiveField<'_>, _ddrb: u8) -> Option<u8> {
@@ -464,6 +647,155 @@ impl VideoSlotDevice for Toaster {
 }
 
 impl Toaster {
+    /// What mux position `mux` carries, as a picture, into `out`.
+    /// `role` says which mux it is: position 7 means a different thing on
+    /// each.
+    fn source_picture(
+        &mut self,
+        mux: regs::Mux,
+        role: video::Role,
+        field: &FieldPixels<'_>,
+        out: &mut [u32],
+    ) {
+        use regs::Mux;
+        match (mux, role) {
+            (Mux::Vid(n), _) => match self.video.input_picture(n) {
+                Some(p) => out.copy_from_slice(&p[..out.len()]),
+                None => out.fill(video::black()),
+            },
+            // On the IS mux, 4 is the Program output fed back and 5 the
+            // external input (DAC0).
+            (Mux::Dac(0), video::Role::Is) => self.video.last_program(out),
+            (Mux::Dac(1), video::Role::Is) => self.dac_picture(0, out),
+            (Mux::Dac(bank), _) => self.dac_picture(bank, out),
+            (Mux::Encoder, _) => {
+                if self.regs().matte() {
+                    let (ma, mb, mp) = self.regs().matte_code();
+                    if self.regs().snow() {
+                        self.video.snow(out);
+                    } else {
+                        out.fill(video::matte_colour(ma, mb, mp));
+                    }
+                } else {
+                    video::amiga_picture(field, Self::pixel0_column(field), out);
+                }
+            }
+            // MONO: the luminance of the LK source.
+            (Mux::Seven, video::Role::Fader | video::Role::Is) => {
+                let lk = self.regs().lk();
+                if lk == Mux::Seven {
+                    out.fill(video::black());
+                } else {
+                    self.source_picture(lk, video::Role::Key, field, out);
+                    video::to_mono(out);
+                }
+            }
+            (Mux::Seven, _) => out.fill(video::black()),
+        }
+    }
+
+    /// Framestore bank playback; bank 0 shows the live input while the
+    /// card is digitising it.
+    fn dac_picture(&mut self, bank: usize, out: &mut [u32]) {
+        if bank == 0 && self.video.live() {
+            let is = self.regs().is();
+            if let regs::Mux::Vid(n) = is {
+                match self.video.input_picture(n) {
+                    Some(p) => out.copy_from_slice(&p[..out.len()]),
+                    None => out.fill(video::black()),
+                }
+                return;
+            }
+        }
+        let pic = self.video.framestore_picture(&self.frame_store, bank);
+        out.copy_from_slice(&pic[..out.len()]);
+    }
+
+    /// Compose and publish one frame of the Program and Preview outputs.
+    fn produce_outputs(&mut self, field: &FieldPixels<'_>) {
+        let (am, bm, pv) = (self.regs().am(), self.regs().bm(), self.regs().pv());
+        let n = video::PICTURE_W * video::PICTURE_H;
+        let mut a = self.video.scratch();
+        self.source_picture(am, video::Role::Fader, field, &mut a);
+        let mut program = vec![video::black(); n];
+        if bm == am {
+            program.copy_from_slice(&a);
+        } else {
+            let mut b = vec![video::black(); n];
+            self.source_picture(bm, video::Role::Fader, field, &mut b);
+            let key = self.fader_key(field);
+            video::mix(&a, &b, &key, &mut program);
+        }
+        let mut preview = vec![video::black(); n];
+        if pv == regs::Mux::Seven {
+            preview.copy_from_slice(&program);
+        } else {
+            self.source_picture(pv, video::Role::Preview, field, &mut preview);
+        }
+        if self.preview_overlay && self.regs().useron() {
+            video::overlay_interface(field, Self::pixel0_column(field), &mut preview);
+        }
+        if self.diag {
+            let r = self.regs();
+            let state = format!(
+                "AM={:?} BM={:?} PV={:?} IS={:?} LK={:?} CDS={:?} CD={} matte={} {:?} live={} OBR={}",
+                r.am(),
+                r.bm(),
+                r.pv(),
+                r.is(),
+                r.lk(),
+                r.cds(),
+                r.cd(),
+                r.matte(),
+                r.matte_code(),
+                self.video.live(),
+                r.obr()
+            );
+            if state != self.diag_outputs {
+                log::info!("toaster: outputs {state}");
+                self.diag_outputs = state;
+            }
+        }
+        self.video.publish(&program, &preview);
+        self.video.give_back(a);
+    }
+
+    /// The fader's mix, per picture pixel (0 = A, 255 = B).
+    fn fader_key(&mut self, field: &FieldPixels<'_>) -> video::Key {
+        let cd = self.regs().cd();
+        match self.regs().cds() {
+            regs::Cds::Cd | regs::Cds::Quaf | regs::Cds::TransQuad | regs::Cds::RgQuad => {
+                video::Key::Flat(cd)
+            }
+            regs::Cds::LumKey => {
+                let lk = self.regs().lk();
+                let mut src = vec![video::black(); video::PICTURE_W * video::PICTURE_H];
+                self.source_picture(lk, video::Role::Key, field, &mut src);
+                video::Key::Map(video::luma_key(
+                    &src,
+                    self.regs().lka(),
+                    self.regs().no_key_invert(),
+                ))
+            }
+            mode => video::Key::Map(video::amiga_key(
+                field,
+                Self::pixel0_column(field),
+                mode,
+                cd,
+            )),
+        }
+    }
+
+    /// Digitise the IS input into the recording bank (OBR).
+    fn record_input(&mut self, field: &FieldPixels<'_>) {
+        let is = self.regs().is();
+        let bank = usize::from(self.regs().obr());
+        let mut pic = vec![video::black(); video::PICTURE_W * video::PICTURE_H];
+        self.source_picture(is, video::Role::Is, field, &mut pic);
+        video::Video::grab(&mut self.frame_store, bank, &pic);
+        self.video.invalidate(bank);
+    }
+
     /// The byte on the parallel port while the beam is at `beam`, from the
     /// line's rendered pixels: on a read-request line, the framestore byte
     /// the quad label under the beam (less the read pipeline) asks for.
@@ -776,7 +1108,8 @@ mod tests {
             h(0x8100, 0x0500, 0xFF00, 0xFF00).kind(),
             LineKind::Elh { index: 0 }
         );
-        assert_eq!(h(0xB300, 0, 0, 0).kind(), LineKind::Elh { index: 9 });
+        // EH6's page is in the B word: EH63.
+        assert_eq!(h(0xB000, 0, 0x0300, 0).kind(), LineKind::Elh { index: 9 });
         assert_eq!(h(0x7000, 0, 0, 0).kind(), LineKind::Elh { index: ELH_EH7 });
     }
 }
