@@ -34,6 +34,8 @@
 
 /// Beam position of an event, plus the deterministic power-on colour-clock
 /// timestamp.
+use std::sync::{Arc, Mutex};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BeamPos {
     pub vpos: u32,
@@ -257,5 +259,199 @@ pub trait VideoSlotDevice: Send {
     /// state run-ahead cannot rewind, so the default is no.
     fn runahead_safe(&self) -> bool {
         false
+    }
+
+    /// The card's own video outputs (the Toaster's Program and Preview),
+    /// for the host to show and record. Shared handles: the card publishes
+    /// into them as it produces frames.
+    fn video_outputs(&self) -> Vec<Arc<CardOutput>> {
+        Vec::new()
+    }
+}
+
+/// One video output of a card: the latest frame it produced, and an
+/// optional recording of every frame.
+///
+/// The card publishes on the emulation thread; the host reads the frame
+/// when it repaints and starts or stops recordings. Recording happens on
+/// publish, so a recording has every frame whatever the host's paint rate.
+pub struct CardOutput {
+    name: &'static str,
+    /// Display aspect ratio of a frame (width / height as shown).
+    aspect: f32,
+    /// Where [`CardOutput::start_recording_auto`] puts recordings.
+    record_dir: Option<std::path::PathBuf>,
+    state: Mutex<OutputState>,
+}
+
+#[derive(Default)]
+struct OutputState {
+    width: usize,
+    height: usize,
+    pixels: Vec<u32>,
+    serial: u64,
+    recorder: Option<crate::recorder::VideoRecorder>,
+    /// Fractional audio samples owed to the recording's silent track.
+    audio_carry: f64,
+}
+
+impl CardOutput {
+    pub fn new(
+        name: &'static str,
+        aspect: f32,
+        record_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            aspect,
+            record_dir,
+            state: Mutex::new(OutputState::default()),
+        })
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn aspect(&self) -> f32 {
+        self.aspect
+    }
+
+    /// The card's host folder, if it has one (where a recording goes, and
+    /// where a replacement monitor artwork may sit). Recordings go to its
+    /// `Output` subfolder.
+    pub fn media_root(&self) -> Option<std::path::PathBuf> {
+        self.record_dir
+            .as_ref()
+            .and_then(|d| d.parent())
+            .map(std::path::Path::to_path_buf)
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, OutputState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Publish a frame `seconds` long.
+    pub fn publish(&self, width: usize, height: usize, pixels: &[u32], seconds: f64) {
+        let mut st = self.state();
+        st.width = width;
+        st.height = height;
+        st.pixels.clear();
+        st.pixels
+            .extend_from_slice(&pixels[..(width * height).min(pixels.len())]);
+        st.serial = st.serial.wrapping_add(1);
+        if st.recorder.is_some() {
+            // The recorder times video against its audio track; a card
+            // output has no sound, so it gets silence of the frame's
+            // length.
+            let owed = st.audio_carry + seconds * f64::from(crate::audio::MIX_SAMPLE_RATE);
+            let n = owed.floor() as usize;
+            st.audio_carry = owed - n as f64;
+            let OutputState {
+                recorder, pixels, ..
+            } = &mut *st;
+            if let Some(rec) = recorder.as_mut() {
+                rec.push_audio(&vec![(0.0, 0.0); n]);
+                if let Err(e) = rec.push_frame(pixels) {
+                    log::warn!("{} recording stopped: {e:#}", self.name);
+                    let _ = rec.finish();
+                    *recorder = None;
+                }
+            }
+        }
+    }
+
+    /// The latest frame, if it is newer than `seen`: copied into `out`,
+    /// with its size and serial.
+    pub fn frame_since(&self, seen: u64, out: &mut Vec<u32>) -> Option<(usize, usize, u64)> {
+        let st = self.state();
+        if st.serial == seen || st.pixels.is_empty() {
+            return None;
+        }
+        out.clear();
+        out.extend_from_slice(&st.pixels);
+        Some((st.width, st.height, st.serial))
+    }
+
+    /// Start recording into `path` (an AVI) from the next frame.
+    pub fn start_recording(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let mut st = self.state();
+        if st.width == 0 || st.height == 0 {
+            anyhow::bail!("{} has not produced a frame yet", self.name);
+        }
+        if let Some(mut old) = st.recorder.take() {
+            let _ = old.finish();
+        }
+        st.recorder = Some(crate::recorder::VideoRecorder::create(
+            path, st.width, st.height,
+        )?);
+        st.audio_carry = 0.0;
+        Ok(())
+    }
+
+    /// Start recording into a new, time-stamped file in the output's
+    /// recording folder (the emulator's recordings folder without one).
+    pub fn start_recording_auto(&self) -> anyhow::Result<std::path::PathBuf> {
+        let name = format!("{}-{}.avi", self.name, crate::timestamp::compact_now());
+        let path = match &self.record_dir {
+            Some(dir) => dir.join(name),
+            None => crate::paths::recording_file().with_file_name(name),
+        };
+        self.start_recording(&path)?;
+        Ok(path)
+    }
+
+    /// Stop recording; the finished file's path.
+    pub fn stop_recording(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
+        let mut st = self.state();
+        let Some(mut rec) = st.recorder.take() else {
+            return Ok(None);
+        };
+        rec.finish()?;
+        Ok(Some(rec.path().to_path_buf()))
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.state().recorder.is_some()
+    }
+}
+
+impl Drop for CardOutput {
+    fn drop(&mut self) {
+        if let Some(mut rec) = self.state().recorder.take() {
+            let _ = rec.finish();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_card_output_records_every_published_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = CardOutput::new("Program", 4.0 / 3.0, Some(dir.path().join("Output")));
+        assert_eq!(out.media_root().as_deref(), Some(dir.path()));
+        // Nothing to record before the first frame.
+        assert!(out.start_recording_auto().is_err());
+        let frame = vec![u32::from_le_bytes([200, 30, 30, 255]); 16 * 12];
+        out.publish(16, 12, &frame, 1001.0 / 30000.0);
+        let path = out.start_recording_auto().unwrap();
+        assert!(out.is_recording());
+        for _ in 0..30 {
+            out.publish(16, 12, &frame, 1001.0 / 30000.0);
+        }
+        let saved = out.stop_recording().unwrap().unwrap();
+        assert_eq!(saved, path);
+        assert!(!out.is_recording());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"AVI ");
+        // Frames since the last read, and none when nothing is new.
+        let mut buf = Vec::new();
+        let (w, h, serial) = out.frame_since(0, &mut buf).unwrap();
+        assert_eq!((w, h, buf.len()), (16, 12, 192));
+        assert!(out.frame_since(serial, &mut buf).is_none());
     }
 }

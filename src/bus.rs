@@ -6695,6 +6695,15 @@ impl Bus {
         self.video_slot.as_deref_mut()
     }
 
+    /// The fitted video-slot card's own video outputs (none without a
+    /// card, or for a card that has none).
+    pub fn video_slot_outputs(&self) -> Vec<std::sync::Arc<crate::videoslot::CardOutput>> {
+        self.video_slot
+            .as_ref()
+            .map(|card| card.video_outputs())
+            .unwrap_or_default()
+    }
+
     /// Live in-progress renders the video-slot tap has performed.
     pub fn video_slot_live_renders(&self) -> u64 {
         self.video_slot_live.renders

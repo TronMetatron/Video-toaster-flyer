@@ -750,6 +750,19 @@ pub(crate) struct RawVideoSlot {
     /// `none` (default) or `toaster` (NewTek Video Toaster 4000).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) card: Option<String>,
+    /// The card's host folder (the Toaster's "Amiga Toaster Files": input,
+    /// output and Flyer folders). Default: `Amiga Toaster Files` in the
+    /// emulator's own folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) media: Option<String>,
+    /// Open a window per card video output (the Toaster's Preview and
+    /// Program monitors). Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) monitors: Option<bool>,
+    /// Let the Toaster put its interface over the Preview output when the
+    /// switcher asks (its preview-overlay preference). Default false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) preview_overlay: Option<bool>,
 }
 
 /// `[parallel]` peripheral selection for the Amiga Centronics parallel port.
