@@ -702,7 +702,12 @@ comes from EH4 `CDS`: the constant `CD` for cuts, fades and the T-bar (the
 switcher rewrites CD every field during an AUTO), a luma key on the `LK`
 source against EH68's clip, or per-pixel codes in the Amiga's AGA low
 nibbles for wipes and alpha keys (`DIB`: b1b0, `DIBGR`: b1b0g1r1 scaled by
-CD) and the genlock transparency for `PIXELSW`. The matte colour is EH3's
+CD) and the genlock transparency for `PIXELSW`. The animated wipes
+(`LatchAM`/`LatchBM` effects) set EH2's `AMWIPE`/`BMWIPE` with the bus at
+7: the bus then takes its source per pixel from the Amiga picture, a
+3-bit source number in the low nibbles (b2, r2, r1, the muxes' numbering)
+set by each pixel that carries the genlock T bit and held along the line
+until the next. The matte colour is EH3's
 MA/MB/MP code: the eight BKG colours exactly, others by the generator's
 model (luma from (MA+MB)/2, chroma from |MA−MB|, hue 11.25° per MP step).
 

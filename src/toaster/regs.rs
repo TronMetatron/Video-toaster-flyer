@@ -25,6 +25,12 @@ pub enum Mux {
 }
 
 impl Mux {
+    /// The source numbered `v` (0-7), as the muxes and the latch codes
+    /// number them.
+    pub fn from_code(v: u8) -> Self {
+        Self::from_bits(u16::from(v))
+    }
+
     fn from_bits(v: u16) -> Self {
         match v & 7 {
             n @ 0..=3 => Mux::Vid(usize::from(n)),
@@ -113,6 +119,15 @@ impl Regs<'_> {
     }
     pub fn bm(&self) -> Mux {
         Mux::from_bits(bits(self.eh(2).b))
+    }
+    /// AMWIPE: with AM = 7, the A bus takes its source per pixel from the
+    /// Amiga picture (the latch effects, `LatchAM`).
+    pub fn amwipe(&self) -> bool {
+        self.eh(2).r & 0x0800 != 0
+    }
+    /// BMWIPE: the same for the B bus.
+    pub fn bmwipe(&self) -> bool {
+        self.eh(2).b & 0x0800 != 0
     }
 
     // EH3: the matte colour code (MA, MB, MP) and snow.
