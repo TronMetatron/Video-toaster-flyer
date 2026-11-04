@@ -531,6 +531,18 @@ impl TryFrom<RawConfig> for Config {
         ];
         let adapter_named = raw.parallel.device.is_some();
         let parallel = resolve_parallel(raw.parallel, &raw.input)?;
+        let video_slot = match raw.video_slot.card.as_deref().map(str::to_ascii_lowercase) {
+            None => VideoSlotCard::None,
+            Some(card) => match card.as_str() {
+                "none" | "" => VideoSlotCard::None,
+                "toaster" => VideoSlotCard::Toaster,
+                other => {
+                    return Err(anyhow!(
+                        "unknown [video_slot] card {other:?}: expected none or toaster"
+                    ))
+                }
+            },
+        };
         let parallel_joysticks = [
             parse_parallel_socket(
                 raw.input.port3.as_deref(),
@@ -1570,6 +1582,7 @@ impl TryFrom<RawConfig> for Config {
             parallel_joysticks,
             serial,
             parallel,
+            video_slot,
             paths: raw.paths,
         })
     }

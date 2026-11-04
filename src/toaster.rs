@@ -1,0 +1,782 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! NewTek Video Toaster 4000: the video-slot card's interface to the Amiga.
+//!
+//! The Toaster has no registers on the Amiga's bus. Its switcher software
+//! talks to it through the picture: every scan line the Amiga displays can
+//! carry a line header in sprites 0 and 1 (attached, at comparator position
+//! `$5B`) and, in the bitplanes, a line of data for the card's framestore or
+//! a request for data from it. The card answers requests on the parallel
+//! port data pins (`$BFE101`), which the switcher reads at beam-timed
+//! positions. The protocol here was recovered from NewTek's released
+//! switcher source (`cop.a`, `autocal.a`, `vthand.a`, `elh.i`) and their
+//! 4.2 binaries; see the project notes for the derivation.
+//!
+//! The card samples four digital lines per hi-res pixel, each wired to two
+//! RGB bits of the video slot (NewTek's names; AGA low-nibble bits):
+//!
+//! | line | bits      | sprite word (header) | bitplane (data) |
+//! |------|-----------|----------------------|-----------------|
+//! | R    | R2 or R1  | sprite 0 A           | plane 0         |
+//! | G    | B2 or G1  | sprite 0 B           | plane 1         |
+//! | B    | R0 or B0  | sprite 1 A           | plane 2         |
+//! | I    | G0 or B1  | sprite 1 B           | plane 3         |
+//!
+//! A data pixel's value is `R | G<<1 | B<<2 | I<<3`. The header's sixteen
+//! lo-res sprite pixels give four 16-bit words (bit 15 first); NewTek uses
+//! bits 15-8:
+//!
+//! - `R` bits 15-12: extended-header select (`%1111` = none, else one of
+//!   eight codes), or on a read request the pixel-in-quad select.
+//! - `G` bit 15: framestore write; bit 14: high nibble; bit 13: the
+//!   colour-subcarrier-inverted ("complemented") copy; bit 12: field II/IV.
+//! - `B`/`I` bits 15-12: line number (low/high nibble). A line that carries
+//!   nothing has `R = %1111` with the write bit clear (the switcher gives it
+//!   line number 255).
+//!
+//! A framestore line is written as four scan lines (normal high and low
+//! nibbles, then the complemented pair); interlaced line `2L + 1` for
+//! fields I/III, `2L` for II/IV. A read request draws a bitmap in which
+//! every quad (four pixels, one colour clock) is labelled with the quad
+//! number to return -- the `I` line carries the label's high nibble and `B`
+//! its low nibble across the quad's four pixels -- and the card puts
+//! framestore byte `4Q + pixel` of the requested line on the port a fixed
+//! pipeline after quad `Q` passed its input. The extended line headers
+//! (EH0-EH7, EH60-EH6F) hold the card's control state: the input muxes,
+//! mattes, keyer, pedestal, gain, hue and the flag bits. EH0 is also the
+//! header of every line of the switcher's normal display, so its bits
+//! change within a field; the write bank comes from its `OBR` bit (reads
+//! use it inverted), taken in beam order.
+//!
+//! Pinned against the 4.2 switcher's own tests: its bitmaps' first pixel
+//! is the card's pixel 12 (quad 3), which puts pixel 0 at lo-res `$5A`,
+//! two lo-res pixels before the header sprite; a quad label is the plain
+//! quad number on the wire; and ten quads of read pipeline put each of
+//! the `HS.default` read positions inside its label run.
+
+use crate::videoslot::{BeamPos, FieldPixels, LiveField, VideoSlotDevice};
+
+/// Pixels per framestore line (the AGA switcher's 768-wide bitmap).
+pub const LINE_PIXELS: usize = 768;
+/// Interlaced framestore lines: the header's eight-bit line number covers
+/// 256 lines per field (0-480 carry the picture; the switcher's read
+/// self-test uses line 504, and 510/511 are the "dummy" line number it
+/// puts on lines that carry nothing).
+pub const LINES: usize = 512;
+/// DV1 and DV2.
+pub const BANKS: usize = 2;
+/// Normal and complemented copies of each line.
+const SIGNALS: usize = 2;
+
+/// Comparator position of the line header sprite.
+const HEADER_LORES: i32 = 0x5B;
+/// Comparator position of the card's pixel 0. Quad 0 is the two lo-res
+/// pixels before the header sprite, the sprite's four used lo-res pixels
+/// are quads 1-2, and the switcher's bitmaps -- whose first pixel
+/// `TestReadScanLine` expects to read back as quad 3, pixel 0 -- start at
+/// pixel 12. Measured against the 4.2 switcher: its written ramp's first
+/// byte lands at this window's pixel 12.
+const PIXEL0_LORES: i32 = 0x5A;
+/// Hi-res pixels between a quad label passing the card's input and the
+/// labelled byte being on the parallel port. Fitted to the switcher's
+/// `HS.default` read positions: each of its ten reads per line must land
+/// inside an 18-quad run of one label, and the CIA access (E-clock
+/// synchronised) happens up to five clocks after the beam position it
+/// waited for; ten quads keeps at least four quads of margin either way.
+const READ_PIPELINE_PIXELS: i64 = 40;
+
+/// Number of extended line headers: EH0-EH5, EH60-EH6F, EH7.
+const ELH_COUNT: usize = 23;
+const ELH_EH0: usize = 0;
+const ELH_EH6_BASE: usize = 6;
+const ELH_EH7: usize = 22;
+
+/// EH0 `R` word bit 8: output/write bank select.
+const EH0R_OBR: u16 = 1 << 8;
+
+/// One decoded line header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineKind {
+    /// An extended header: `index` into the ELH file.
+    Elh { index: usize },
+    /// A line carrying nothing (`I` nibble `$F`).
+    Dummy,
+    /// A framestore write.
+    Write {
+        line: usize,
+        high_nibble: bool,
+        complemented: bool,
+    },
+    /// A read request.
+    Read {
+        line: usize,
+        pixel: usize,
+        complemented: bool,
+    },
+}
+
+/// The four header words of a line, bit 15 = the sprite's first pixel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Header {
+    pub r: u16,
+    pub g: u16,
+    pub b: u16,
+    pub i: u16,
+}
+
+impl Header {
+    /// Extended-header select codes (`elh.i` `VTI_E*`), indexed as the ELH
+    /// file is.
+    fn elh_index(self) -> Option<usize> {
+        let base = match self.r >> 12 {
+            0b1000 => 0,
+            0b0100 => 1,
+            0b1010 => 2,
+            0b0110 => 3,
+            0b1001 => 4,
+            0b0101 => 5,
+            0b1011 => ELH_EH6_BASE + usize::from((self.r >> 8) & 0xF),
+            0b0111 => ELH_EH7,
+            _ => return None,
+        };
+        // EH6's sixteen pages occupy the file between EH5 and EH7.
+        Some(base)
+    }
+
+    pub fn kind(self) -> LineKind {
+        if let Some(index) = self.elh_index() {
+            return LineKind::Elh { index };
+        }
+        let l = usize::from(((self.i >> 12) << 4) | (self.b >> 12));
+        let field_ii = self.g & 0x1000 != 0;
+        let complemented = self.g & 0x2000 != 0;
+        let line = 2 * l + usize::from(!field_ii);
+        if self.g & 0x8000 != 0 {
+            return LineKind::Write {
+                line,
+                high_nibble: self.g & 0x4000 != 0,
+                complemented,
+            };
+        }
+        // Pixel-in-quad codes %0000 %0010 %1100 %1110; anything else with
+        // no extended header and no write bit carries nothing.
+        let pixel = match self.r >> 12 {
+            0b0000 => 0,
+            0b0010 => 1,
+            0b1100 => 2,
+            0b1110 => 3,
+            _ => return LineKind::Dummy,
+        };
+        LineKind::Read {
+            line,
+            pixel,
+            complemented,
+        }
+    }
+}
+
+/// The four-bit value the card's input lines read from one RGBA8 pixel.
+#[inline]
+pub fn lines_of(pixel: u32) -> u8 {
+    let [r, g, b, _] = pixel.to_le_bytes();
+    let line_r = (r & 0x06) != 0;
+    let line_g = (b & 0x04) != 0 || (g & 0x02) != 0;
+    let line_b = (r & 0x01) != 0 || (b & 0x01) != 0;
+    let line_i = (g & 0x01) != 0 || (b & 0x02) != 0;
+    u8::from(line_r) | (u8::from(line_g) << 1) | (u8::from(line_b) << 2) | (u8::from(line_i) << 3)
+}
+
+/// Per-field activity, for diagnostics and tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub fields: u64,
+    pub elh_lines: u64,
+    pub write_lines: u64,
+    pub read_requests: u64,
+    pub port_bytes: u64,
+}
+
+pub struct Toaster {
+    /// `[bank][signal][line][pixel]`.
+    frame_store: Vec<u8>,
+    /// Raw extended line headers, last value written.
+    elh: [Header; ELH_COUNT],
+    /// Seen a valid extended header: the switcher is driving the card.
+    active: bool,
+    /// Lines of the field in progress already taken in through the live
+    /// scan: `(field number, next line to take)`.
+    scanned: Option<(u64, u32)>,
+    stats: Stats,
+    diag: bool,
+    diag_lines_logged: u32,
+    diag_fields: bool,
+}
+
+impl Default for Toaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Toaster {
+    pub fn new() -> Self {
+        Self {
+            frame_store: vec![0; BANKS * SIGNALS * LINES * LINE_PIXELS],
+            elh: [Header::default(); ELH_COUNT],
+            active: false,
+            scanned: None,
+            stats: Stats::default(),
+            diag: crate::envcfg::flag("COPPERLINE_DIAG_TOASTER"),
+            diag_lines_logged: 0,
+            diag_fields: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER")
+                .is_some_and(|v| v == "fields"),
+        }
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    pub fn elh(&self, index: usize) -> Header {
+        self.elh[index]
+    }
+
+    fn store_index(bank: usize, complemented: bool, line: usize, pixel: usize) -> usize {
+        ((bank * SIGNALS + usize::from(complemented)) * LINES + line) * LINE_PIXELS + pixel
+    }
+
+    /// One framestore byte.
+    pub fn frame_store_byte(
+        &self,
+        bank: usize,
+        complemented: bool,
+        line: usize,
+        pixel: usize,
+    ) -> u8 {
+        self.frame_store[Self::store_index(bank, complemented, line, pixel)]
+    }
+
+    /// Bank a write goes to: EH0 `OBR`.
+    fn write_bank(&self) -> usize {
+        usize::from(self.elh[ELH_EH0].r & EH0R_OBR != 0)
+    }
+
+    /// Bank a read comes from: the switcher sets `OBR` for bank 0.
+    fn read_bank(&self) -> usize {
+        usize::from(self.elh[ELH_EH0].r & EH0R_OBR == 0)
+    }
+
+    /// Sample the line header sprite of row `vpos`.
+    fn header(field: &FieldPixels<'_>, vpos: u32) -> Option<Header> {
+        let row = field.row(vpos)?;
+        // The serializer's first pixel lands one lo-res pixel after the
+        // comparator match.
+        let x0 = field.column_for_lores(HEADER_LORES + crate::bus::SPRITE_OUTPUT_DELAY_LORES);
+        let step = 2 * field.canvas_scale as i64;
+        let mut h = Header::default();
+        for k in 0..16u32 {
+            let col = usize::try_from(x0 + i64::from(k) * step).ok()?;
+            let v = lines_of(*row.get(col)?);
+            let bit = 15 - k;
+            h.r |= u16::from(v & 1) << bit;
+            h.g |= u16::from((v >> 1) & 1) << bit;
+            h.b |= u16::from((v >> 2) & 1) << bit;
+            h.i |= u16::from((v >> 3) & 1) << bit;
+        }
+        Some(h)
+    }
+
+    /// Canvas column of the card's pixel 0.
+    fn pixel0_column(field: &FieldPixels<'_>) -> i64 {
+        field.column_for_lores(PIXEL0_LORES)
+    }
+
+    fn store_write_line(
+        &mut self,
+        field: &FieldPixels<'_>,
+        vpos: u32,
+        line: usize,
+        high_nibble: bool,
+        complemented: bool,
+    ) {
+        let Some(row) = field.row(vpos) else {
+            return;
+        };
+        if line >= LINES {
+            return;
+        }
+        let bank = self.write_bank();
+        let x0 = Self::pixel0_column(field);
+        let step = field.canvas_scale as i64;
+        let base = Self::store_index(bank, complemented, line, 0);
+        for p in 0..LINE_PIXELS {
+            let Ok(col) = usize::try_from(x0 + p as i64 * step) else {
+                continue;
+            };
+            let Some(&pixel) = row.get(col) else {
+                break;
+            };
+            let v = lines_of(pixel);
+            let byte = &mut self.frame_store[base + p];
+            *byte = if high_nibble {
+                (*byte & 0x0F) | (v << 4)
+            } else {
+                (*byte & 0xF0) | v
+            };
+        }
+        self.stats.write_lines += 1;
+        if self.diag && self.diag_lines_logged < 400 {
+            self.diag_lines_logged += 1;
+            let bytes: Vec<u8> = (8..56).map(|p| self.frame_store[base + p]).collect();
+            log::info!(
+                "toaster: write vpos={vpos} line={line} hi={high_nibble} comp={complemented} bank={bank} pixels 8.. {bytes:02X?}"
+            );
+        }
+    }
+
+    /// Act on one line's header: latch an extended header, store a written
+    /// line, count a read request.
+    fn take_line(&mut self, field: &FieldPixels<'_>, vpos: u32, header: Header) {
+        match header.kind() {
+            LineKind::Elh { index } => {
+                if !self.active {
+                    log::info!(
+                        "toaster: first extended header on line {vpos}: the switcher is driving the card"
+                    );
+                }
+                self.active = true;
+                if self.diag && self.elh[index] != header {
+                    log::info!(
+                        "toaster: ELH {index} <- R={:04X} G={:04X} B={:04X} I={:04X} (vpos {vpos})",
+                        header.r,
+                        header.g,
+                        header.b,
+                        header.i
+                    );
+                }
+                self.elh[index] = header;
+                self.stats.elh_lines += 1;
+            }
+            LineKind::Write {
+                line,
+                high_nibble,
+                complemented,
+            } if self.active => {
+                self.store_write_line(field, vpos, line, high_nibble, complemented);
+            }
+            LineKind::Read { .. } if self.active => {
+                self.stats.read_requests += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Take in the lines of the field in progress that the beam has
+    /// passed since the last scan, so a read on line N sees the headers
+    /// (bank select, above all) of lines 0..N of its own field, as the
+    /// card does.
+    fn scan_to_beam(&mut self, live: &mut LiveField<'_>) {
+        let beam = live.beam();
+        let mut next = match self.scanned {
+            Some((frame, next)) if frame == beam.frame => next,
+            _ => live.first_vpos(),
+        };
+        while next < beam.vpos {
+            if let Some(field) = live.line(next) {
+                if let Some(header) = Self::header(&field, next) {
+                    self.take_line(&field, next, header);
+                }
+            }
+            next += 1;
+        }
+        self.scanned = Some((beam.frame, next));
+    }
+
+    /// The quad label drawn at canvas column `col` on `row`: the `I` line
+    /// across the quad's four pixels is the label's high nibble, the `B`
+    /// line its low nibble, first pixel = bit 3. (The switcher's source
+    /// talks of complementing the label data, but that cancels against its
+    /// inverted read palette: on the wire the label is the quad number.)
+    fn quad_label(row: &[u32], quad_col: i64, scale: i64) -> Option<u8> {
+        let mut hi = 0u8;
+        let mut lo = 0u8;
+        for j in 0..4i64 {
+            let col = usize::try_from(quad_col + j * scale).ok()?;
+            let v = lines_of(*row.get(col)?);
+            hi |= ((v >> 3) & 1) << (3 - j);
+            lo |= ((v >> 2) & 1) << (3 - j);
+        }
+        Some((hi << 4) | lo)
+    }
+}
+
+impl VideoSlotDevice for Toaster {
+    fn name(&self) -> &'static str {
+        "Video Toaster 4000"
+    }
+
+    fn supplies_sync(&self) -> bool {
+        true
+    }
+
+    fn field_complete(&mut self, field: &FieldPixels<'_>, at: BeamPos) {
+        self.stats.fields += 1;
+        // Lines the live scan already took in this field are done.
+        let first_unscanned = match self.scanned.take() {
+            Some((frame, next)) if frame == at.frame => next,
+            _ => 0,
+        };
+        // `COPPERLINE_DIAG_TOASTER=fields`: dump every line header of one
+        // field in forty.
+        let dump = self.diag_fields && self.active && self.stats.fields.is_multiple_of(40);
+        for row in 0..field.rows {
+            let vpos = field.visible_start_vpos + row as u32;
+            if vpos < first_unscanned {
+                continue;
+            }
+            let Some(header) = Self::header(field, vpos) else {
+                continue;
+            };
+            if dump {
+                log::info!(
+                    "toaster: field {} line {vpos}: R={:04X} G={:04X} B={:04X} I={:04X} {:?}",
+                    self.stats.fields,
+                    header.r,
+                    header.g,
+                    header.b,
+                    header.i,
+                    header.kind()
+                );
+            }
+            self.take_line(field, vpos, header);
+        }
+    }
+
+    fn parallel_read(&mut self, live: &mut LiveField<'_>, _ddrb: u8) -> Option<u8> {
+        self.scan_to_beam(live);
+        if !self.active {
+            return None;
+        }
+        let beam = live.beam();
+        let field = live.pixels();
+        self.port_byte(&field, beam)
+    }
+}
+
+impl Toaster {
+    /// The byte on the parallel port while the beam is at `beam`, from the
+    /// line's rendered pixels: on a read-request line, the framestore byte
+    /// the quad label under the beam (less the read pipeline) asks for.
+    fn port_byte(&mut self, field: &FieldPixels<'_>, beam: BeamPos) -> Option<u8> {
+        let header = Self::header(field, beam.vpos)?;
+        let LineKind::Read {
+            line,
+            pixel,
+            complemented,
+        } = header.kind()
+        else {
+            return None;
+        };
+        if line >= LINES {
+            return None;
+        }
+        let row = field.row(beam.vpos)?;
+        let scale = field.canvas_scale as i64;
+        let x0 = Self::pixel0_column(field);
+        let beam_col = field.column_for_hpos(beam.hpos);
+        let card_pixel = (beam_col - x0) / scale - READ_PIPELINE_PIXELS;
+        if card_pixel < 0 {
+            return None;
+        }
+        let quad = card_pixel / 4;
+        let label = Self::quad_label(row, x0 + quad * 4 * scale, scale)?;
+        let p = usize::from(label) * 4 + pixel;
+        let byte = if p < LINE_PIXELS {
+            self.frame_store_byte(self.read_bank(), complemented, line, p)
+        } else {
+            0
+        };
+        self.stats.port_bytes += 1;
+        if self.diag && self.stats.port_bytes <= 600 {
+            log::info!(
+                "toaster: read vpos={} hpos={} quad {quad} label {label} line {line} px {pixel} comp={complemented} -> {byte:02X}",
+                beam.vpos,
+                beam.hpos
+            );
+        }
+        Some(byte)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::videoslot::{SLOT_FIRST_CCK, SLOT_LINE_CCK};
+
+    const WIDTH: usize = SLOT_LINE_CCK * 4;
+
+    /// A one-line slot canvas for beam line `vpos`.
+    struct Line {
+        pixels: Vec<u32>,
+        vpos: u32,
+    }
+
+    impl Line {
+        fn new(vpos: u32) -> Self {
+            Self {
+                pixels: vec![u32::from_le_bytes([0, 0, 0, 0xFF]); WIDTH],
+                vpos,
+            }
+        }
+
+        fn field(&self) -> FieldPixels<'_> {
+            FieldPixels {
+                pixels: &self.pixels,
+                width: WIDTH,
+                rows: 1,
+                visible_start_vpos: self.vpos,
+                first_cck: SLOT_FIRST_CCK,
+                canvas_scale: 1,
+                long_frame: true,
+                interlaced: false,
+                valid_rows: 1,
+            }
+        }
+
+        /// A pixel the card's four lines read as `v` (R, G<<1, B<<2, I<<3).
+        fn wire(v: u8) -> u32 {
+            let r = if v & 1 != 0 { 0x02 } else { 0 } | if v & 4 != 0 { 0x01 } else { 0 };
+            let g = if v & 2 != 0 { 0x02 } else { 0 } | if v & 8 != 0 { 0x01 } else { 0 };
+            u32::from_le_bytes([r, g, 0, 0xFF])
+        }
+
+        /// Draw the header sprite: sixteen lo-res pixels from `$5C`.
+        fn header(&mut self, h: Header) {
+            let x0 = self
+                .field()
+                .column_for_lores(HEADER_LORES + crate::bus::SPRITE_OUTPUT_DELAY_LORES);
+            for k in 0..16 {
+                let bit = 15 - k;
+                let v = ((h.r >> bit) & 1)
+                    | ((h.g >> bit) & 1) << 1
+                    | ((h.b >> bit) & 1) << 2
+                    | ((h.i >> bit) & 1) << 3;
+                let col = (x0 + 2 * k) as usize;
+                self.pixels[col] = Self::wire(v as u8);
+                self.pixels[col + 1] = Self::wire(v as u8);
+            }
+        }
+
+        /// Put nibble `v` on card pixel `p`.
+        fn card_pixel(&mut self, p: usize, v: u8) {
+            let col = (Toaster::pixel0_column(&self.field()) + p as i64) as usize;
+            self.pixels[col] = Self::wire(v);
+        }
+
+        /// The read bitmap: quads from 3 labelled `label`, 18 quads each.
+        fn labels(&mut self, first_label: u8) {
+            for quad in 3..192usize {
+                let label = first_label + ((quad - 3) / 18) as u8;
+                for j in 0..4 {
+                    let bit = 3 - j;
+                    let v = ((label >> 4 >> bit) & 1) << 3 | ((label >> bit) & 1) << 2;
+                    self.card_pixel(quad * 4 + j, v);
+                }
+            }
+        }
+    }
+
+    /// Framestore line `line` written with `bytes` from card pixel 12 by
+    /// the four passes the switcher makes, with `OBR` as given.
+    fn write_line(card: &mut Toaster, obr: bool, line: usize, bytes: &[u8]) {
+        let mut eh0 = Line::new(23);
+        eh0.header(Header {
+            r: 0x8000 | if obr { EH0R_OBR } else { 0 },
+            g: 0x0100,
+            b: 0xF000,
+            i: 0x0F00,
+        });
+        card.field_complete(&eh0.field(), BeamPos::default());
+        let l = (line / 2) as u16;
+        let field_ii = line.is_multiple_of(2);
+        for (vpos, g) in [(24, 0xC000u16), (25, 0x8000), (26, 0xE000), (27, 0xA000)] {
+            let mut data = Line::new(vpos);
+            data.header(Header {
+                r: 0xF000,
+                g: g | if field_ii { 0x1000 } else { 0 },
+                b: (l & 0xF) << 12,
+                i: (l >> 4) << 12,
+            });
+            for (k, &byte) in bytes.iter().enumerate() {
+                let nibble = if g & 0x4000 != 0 {
+                    byte >> 4
+                } else {
+                    byte & 0xF
+                };
+                data.card_pixel(12 + k, nibble);
+            }
+            card.field_complete(&data.field(), BeamPos::default());
+        }
+    }
+
+    fn read_request(line: usize, pixel: u8, complemented: bool) -> Header {
+        let l = (line / 2) as u16;
+        let field_ii = line.is_multiple_of(2);
+        Header {
+            r: [0x0000, 0x2000, 0xC000, 0xE000][usize::from(pixel)],
+            g: if complemented { 0x2000 } else { 0 } | if field_ii { 0x1000 } else { 0 },
+            b: (l & 0xF) << 12,
+            i: (l >> 4) << 12,
+        }
+    }
+
+    #[test]
+    fn a_written_line_reads_back_by_quad_label() {
+        let mut card = Toaster::new();
+        let ramp: Vec<u8> = (71..=200).collect();
+        write_line(&mut card, false, 504, &ramp);
+        assert!(card.active);
+        assert_eq!(card.frame_store_byte(0, false, 504, 12), 71);
+        assert_eq!(card.frame_store_byte(0, true, 504, 13), 72);
+
+        // The switcher reads bank 0 with OBR set.
+        let mut eh0 = Line::new(23);
+        eh0.header(Header {
+            r: 0x8000 | EH0R_OBR,
+            g: 0x0100,
+            b: 0xF000,
+            i: 0x0F00,
+        });
+        card.field_complete(&eh0.field(), BeamPos::default());
+        let mut read = Line::new(24);
+        read.header(read_request(504, 0, false));
+        read.labels(3);
+        let at = |hpos| BeamPos {
+            vpos: 24,
+            hpos,
+            ..BeamPos::default()
+        };
+        // HS.default's ten read positions land in labels 3..=12.
+        let expected: Vec<u8> = (0..10).map(|i| 71 + 4 * i).collect();
+        let got: Vec<u8> = [58, 75, 93, 111, 129, 147, 166, 183, 201, 216]
+            .into_iter()
+            .map(|h| card.port_byte(&read.field(), at(h)).unwrap())
+            .collect();
+        assert_eq!(got, expected);
+        // Five clocks later (the CIA access's E-clock slip) still reads
+        // the same labels.
+        let late: Vec<u8> = [63, 80, 98, 116, 134, 152, 171, 188, 206, 221]
+            .into_iter()
+            .map(|h| card.port_byte(&read.field(), at(h)).unwrap())
+            .collect();
+        assert_eq!(late, expected);
+        // Pixel 1 of each quad, from the complemented copy.
+        let mut read = Line::new(25);
+        read.header(read_request(504, 1, true));
+        read.labels(3);
+        assert_eq!(
+            card.port_byte(
+                &read.field(),
+                BeamPos {
+                    vpos: 25,
+                    hpos: 75,
+                    ..BeamPos::default()
+                }
+            ),
+            Some(72 + 4)
+        );
+    }
+
+    #[test]
+    fn banks_follow_the_obr_bit() {
+        let mut card = Toaster::new();
+        write_line(&mut card, true, 100, &[1, 2, 3]);
+        assert_eq!(card.frame_store_byte(1, false, 100, 12), 1);
+        assert_eq!(card.frame_store_byte(0, false, 100, 12), 0);
+        write_line(&mut card, false, 100, &[9]);
+        assert_eq!(card.frame_store_byte(0, false, 100, 12), 9);
+        // Reads come from the other bank than OBR names: the last EH0 above
+        // cleared OBR, so bank 1 is read.
+        let mut read = Line::new(24);
+        read.header(read_request(100, 0, false));
+        read.labels(3);
+        assert_eq!(
+            card.port_byte(
+                &read.field(),
+                BeamPos {
+                    vpos: 24,
+                    hpos: 58,
+                    ..BeamPos::default()
+                }
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn input_lines_follow_the_wired_rgb_bits() {
+        let px = |r: u8, g: u8, b: u8| u32::from_le_bytes([r, g, b, 0xFF]);
+        // The switcher's write palette: one line per bitplane.
+        assert_eq!(lines_of(px(0x04, 0, 0)), 1);
+        assert_eq!(lines_of(px(0, 0, 0x04)), 2);
+        assert_eq!(lines_of(px(0x01, 0, 0)), 4);
+        assert_eq!(lines_of(px(0, 0x01, 0)), 8);
+        // The alternate bits of each pair, and the sprite palette's pairs.
+        assert_eq!(lines_of(px(0x02, 0, 0)), 1);
+        assert_eq!(lines_of(px(0, 0x02, 0)), 2);
+        assert_eq!(lines_of(px(0, 0, 0x01)), 4);
+        assert_eq!(lines_of(px(0, 0, 0x02)), 8);
+        assert_eq!(lines_of(px(0x66, 0, 0)), 1);
+        assert_eq!(lines_of(px(0, 0x22, 0x44)), 2);
+        // High bits of the guns carry nothing.
+        assert_eq!(lines_of(px(0xF8, 0xFC, 0xF8)), 0);
+    }
+
+    #[test]
+    fn header_kinds_decode() {
+        let h = |r, g, b, i| Header { r, g, b, i };
+        // DoSafeWrite's filler: no ELH, no write bit, line number 255.
+        assert_eq!(h(0xF000, 0x0000, 0xF000, 0xF000).kind(), LineKind::Dummy);
+        // The read self-test's line 504 (L = 252) decodes like any other.
+        assert_eq!(
+            h(0xF000, 0xD000, 0xC000, 0xF000).kind(),
+            LineKind::Write {
+                line: 504,
+                high_nibble: true,
+                complemented: false
+            }
+        );
+        // tblI/tblII write codes for toaster line L = $21: field I line 67.
+        assert_eq!(
+            h(0xF000, 0xC000, 0x1000, 0x2000).kind(),
+            LineKind::Write {
+                line: 67,
+                high_nibble: true,
+                complemented: false
+            }
+        );
+        assert_eq!(
+            h(0xF000, 0xB000, 0x1000, 0x2000).kind(),
+            LineKind::Write {
+                line: 66,
+                high_nibble: false,
+                complemented: true
+            }
+        );
+        // Read request, pixel 2 of each quad, complemented, field II.
+        assert_eq!(
+            h(0xC000, 0x3000, 0x1000, 0x2000).kind(),
+            LineKind::Read {
+                line: 66,
+                pixel: 2,
+                complemented: true
+            }
+        );
+        assert_eq!(
+            h(0x8100, 0x0500, 0xFF00, 0xFF00).kind(),
+            LineKind::Elh { index: 0 }
+        );
+        assert_eq!(h(0xB300, 0, 0, 0).kind(), LineKind::Elh { index: 9 });
+        assert_eq!(h(0x7000, 0, 0, 0).kind(), LineKind::Elh { index: ELH_EH7 });
+    }
+}

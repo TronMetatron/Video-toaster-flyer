@@ -584,6 +584,13 @@ video = "PAL"
 # genlock = false
 
 
+# A card in the video slot. "toaster" fits an emulated NewTek Video Toaster
+# 4000 (A4000; the Toaster software is not included). It supplies sync like
+# a genlock while fitted.
+# [video_slot]
+# card = "none"
+
+
 # IDE hard-disk images, on the machines with a built-in IDE port: A600, A1200,
 # and A4000. Raw flat HDF images opened read/write; both full images with their
 # own RDB and bare partition hardfiles (boot block "DOS\x..", size a multiple
