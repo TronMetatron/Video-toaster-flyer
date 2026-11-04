@@ -1768,6 +1768,9 @@ pub struct App {
     /// appended on emulated-frame boundaries, so captures stay in sync
     /// even under warp or host stutter.
     recorder: Option<crate::recorder::VideoRecorder>,
+    /// Windows for the video-slot card's own outputs (the Video Toaster's
+    /// Preview and Program monitors).
+    card_monitors: card_monitors::CardMonitors,
     /// Scratch presentation-scaled framebuffer for the recorder (same
     /// vertical resample as screenshots).
     record_fb: Vec<u32>,
@@ -3152,6 +3155,7 @@ impl App {
             reported_double_fault: false,
             hunt: None,
             recorder: None,
+            card_monitors: card_monitors::CardMonitors::new(),
             record_fb: Vec::new(),
             record_scratch_fb: Vec::new(),
             clip_settings: clip,
@@ -4893,6 +4897,13 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // The card's monitor windows keep their events to themselves.
+        if self.card_monitors.owns(window_id) {
+            if let Some(message) = self.card_monitors.window_event(window_id, &event) {
+                self.show_osd(message);
+            }
+            return;
+        }
         // Ahead of netplay too: a replayed press must not reach the shared
         // machine's input either.
         if let WindowEvent::KeyboardInput {
@@ -6386,6 +6397,7 @@ impl ApplicationHandler for App {
         if self.render.is_none() {
             return;
         }
+        self.service_card_monitors(event_loop);
         let host_poll_started = Instant::now();
         // Act on a completed drop before the OSD/control-flow computation
         // below, so a drop-raised OSD keeps the loop awake for its fade.
@@ -8268,6 +8280,7 @@ mod adapter;
 mod app_panels;
 mod app_session;
 mod bezel;
+mod card_monitors;
 mod console;
 #[cfg(feature = "control")]
 mod control;
