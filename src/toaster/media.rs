@@ -40,6 +40,13 @@ pub const INPUTS: usize = 4;
 /// One picture: `PICTURE_W * PICTURE_H` RGBA pixels.
 pub type Picture = Arc<Vec<u32>>;
 
+/// One video frame's sound: stereo samples at the host mixer rate
+/// ([`crate::audio::MIX_SAMPLE_RATE`]), about 1471 per frame.
+pub type Sound = Arc<Vec<(f32, f32)>>;
+
+/// Mixer samples per video frame (29.97 frames a second).
+pub const SAMPLES_PER_FRAME: f64 = crate::audio::MIX_SAMPLE_RATE as f64 * 1001.0 / 30000.0;
+
 const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp"];
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "mpg", "mpeg", "mts", "m2ts", "ts", "dv",
@@ -228,7 +235,8 @@ pub fn find_ffmpeg(media_root: &Path) -> Option<PathBuf> {
 
 /// What a worker hands the card.
 enum Message {
-    Picture(Picture),
+    /// A frame, with its sound when the source has some.
+    Picture(Picture, Option<Sound>),
     NoSignal,
 }
 
@@ -250,6 +258,8 @@ pub struct InputFeed {
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     current: Option<Picture>,
+    /// The sound of the frame taken by the last `advance`, until taken.
+    sound: Option<Sound>,
     dir: PathBuf,
     shared: Arc<Shared>,
 }
@@ -276,6 +286,7 @@ impl InputFeed {
             stop,
             worker,
             current: None,
+            sound: None,
             dir,
             shared,
         }
@@ -312,15 +323,28 @@ impl InputFeed {
     /// previous frame.
     pub fn advance(&mut self) {
         match self.rx.try_recv() {
-            Ok(Message::Picture(p)) => self.current = Some(p),
-            Ok(Message::NoSignal) => self.current = None,
-            Err(_) => {}
+            Ok(Message::Picture(p, sound)) => {
+                self.current = Some(p);
+                self.sound = sound;
+            }
+            Ok(Message::NoSignal) => {
+                self.current = None;
+                self.sound = None;
+            }
+            // No new frame: the picture holds, the sound does not.
+            Err(_) => self.sound = None,
         }
     }
 
     /// The current frame; `None` with nothing plugged in.
     pub fn picture(&self) -> Option<&Picture> {
         self.current.as_ref()
+    }
+
+    /// The sound that goes with the frame the last `advance` took (none for
+    /// a still, a silent source, or when no new frame came).
+    pub fn sound(&self) -> Option<&Sound> {
+        self.sound.as_ref()
     }
 }
 
@@ -473,7 +497,7 @@ impl Worker {
                 return Played::Failed;
             }
         };
-        if !self.send(Message::Picture(picture)) {
+        if !self.send(Message::Picture(picture, None)) {
             return Played::Stop;
         }
         // Alone, a still holds until the folder changes; one of several,
@@ -510,21 +534,10 @@ impl Worker {
              pad={SQUARE_W}:{PICTURE_H}:(ow-iw)/2:(oh-ih)/2:black,\
              scale={PICTURE_W}:{PICTURE_H},fps=30000/1001"
         );
-        let mut cmd = std::process::Command::new(&ffmpeg);
-        cmd.args(["-nostdin", "-loglevel", "error", "-i"])
-            .arg(file)
-            .args([
-                "-an", "-vf", &filter, "-pix_fmt", "rgba", "-f", "rawvideo", "-",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW: no console flashing up per clip.
-            cmd.creation_flags(0x0800_0000);
-        }
+        let mut cmd = ffmpeg_command(&ffmpeg, file);
+        cmd.args([
+            "-an", "-vf", &filter, "-pix_fmt", "rgba", "-f", "rawvideo", "-",
+        ]);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -536,6 +549,11 @@ impl Worker {
             let _ = child.kill();
             return Played::Failed;
         };
+        // The sound comes from a second ffmpeg on the same file, read a
+        // frame's worth at a time beside each picture, so the two stay
+        // together whatever the host's pace. A file without sound plays
+        // silent.
+        let mut sound = SoundReader::start(&ffmpeg, file);
         let mut buf = vec![0u8; PICTURE_W * PICTURE_H * 4];
         let mut frames = 0u64;
         let mut last_scan = Instant::now();
@@ -560,7 +578,11 @@ impl Worker {
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], 0xFF]))
                 .collect();
-            if !self.send(Message::Picture(Arc::new(picture))) {
+            let frame_sound = sound.as_mut().and_then(SoundReader::frame);
+            if frame_sound.is_none() {
+                sound = None;
+            }
+            if !self.send(Message::Picture(Arc::new(picture), frame_sound)) {
                 break Played::Stop;
             }
             if last_scan.elapsed() >= RESCAN {
@@ -576,6 +598,74 @@ impl Worker {
     }
 }
 
+/// ffmpeg reading `file`, its output on a pipe, no console window.
+fn ffmpeg_command(ffmpeg: &Path, file: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-nostdin", "-loglevel", "error", "-i"])
+        .arg(file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: no console flashing up per clip.
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
+/// A file's sound as stereo at the mixer rate, a video frame at a time.
+struct SoundReader {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+    carry: f64,
+    buf: Vec<u8>,
+}
+
+impl SoundReader {
+    fn start(ffmpeg: &Path, file: &Path) -> Option<Self> {
+        let rate = crate::audio::MIX_SAMPLE_RATE.to_string();
+        let mut cmd = ffmpeg_command(ffmpeg, file);
+        cmd.args(["-vn", "-ac", "2", "-ar", &rate, "-f", "s16le", "-"]);
+        let mut child = cmd.spawn().ok()?;
+        let out = child.stdout.take()?;
+        Some(Self {
+            child,
+            out,
+            carry: 0.0,
+            buf: Vec::new(),
+        })
+    }
+
+    /// The next frame's samples; `None` once the sound has ended.
+    fn frame(&mut self) -> Option<Sound> {
+        self.carry += SAMPLES_PER_FRAME;
+        let n = self.carry.floor() as usize;
+        self.carry -= n as f64;
+        self.buf.resize(n * 4, 0);
+        std::io::Read::read_exact(&mut self.out, &mut self.buf).ok()?;
+        Some(Arc::new(
+            self.buf
+                .chunks_exact(4)
+                .map(|c| {
+                    (
+                        f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0,
+                        f32::from(i16::from_le_bytes([c[2], c[3]])) / 32768.0,
+                    )
+                })
+                .collect(),
+        ))
+    }
+}
+
+impl Drop for SoundReader {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 enum Played {
     Shown,
     Failed,
@@ -585,6 +675,41 @@ enum Played {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_video_file_brings_its_sound_frame_by_frame() {
+        // Needs ffmpeg; skipped where there is none.
+        let dir = tempfile::tempdir().unwrap();
+        let Some(ffmpeg) = find_ffmpeg(dir.path()) else {
+            return;
+        };
+        let clip = dir.path().join("tone.mp4");
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=160x120:rate=30000/1001:duration=1")
+            .args(["-f", "lavfi", "-i", "sine=frequency=441:duration=1"])
+            .args(["-shortest", "-c:v", "mpeg4", "-c:a", "aac"])
+            .arg(&clip)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let mut reader = SoundReader::start(&ffmpeg, &clip).expect("ffmpeg starts");
+        let mut lengths = Vec::new();
+        let mut peak = 0.0f32;
+        for _ in 0..10 {
+            let frame = reader.frame().expect("a frame of sound");
+            lengths.push(frame.len());
+            peak = frame.iter().fold(peak, |p, (l, _)| p.max(l.abs()));
+        }
+        // 44100 / 29.97: 1471 and 1472 samples, and a tone in them.
+        assert!(
+            lengths.iter().all(|&n| n == 1471 || n == 1472),
+            "{lengths:?}"
+        );
+        assert!(lengths.iter().sum::<usize>().abs_diff(14715) <= 1);
+        assert!(peak > 0.1, "peak {peak}");
+    }
 
     #[test]
     fn fit_letterboxes_and_pillarboxes() {

@@ -275,6 +275,11 @@ pub trait VideoSlotDevice: Send {
         serde_json::Value::Null
     }
 
+    /// Sound the card produced since the last call, stereo at the host
+    /// mixer rate ([`crate::audio::MIX_SAMPLE_RATE`]), appended to `out`.
+    /// The bus feeds it to the audio mixer after each field.
+    fn take_audio(&mut self, _out: &mut Vec<(f32, f32)>) {}
+
     /// A card-specific control-protocol command (`toaster.input`).
     fn control(
         &mut self,
@@ -347,8 +352,16 @@ impl CardOutput {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Publish a frame `seconds` long.
-    pub fn publish(&self, width: usize, height: usize, pixels: &[u32], seconds: f64) {
+    /// Publish a frame `seconds` long, with its sound (stereo at the mixer
+    /// rate) when it has any: a recording gets silence otherwise.
+    pub fn publish(
+        &self,
+        width: usize,
+        height: usize,
+        pixels: &[u32],
+        seconds: f64,
+        sound: Option<&[(f32, f32)]>,
+    ) {
         let mut st = self.state();
         st.width = width;
         st.height = height;
@@ -357,9 +370,8 @@ impl CardOutput {
             .extend_from_slice(&pixels[..(width * height).min(pixels.len())]);
         st.serial = st.serial.wrapping_add(1);
         if st.recorder.is_some() {
-            // The recorder times video against its audio track; a card
-            // output has no sound, so it gets silence of the frame's
-            // length.
+            // The recorder times video against its audio track: the
+            // frame's sound, or silence of the frame's length.
             let owed = st.audio_carry + seconds * f64::from(crate::audio::MIX_SAMPLE_RATE);
             let n = owed.floor() as usize;
             st.audio_carry = owed - n as f64;
@@ -367,7 +379,9 @@ impl CardOutput {
                 recorder, pixels, ..
             } = &mut *st;
             if let Some(rec) = recorder.as_mut() {
-                rec.push_audio(&vec![(0.0, 0.0); n]);
+                let mut samples = sound.map(<[_]>::to_vec).unwrap_or_default();
+                samples.resize(n, samples.last().copied().unwrap_or((0.0, 0.0)));
+                rec.push_audio(&samples);
                 if let Err(e) = rec.push_frame(pixels) {
                     log::warn!("{} recording stopped: {e:#}", self.name);
                     let _ = rec.finish();
@@ -466,11 +480,11 @@ mod tests {
         // Nothing to record before the first frame.
         assert!(out.start_recording_auto().is_err());
         let frame = vec![u32::from_le_bytes([200, 30, 30, 255]); 16 * 12];
-        out.publish(16, 12, &frame, 1001.0 / 30000.0);
+        out.publish(16, 12, &frame, 1001.0 / 30000.0, None);
         let path = out.start_recording_auto().unwrap();
         assert!(out.is_recording());
         for _ in 0..30 {
-            out.publish(16, 12, &frame, 1001.0 / 30000.0);
+            out.publish(16, 12, &frame, 1001.0 / 30000.0, None);
         }
         let saved = out.stop_recording().unwrap().unwrap();
         assert_eq!(saved, path);

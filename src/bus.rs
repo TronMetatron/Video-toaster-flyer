@@ -783,6 +783,9 @@ pub struct Bus {
     /// like the parallel peripheral, so it survives save-state loads.
     #[serde(skip)]
     video_slot: Option<Box<dyn crate::videoslot::VideoSlotDevice>>,
+    /// Scratch for the video-slot card's sound on its way to Paula's mixer.
+    #[serde(skip)]
+    video_slot_audio: Vec<(f32, f32)>,
     #[serde(skip)]
     video_slot_live: crate::videoslot::LiveFieldCache,
     #[serde(skip)]
@@ -3770,6 +3773,7 @@ impl Bus {
             floppy,
             parallel_port: crate::parallel::null_parallel_port(),
             video_slot: None,
+            video_slot_audio: Vec::new(),
             video_slot_live: Default::default(),
             video_slot_fb: Vec::new(),
             video_slot_scratch: Vec::new(),
@@ -6777,6 +6781,14 @@ impl Bus {
             self.video_slot_fb = fb;
             self.video_slot_scratch = scratch;
         }
+        // The card's sound for the frame it may just have finished.
+        let mut sound = std::mem::take(&mut self.video_slot_audio);
+        device.take_audio(&mut sound);
+        let ring = self.paula.video_slot_audio_mut();
+        for (left, right) in sound.drain(..) {
+            ring.push_frame(left, right);
+        }
+        self.video_slot_audio = sound;
         self.video_slot = Some(device);
     }
 

@@ -55,6 +55,7 @@
 //! the `HS.default` read positions inside its label run.
 
 pub mod composite;
+pub mod dve;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod media;
 pub mod regs;
@@ -348,6 +349,8 @@ pub struct Toaster {
     /// Show the switcher's interface over Preview when it asks to
     /// (`USERON`, the Toaster's "preview overlay" for one-monitor setups).
     preview_overlay: bool,
+    /// The digital effect's addressing for the frame being composed.
+    dve: Option<dve::DveMap>,
 }
 
 impl Default for Toaster {
@@ -384,6 +387,7 @@ impl Toaster {
                 .is_some_and(|v| v == "fields"),
             diag_outputs: String::new(),
             preview_overlay: false,
+            dve: None,
         }
     }
 
@@ -639,6 +643,10 @@ impl VideoSlotDevice for Toaster {
         self.status_value()
     }
 
+    fn take_audio(&mut self, out: &mut Vec<(f32, f32)>) {
+        self.video.take_audio(out);
+    }
+
     fn control(
         &mut self,
         command: &str,
@@ -692,6 +700,19 @@ fn media_inputs() -> usize {
     4
 }
 
+/// How much of each video input an output shows (0-1 each): the sound
+/// follows the picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Inputs([f32; 4]);
+
+impl Inputs {
+    fn add(&mut self, other: &Inputs, weight: f32) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a += b * weight;
+        }
+    }
+}
+
 /// The folder, under the card's host folder, through which the host hands
 /// ARexx jobs to the Amiga (S:Copperline-Link.rexx runs them).
 pub const LINK_FOLDER: &str = ".copperline";
@@ -711,9 +732,9 @@ impl Toaster {
             }
         };
         let cds = match r.cds() {
-            Cds::Quaf => "digital effect (QUAF, not emulated)",
+            Cds::Quaf => "digital effect (QUAF)",
             Cds::PixelSw => "Amiga transparency (PIXELSW)",
-            Cds::TransQuad => "transparent quads (TRANSQUAD)",
+            Cds::TransQuad => "digital effect, drop shadow (TRANSQUAD)",
             Cds::LumKey => "luminance key (LUMKEY)",
             Cds::Dibgr => "Amiga 4-bit key (DIBGR)",
             Cds::Dib => "Amiga 2-bit wipe (DIB)",
@@ -783,8 +804,8 @@ impl Toaster {
             // On the IS mux, 4 is the Program output fed back and 5 the
             // external input (DAC0).
             (Mux::Dac(0), video::Role::Is) => self.video.last_program(out),
-            (Mux::Dac(1), video::Role::Is) => self.dac_picture(0, out),
-            (Mux::Dac(bank), _) => self.dac_picture(bank, out),
+            (Mux::Dac(1), video::Role::Is) => self.dac_picture(0, false, out),
+            (Mux::Dac(bank), _) => self.dac_picture(bank, true, out),
             (Mux::Encoder, _) => {
                 if self.regs().matte() {
                     let (ma, mb, mp) = self.regs().matte_code();
@@ -813,41 +834,69 @@ impl Toaster {
 
     /// Framestore bank playback; bank 0 shows the live input while the
     /// card is digitising it.
-    fn dac_picture(&mut self, bank: usize, out: &mut [u32]) {
-        if bank == 0 && self.video.live() {
-            let is = self.regs().is();
-            if let regs::Mux::Vid(n) = is {
-                match self.video.input_picture(n) {
-                    Some(p) => out.copy_from_slice(&p[..out.len()]),
-                    None => out.fill(video::black()),
+    /// With `mapped`, a digital effect in progress readdresses the playback
+    /// (see [`dve`]).
+    fn dac_picture(&mut self, bank: usize, mapped: bool, out: &mut [u32]) {
+        let map = if mapped { self.dve.take() } else { None };
+        let linear = |this: &mut Self, out: &mut [u32]| {
+            if bank == 0 && this.video.live() {
+                if let regs::Mux::Vid(n) = this.regs().is() {
+                    match this.video.input_picture(n) {
+                        Some(p) => out.copy_from_slice(&p[..out.len()]),
+                        None => out.fill(video::black()),
+                    }
+                    return;
                 }
-                return;
             }
+            let pic = this.video.framestore_picture(&this.frame_store, bank);
+            out.copy_from_slice(&pic[..out.len()]);
+        };
+        match map {
+            Some(map) => {
+                let mut src = vec![video::black(); out.len()];
+                linear(self, &mut src);
+                let live = bank == 0 && self.video.live();
+                if map.reaches_below() && !live {
+                    src.extend(video::Video::framestore_below(&self.frame_store, bank));
+                }
+                map.apply(&src, out);
+                self.dve = Some(map);
+            }
+            None => linear(self, out),
         }
-        let pic = self.video.framestore_picture(&self.frame_store, bank);
-        out.copy_from_slice(&pic[..out.len()]);
     }
 
     /// What a fader bus carries: its mux position, or with its WIPE bit
     /// and position 7, a source per pixel chosen by the Amiga picture.
+    /// Returns how much of each video input the bus shows, for the sound.
     fn bus_picture(
         &mut self,
         mux: regs::Mux,
         latched: bool,
         field: &FieldPixels<'_>,
         out: &mut [u32],
-    ) {
+    ) -> Inputs {
         if !(latched && mux == regs::Mux::Seven) {
             self.source_picture(mux, video::Role::Fader, field, out);
-            return;
+            return self.source_inputs(mux, video::Role::Fader);
         }
         let codes = video::latch_codes(field, Self::pixel0_column(field));
-        let mut used = [false; 8];
+        let mut count = [0usize; 8];
         for c in codes.iter() {
-            used[usize::from(c.unwrap_or(7))] = true;
+            count[usize::from(c.unwrap_or(7))] += 1;
+        }
+        let mut shares = Inputs::default();
+        for code in 0..8u8 {
+            let part = count[usize::from(code)] as f32 / codes.len().max(1) as f32;
+            if part > 0.0 {
+                shares.add(
+                    &self.source_inputs(regs::Mux::from_code(code), video::Role::Fader),
+                    part,
+                );
+            }
         }
         let mut src = vec![video::black(); out.len()];
-        for code in (0..8u8).filter(|&c| used[usize::from(c)]) {
+        for code in (0..8u8).filter(|&c| count[usize::from(c)] > 0) {
             self.source_picture(
                 regs::Mux::from_code(code),
                 video::Role::Fader,
@@ -860,30 +909,93 @@ impl Toaster {
                 }
             }
         }
+        shares
+    }
+
+    /// Which video inputs a mux position carries (the sound follows them):
+    /// an input itself, the live framestore passing its input through, or
+    /// for MONO the key source. Framestores, mattes and the Amiga are
+    /// silent.
+    fn source_inputs(&self, mux: regs::Mux, role: video::Role) -> Inputs {
+        use regs::Mux;
+        let mut shares = Inputs::default();
+        match (mux, role) {
+            (Mux::Vid(n), _) => shares.0[n] = 1.0,
+            (Mux::Dac(0), video::Role::Fader | video::Role::Preview) if self.video.live() => {
+                if let Mux::Vid(n) = self.regs().is() {
+                    shares.0[n] = 1.0;
+                }
+            }
+            (Mux::Seven, video::Role::Fader) => {
+                let lk = self.regs().lk();
+                if lk != Mux::Seven {
+                    return self.source_inputs(lk, video::Role::Key);
+                }
+            }
+            _ => {}
+        }
+        shares
+    }
+
+    /// The sound of `shares` for this frame: each input's frame of sound,
+    /// scaled by how much of it is on the output.
+    fn mix_sound(&self, shares: &Inputs, len: usize) -> Vec<(f32, f32)> {
+        let mut out = vec![(0.0f32, 0.0f32); len];
+        for (n, &w) in shares.0.iter().enumerate() {
+            if w < 0.001 {
+                continue;
+            }
+            let Some(sound) = self.video.input_sound(n) else {
+                continue;
+            };
+            for (i, o) in out.iter_mut().enumerate() {
+                // A frame's sound is one sample longer or shorter than
+                // another's now and then: hold the last.
+                let (l, r) = sound.get(i).or(sound.last()).copied().unwrap_or((0.0, 0.0));
+                o.0 += l * w;
+                o.1 += r * w;
+            }
+        }
+        out
     }
 
     /// Compose and publish one frame of the Program and Preview outputs.
     fn produce_outputs(&mut self, field: &FieldPixels<'_>) {
         let (am, bm, pv) = (self.regs().am(), self.regs().bm(), self.regs().pv());
         let (amwipe, bmwipe) = (self.regs().amwipe(), self.regs().bmwipe());
+        // A digital effect: the framestore playback is addressed line by
+        // line and quad by quad from the Amiga's picture.
+        self.dve = (!self.regs().linp() && !self.regs().lut())
+            .then(|| dve::DveMap::from_field(field, Self::pixel0_column(field)));
         let n = video::PICTURE_W * video::PICTURE_H;
         let mut a = self.video.scratch();
-        self.bus_picture(am, amwipe, field, &mut a);
+        let a_inputs = self.bus_picture(am, amwipe, field, &mut a);
         let mut program = vec![video::black(); n];
-        if bm == am && bmwipe == amwipe {
+        let program_inputs = if bm == am && bmwipe == amwipe {
             program.copy_from_slice(&a);
+            a_inputs
         } else {
             let mut b = vec![video::black(); n];
-            self.bus_picture(bm, bmwipe, field, &mut b);
+            let b_inputs = self.bus_picture(bm, bmwipe, field, &mut b);
             let key = self.fader_key(field);
             video::mix(&a, &b, &key, &mut program);
-        }
+            let k = key.mean() / 255.0;
+            let mut shares = Inputs::default();
+            shares.add(&a_inputs, 1.0 - k);
+            shares.add(&b_inputs, k);
+            shares
+        };
         let mut preview = vec![video::black(); n];
-        if pv == regs::Mux::Seven {
+        let preview_inputs = if pv == regs::Mux::Seven {
             preview.copy_from_slice(&program);
+            program_inputs
         } else {
             self.source_picture(pv, video::Role::Preview, field, &mut preview);
-        }
+            self.source_inputs(pv, video::Role::Preview)
+        };
+        let samples = self.video.frame_samples();
+        let program_sound = self.mix_sound(&program_inputs, samples);
+        let preview_sound = self.mix_sound(&preview_inputs, samples);
         if self.preview_overlay && self.regs().useron() {
             video::overlay_interface(field, Self::pixel0_column(field), &mut preview);
         }
@@ -910,7 +1022,9 @@ impl Toaster {
                 self.diag_outputs = state;
             }
         }
-        self.video.publish(&program, &preview);
+        self.video
+            .publish(&program, &preview, &program_sound, &preview_sound);
+        self.dve = None;
         self.video.give_back(a);
     }
 
@@ -918,6 +1032,12 @@ impl Toaster {
     fn fader_key(&mut self, field: &FieldPixels<'_>) -> video::Key {
         let cd = self.regs().cd();
         match self.regs().cds() {
+            // During a digital effect the quad codes say where the DVE
+            // picture (B) shows over the background (A).
+            mode @ (regs::Cds::Quaf | regs::Cds::TransQuad) if self.dve.is_some() => {
+                let map = self.dve.as_ref().expect("checked");
+                video::Key::Map(map.key(mode == regs::Cds::TransQuad, cd))
+            }
             regs::Cds::Cd | regs::Cds::Quaf | regs::Cds::TransQuad | regs::Cds::RgQuad => {
                 video::Key::Flat(cd)
             }
@@ -1005,6 +1125,27 @@ mod tests {
     struct Line {
         pixels: Vec<u32>,
         vpos: u32,
+    }
+
+    #[test]
+    fn the_sound_follows_how_much_of_each_input_program_shows() {
+        let mut shares = Inputs::default();
+        let mut a = Inputs::default();
+        a.0[0] = 1.0;
+        let mut b = Inputs::default();
+        b.0[1] = 1.0;
+        let k = video::Key::Flat(64).mean() / 255.0;
+        shares.add(&a, 1.0 - k);
+        shares.add(&b, k);
+        assert!((shares.0[0] - 0.749).abs() < 0.01 && (shares.0[1] - 0.251).abs() < 0.01);
+        let map = video::Key::Map(vec![0, 255, 255, 255]);
+        assert!((map.mean() - 191.25).abs() < 0.01);
+        // An input pinned to nothing is silent: no sound without frames.
+        let card = Toaster::new();
+        assert!(card
+            .mix_sound(&shares, 1471)
+            .iter()
+            .all(|&(l, r)| l == 0.0 && r == 0.0));
     }
 
     #[test]

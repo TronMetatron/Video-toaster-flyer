@@ -43,6 +43,10 @@ pub struct Video {
     preview: Arc<CardOutput>,
     /// The host folder the connectors live in.
     media_root: Option<PathBuf>,
+    /// Program's sound not yet taken by the bus.
+    audio_out: Vec<(f32, f32)>,
+    /// Fractional mixer samples carried between frames.
+    audio_carry: f64,
     /// Pictures decoded from the two framestore banks this frame (lazily).
     decoded: [Option<Vec<u32>>; 2],
     /// The two fields of a frame: outputs publish on the second.
@@ -89,6 +93,8 @@ impl Video {
             program: CardOutput::new("Program", ASPECT, output_dir.clone()),
             preview: CardOutput::new("Preview", ASPECT, output_dir),
             media_root: root,
+            audio_out: Vec::new(),
+            audio_carry: 0.0,
             decoded: [None, None],
             odd_field: false,
             scratch: Vec::new(),
@@ -196,6 +202,22 @@ impl Video {
         slot.as_deref().unwrap_or(&[])
     }
 
+    /// Framestore lines below the picture (`PICTURE_LINE0 + PICTURE_H` to
+    /// the end of the bank), decoded like the picture. A digital effect
+    /// reaches them: the switcher keeps its border colour there.
+    pub fn framestore_below(store: &super::FrameStore, bank: usize) -> Vec<u32> {
+        let rows = super::LINES - PICTURE_LINE0 - PICTURE_H;
+        let mut pic = vec![black(); PICTURE_W * rows];
+        for (i, out) in pic.chunks_exact_mut(PICTURE_W).enumerate() {
+            let y = PICTURE_H + i;
+            let fl = PICTURE_LINE0 + y;
+            let n = &store.line(bank, false, fl)[PICTURE_X0..PICTURE_X0 + PICTURE_W];
+            let c = &store.line(bank, true, fl)[PICTURE_X0..PICTURE_X0 + PICTURE_W];
+            composite::decode_line(n, c, y, out);
+        }
+        pic
+    }
+
     /// Digitise a picture into framestore bank `bank` (a grab).
     pub fn grab(store: &mut super::FrameStore, bank: usize, picture: &[u32]) {
         for y in 0..PICTURE_H {
@@ -210,13 +232,67 @@ impl Video {
     }
 
     /// Publish a finished Program and Preview frame.
-    pub fn publish(&mut self, program: &[u32], preview: &[u32]) {
-        self.program
-            .publish(PICTURE_W, PICTURE_H, program, FRAME_SECONDS);
-        self.preview
-            .publish(PICTURE_W, PICTURE_H, preview, FRAME_SECONDS);
+    /// Publish a frame of each output, with the sound that goes with it.
+    /// Program's sound also goes to the host's speakers ([`Self::take_audio`]).
+    pub fn publish(
+        &mut self,
+        program: &[u32],
+        preview: &[u32],
+        program_sound: &[(f32, f32)],
+        preview_sound: &[(f32, f32)],
+    ) {
+        self.program.publish(
+            PICTURE_W,
+            PICTURE_H,
+            program,
+            FRAME_SECONDS,
+            Some(program_sound),
+        );
+        self.preview.publish(
+            PICTURE_W,
+            PICTURE_H,
+            preview,
+            FRAME_SECONDS,
+            Some(preview_sound),
+        );
+        // Bounded: if nothing drains it (no bus), keep the last second.
+        self.audio_out.extend_from_slice(program_sound);
+        let cap = crate::audio::MIX_SAMPLE_RATE as usize;
+        if self.audio_out.len() > cap {
+            let excess = self.audio_out.len() - cap;
+            self.audio_out.drain(..excess);
+        }
         self.last_program.clear();
         self.last_program.extend_from_slice(program);
+    }
+
+    /// Program's sound since the last call.
+    pub fn take_audio(&mut self, out: &mut Vec<(f32, f32)>) {
+        out.append(&mut self.audio_out);
+    }
+
+    /// This frame's length in mixer samples (alternating 1471 and 1472).
+    pub fn frame_samples(&mut self) -> usize {
+        self.audio_carry += FRAME_SECONDS * f64::from(crate::audio::MIX_SAMPLE_RATE);
+        let n = self.audio_carry.floor() as usize;
+        self.audio_carry -= n as f64;
+        n
+    }
+
+    /// The sound of input `n` for this frame, if it has any.
+    pub fn input_sound(&self, n: usize) -> Option<&[(f32, f32)]> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            self.inputs
+                .get(n)
+                .and_then(|i| i.sound())
+                .map(|s| s.as_slice())
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = n;
+            None
+        }
     }
 
     /// The last Program frame (black before the first).
@@ -280,6 +356,17 @@ pub enum Role {
 pub enum Key {
     Flat(u8),
     Map(Vec<u8>),
+}
+
+impl Key {
+    /// The average mix, 0-255: how much of B the picture shows.
+    pub fn mean(&self) -> f32 {
+        match self {
+            Key::Flat(k) => f32::from(*k),
+            Key::Map(m) if m.is_empty() => 0.0,
+            Key::Map(m) => m.iter().map(|&k| u64::from(k)).sum::<u64>() as f32 / m.len() as f32,
+        }
+    }
 }
 
 /// Program = A·(1−k) + B·k.
