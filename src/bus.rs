@@ -6784,10 +6784,8 @@ impl Bus {
         // The card's sound for the frame it may just have finished.
         let mut sound = std::mem::take(&mut self.video_slot_audio);
         device.take_audio(&mut sound);
-        let ring = self.paula.video_slot_audio_mut();
-        for (left, right) in sound.drain(..) {
-            ring.push_frame(left, right);
-        }
+        self.paula.video_slot_audio_mut().push_chunk(&sound);
+        sound.clear();
         self.video_slot_audio = sound;
         self.video_slot = Some(device);
     }
@@ -8657,8 +8655,16 @@ impl Bus {
                 mem,
                 paula,
                 devices_wrote_memory,
+                agnus,
+                emulated_frames,
                 ..
             } = self;
+            // The beam, for boards that keep time by the field (the Flyer).
+            let beam = crate::zorro_device::HostBeam {
+                vpos: agnus.vpos,
+                long_frame: agnus.lof,
+                frame: *emulated_frames,
+            };
             for (slot, dev) in devices.iter_mut().enumerate() {
                 let (cd_audio, toccata_audio, mhi_audio) = paula.audio_rings_mut();
                 let mut host = crate::zorro_device::DeviceHost::for_slot_with_audio(
@@ -8667,7 +8673,8 @@ impl Bus {
                     cd_audio,
                     toccata_audio,
                     mhi_audio,
-                );
+                )
+                .with_beam(beam);
                 crate::zorro_device::ZorroDevice::tick(dev, cck, &mut host);
                 // A tick that DMA'd into guest memory (copperhf draining a
                 // completed read, a plugin board writing a buffer) wrote

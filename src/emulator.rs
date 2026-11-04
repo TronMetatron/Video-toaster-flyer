@@ -4427,6 +4427,22 @@ fn build_machine_inner(
     if cfg.mhi {
         log::warn!("[mhi] enabled = true needs a build with --features mhi; no board is fitted");
     }
+    // NewTek Video Flyer (`[video_slot] flyer`): a Zorro II card whose
+    // window is its shared SRAM; flyer.library finds it by manufacturer
+    // 2191, product 0, and its commands are served in Rust (crate::flyer).
+    // Its drives live in the Toaster's host folder.
+    if cfg.video_slot_flyer {
+        let slot = devices.len();
+        zorro.add_board(crate::flyer::board_spec(slot))?;
+        let media = cfg
+            .video_slot_media
+            .clone()
+            .unwrap_or_else(crate::paths::toaster_files_dir);
+        info!("flyer: Video Flyer on the Zorro chain (slot {slot})");
+        devices.push(crate::zorro_device::BoardDevice::Flyer(Box::new(
+            crate::flyer::Flyer::new(Some(media)),
+        )));
+    }
     // RTG board (`[rtg] card`): the Z3660.card P96 driver drives RTG screens
     // through its register file and framebuffer; see crate::z3660.
     if cfg.rtg == crate::config::RtgCard::Z3660 {

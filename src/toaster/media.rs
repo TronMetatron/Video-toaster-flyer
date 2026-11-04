@@ -267,9 +267,10 @@ pub struct InputFeed {
 impl InputFeed {
     /// Start watching `dir`.
     pub fn spawn(index: usize, dir: PathBuf, ffmpeg: Option<PathBuf>) -> Self {
-        // Two frames of buffer: enough to ride over a decoder hiccup,
-        // little enough that playback stays on the emulated clock.
-        let (tx, rx) = sync_channel(2);
+        // Eight frames (a quarter second) of buffer: a decoder or disk
+        // hiccup on the host must not leave a frame without its picture and
+        // sound, and the worker still only runs as far ahead as this.
+        let (tx, rx) = sync_channel(8);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let shared = Arc::new(Shared::default());

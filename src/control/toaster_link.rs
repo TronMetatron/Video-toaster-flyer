@@ -83,6 +83,7 @@ pub fn wrap(body: &str) -> String {
          OPTIONS RESULTS\n\
          SIGNAL ON SYNTAX\n\
          IF ~SHOW('Libraries','rexxsupport.library') THEN call addlib('rexxsupport.library', 0, -30, 0)\n\
+         IF SHOW('Libraries','CG_AREXX') THEN call remlib('CG_AREXX')\n\
          IF SHOW('Ports','ToasterARexx.port') & ~SHOW('Libraries','ToasterARexx.port') THEN call addlib('ToasterARexx.port', 0)\n\
          IF SHOW('Ports','PROJECT_REXX_PORT') & ~SHOW('Libraries','PROJECT_REXX_PORT') THEN call addlib('PROJECT_REXX_PORT', 0)\n\
          {body}\n\
@@ -202,8 +203,21 @@ pub fn app_body(app: &App, command: &str, args: &[serde_json::Value]) -> Result<
         name = app.name
     );
     if app.function_host {
+        // ARexx asks the function hosts in turn and the switcher's host
+        // answers every call (with an error for one it does not know), so
+        // another program's host goes on the list alone for its call, and
+        // comes off again: the CG's host blocks while the CG is off screen.
+        let own = app.port == "ToasterARexx.port" || app.port == "PROJECT_REXX_PORT";
+        let (alone, after) = if own {
+            (String::new(), String::new())
+        } else {
+            (
+                "call remlib('ToasterARexx.port'); call remlib('PROJECT_REXX_PORT')\n".to_string(),
+                format!("call remlib('{}')\n", app.port),
+            )
+        };
         Ok(format!(
-            "{missing}IF ~SHOW('Libraries','{port}') THEN call addlib('{port}', 0)\n{}",
+            "{missing}{alone}IF ~SHOW('Libraries','{port}') THEN call addlib('{port}', 0)\n{}{after}",
             call_body(command, args),
             port = app.port
         ))

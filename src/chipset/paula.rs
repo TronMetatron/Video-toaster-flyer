@@ -437,32 +437,87 @@ impl MhiAudioRing {
     }
 }
 
-/// A video-slot card's sound at the mixer rate. The card pushes a video
-/// frame's worth (about 1471 samples) at the end of each frame and the
-/// mixer pops one per output sample, so it holds about a frame; the limit
-/// (a few frames) only guards against a consumer that stops.
+/// A video-slot card's sound at the mixer rate. The card hands over a
+/// video frame's worth (about 1471 samples) when each frame ends and the
+/// mixer takes one per output sample, so the ring keeps a little in hand.
+///
+/// The card's frames and the mixer's clock need not agree exactly (an
+/// Amiga frame is not quite 1001/30 ms, and a source file can run late),
+/// so each frame's sound is stretched or squeezed by up to 1 % to steer
+/// the fill toward [`VIDEO_SLOT_AUDIO_TARGET`]: inaudible, and the ring
+/// neither runs dry every few seconds nor grows without end. If it does
+/// run dry (the source stalled), the next frame starts after a short gap
+/// that rebuilds the margin, instead of clicking on every frame after.
 #[derive(Debug, Default)]
 pub struct VideoSlotAudioRing {
     samples: std::collections::VecDeque<(f32, f32)>,
+    /// The last sample pushed, and how far past it the next output falls.
+    last: (f32, f32),
+    phase: f64,
+    starved: bool,
 }
 
-const VIDEO_SLOT_AUDIO_RING_LIMIT: usize = 8192;
+/// Samples kept in hand when a frame's sound arrives (about 46 ms).
+pub const VIDEO_SLOT_AUDIO_TARGET: usize = 2048;
+const VIDEO_SLOT_AUDIO_RING_LIMIT: usize = 16_384;
 
 impl VideoSlotAudioRing {
-    pub fn push_frame(&mut self, left: f32, right: f32) -> bool {
-        if self.samples.len() >= VIDEO_SLOT_AUDIO_RING_LIMIT {
-            return false;
+    /// Add a frame's sound.
+    pub fn push_chunk(&mut self, chunk: &[(f32, f32)]) {
+        let Some(&end) = chunk.last() else {
+            return;
+        };
+        if self.starved {
+            self.starved = false;
+            let pad = VIDEO_SLOT_AUDIO_TARGET.saturating_sub(self.samples.len());
+            self.samples.extend(std::iter::repeat_n((0.0, 0.0), pad));
         }
-        self.samples.push_back((left, right));
-        true
+        // Proportional steering: 1000 samples off target is 0.6 %.
+        let error = VIDEO_SLOT_AUDIO_TARGET as f64 - self.samples.len() as f64;
+        let ratio =
+            (1.0 + error / (4.0 * f64::from(crate::audio::MIX_SAMPLE_RATE))).clamp(0.99, 1.01);
+        let step = 1.0 / ratio;
+        // Linear interpolation over `last, chunk[0], chunk[1], ...`.
+        let n = chunk.len() as f64;
+        let mut t = self.phase;
+        while t < n {
+            let i = t as usize;
+            let f = (t - i as f64) as f32;
+            let a = if i == 0 { self.last } else { chunk[i - 1] };
+            let b = chunk[i];
+            self.samples
+                .push_back((a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f));
+            t += step;
+        }
+        self.phase = t - n;
+        self.last = end;
+        while self.samples.len() > VIDEO_SLOT_AUDIO_RING_LIMIT {
+            self.samples.pop_front();
+        }
     }
 
     pub fn next_sample(&mut self) -> (f32, f32) {
-        self.samples.pop_front().unwrap_or((0.0, 0.0))
+        match self.samples.pop_front() {
+            Some(s) => s,
+            None => {
+                self.starved = true;
+                (0.0, 0.0)
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
     }
 
     pub fn clear(&mut self) {
         self.samples.clear();
+        self.phase = 0.0;
+        self.starved = false;
     }
 }
 
@@ -3545,14 +3600,53 @@ mod tests {
     }
 
     #[test]
+    fn the_video_slot_ring_rides_a_frame_rate_mismatch_without_gaps() {
+        // The card hands over 1471.5 samples a frame on average; the mixer
+        // takes a frame of 1468 (or 1475) samples: neither runs dry or
+        // grows once settled.
+        for take in [1468usize, 1475] {
+            let mut ring = VideoSlotAudioRing::default();
+            let mut gaps_after_warmup = 0;
+            for frame in 0..3000 {
+                let n = if frame % 2 == 0 { 1471 } else { 1472 };
+                ring.push_chunk(&vec![(0.5, 0.5); n]);
+                for _ in 0..take {
+                    let (l, _) = ring.next_sample();
+                    if frame > 100 && l == 0.0 {
+                        gaps_after_warmup += 1;
+                    }
+                }
+            }
+            assert_eq!(gaps_after_warmup, 0, "taking {take} a frame");
+            // Settled within a frame or so of the target, not drifting.
+            let level = ring.len();
+            assert!(
+                level > 500 && level < VIDEO_SLOT_AUDIO_TARGET + 1000,
+                "level {level} taking {take}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_video_slot_ring_rebuilds_its_margin_once() {
+        let mut ring = VideoSlotAudioRing::default();
+        // A stalled source: the mixer runs the ring dry.
+        for _ in 0..100 {
+            ring.next_sample();
+        }
+        ring.push_chunk(&[(0.5, 0.5); 1471]);
+        assert!(ring.len() >= VIDEO_SLOT_AUDIO_TARGET);
+    }
+
+    #[test]
     fn a_video_slot_cards_sound_reaches_the_mix() {
         let (mut paula, frames) = paula_with_collect_sink();
         paula.set_led_filter_guest(false);
         let ram = vec![0u8; 64];
         // A frame of the Toaster's Program sound, nothing from Paula.
-        for _ in 0..1471 {
-            paula.video_slot_audio_mut().push_frame(0.25, -0.25);
-        }
+        paula
+            .video_slot_audio_mut()
+            .push_chunk(&[(0.25, -0.25); 1471]);
         paula.tick_audio(4000, DMACON_DMAEN, &ram);
         let frames = frames.borrow();
         assert!(

@@ -70,6 +70,11 @@ pub const LINE_PIXELS: usize = 768;
 /// self-test uses line 504, and 510/511 are the "dummy" line number it
 /// puts on lines that carry nothing).
 pub const LINES: usize = 512;
+
+/// How far right the card stores a write line sent with EH0 `LUST` clear:
+/// the switcher scrolls the second pass of its zipper write 16 hi-res
+/// pixels left (cop.a, "shift left 16 HIRES pixels").
+const ZIPPER_SHIFT: usize = 16;
 /// DV1 and DV2.
 pub const BANKS: usize = 2;
 /// Normal and complemented copies of each line.
@@ -474,9 +479,19 @@ impl Toaster {
         let bank = self.write_bank();
         let x0 = Self::pixel0_column(field);
         let step = field.canvas_scale as i64;
+        // The second pass of a zipper write (LUST clear) lands 16 samples
+        // right of where its pixels are on the Amiga line; the header
+        // pixels left of the bitmap stay out of the picture.
+        let shift = if self.regs().lust() { 0 } else { ZIPPER_SHIFT };
         let store = self.frame_store.line_mut(bank, complemented, line);
         for (p, byte) in store.iter_mut().enumerate() {
-            let Ok(col) = usize::try_from(x0 + p as i64 * step) else {
+            let Some(src) = p.checked_sub(shift) else {
+                continue;
+            };
+            if shift != 0 && src < video::PICTURE_X0 {
+                continue;
+            }
+            let Ok(col) = usize::try_from(x0 + src as i64 * step) else {
                 continue;
             };
             let Some(&pixel) = row.get(col) else {
@@ -948,10 +963,8 @@ impl Toaster {
             let Some(sound) = self.video.input_sound(n) else {
                 continue;
             };
-            for (i, o) in out.iter_mut().enumerate() {
-                // A frame's sound is one sample longer or shorter than
-                // another's now and then: hold the last.
-                let (l, r) = sound.get(i).or(sound.last()).copied().unwrap_or((0.0, 0.0));
+            // A source frame's sound (1001/30 ms) fitted to the Amiga's.
+            for (o, (l, r)) in out.iter_mut().zip(crate::videoslot::resample(sound, len)) {
                 o.0 += l * w;
                 o.1 += r * w;
             }
@@ -1239,12 +1252,25 @@ mod tests {
     /// Framestore line `line` written with `bytes` from card pixel 12 by
     /// the four passes the switcher makes, with `OBR` as given.
     fn write_line(card: &mut Toaster, obr: bool, line: usize, bytes: &[u8]) {
+        write_line_pass(card, obr, line, bytes, true, 0);
+    }
+
+    /// One write of `line`, with EH0's `LUST` as given and the bitmap
+    /// drawn `left` pixels left of card pixel 12 (a zipper's second pass).
+    fn write_line_pass(
+        card: &mut Toaster,
+        obr: bool,
+        line: usize,
+        bytes: &[u8],
+        lust: bool,
+        left: usize,
+    ) {
         let mut eh0 = Line::new(23);
         eh0.header(Header {
             r: 0x8000 | if obr { EH0R_OBR } else { 0 },
             g: 0x0100,
             b: 0xF000,
-            i: 0x0F00,
+            i: if lust { 0x0F00 } else { 0x0E00 },
         });
         card.field_complete(&eh0.field(), BeamPos::default());
         let l = (line / 2) as u16;
@@ -1257,13 +1283,13 @@ mod tests {
                 b: (l & 0xF) << 12,
                 i: (l >> 4) << 12,
             });
-            for (k, &byte) in bytes.iter().enumerate() {
+            for (k, &byte) in bytes.iter().enumerate().skip(left) {
                 let nibble = if g & 0x4000 != 0 {
                     byte >> 4
                 } else {
                     byte & 0xF
                 };
-                data.card_pixel(12 + k, nibble);
+                data.card_pixel(12 + k - left, nibble);
             }
             card.field_complete(&data.field(), BeamPos::default());
         }
@@ -1277,6 +1303,21 @@ mod tests {
             g: if complemented { 0x2000 } else { 0 } | if field_ii { 0x1000 } else { 0 },
             b: (l & 0xF) << 12,
             i: (l >> 4) << 12,
+        }
+    }
+
+    #[test]
+    fn a_zipper_writes_second_pass_lands_where_the_first_did() {
+        // The switcher's AA framestore load: the whole line with LUST set,
+        // then again with LUST clear and the bitmap scrolled 16 pixels
+        // left. Both passes must agree on every sample.
+        let mut card = Toaster::new();
+        let bytes: Vec<u8> = (0..756).map(|k| 71 + (k % 129) as u8).collect();
+        write_line_pass(&mut card, false, 100, &bytes, true, 0);
+        write_line_pass(&mut card, false, 100, &bytes, false, 16);
+        let stored = card.frame_store.line(0, false, 100);
+        for k in [0usize, 4, 15, 16, 300, 731, 739] {
+            assert_eq!(stored[12 + k], bytes[k], "sample {}", 12 + k);
         }
     }
 
