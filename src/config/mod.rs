@@ -508,6 +508,12 @@ pub struct Config {
     pub parallel: ParallelConfig,
     /// `[video_slot] card`: the card in the video slot.
     pub video_slot: VideoSlotCard,
+    /// `[video_slot] media`: the card's host folder, when set.
+    pub video_slot_media: Option<PathBuf>,
+    /// `[video_slot] monitors`: open windows for the card's outputs.
+    pub video_slot_monitors: bool,
+    /// `[video_slot] preview_overlay`: the Toaster's interface over Preview.
+    pub video_slot_preview_overlay: bool,
 }
 
 /// How much of the overscan field the window presents. The
@@ -2983,6 +2989,9 @@ impl Default for Config {
             serial: SerialConfig::default(),
             parallel: ParallelConfig::default(),
             video_slot: VideoSlotCard::None,
+            video_slot_media: None,
+            video_slot_monitors: true,
+            video_slot_preview_overlay: false,
             paths: crate::pathconf::Paths::default(),
         }
     }

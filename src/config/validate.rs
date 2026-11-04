@@ -543,6 +543,15 @@ impl TryFrom<RawConfig> for Config {
                 }
             },
         };
+        let video_slot_media = raw
+            .video_slot
+            .media
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(PathBuf::from);
+        let video_slot_monitors = raw.video_slot.monitors.unwrap_or(true);
+        let video_slot_preview_overlay = raw.video_slot.preview_overlay.unwrap_or(false);
         let parallel_joysticks = [
             parse_parallel_socket(
                 raw.input.port3.as_deref(),
@@ -1583,6 +1592,9 @@ impl TryFrom<RawConfig> for Config {
             serial,
             parallel,
             video_slot,
+            video_slot_media,
+            video_slot_monitors,
+            video_slot_preview_overlay,
             paths: raw.paths,
         })
     }
