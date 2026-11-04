@@ -731,13 +731,34 @@ plays the folder's files (stills decoded with the `image` crate, video
 through ffmpeg) into a two-frame channel, one frame taken per emulated
 frame. The outputs are published per frame into `videoslot::CardOutput`s,
 which the window layer shows as monitor windows (`card_monitors.rs`) and
-which record themselves (ZMBV AVI with a silent track, via `recorder.rs`)
-when asked.
+which record themselves (ZMBV AVI, via `recorder.rs`) when asked. A video
+file's sound is decoded by a second ffmpeg (stereo s16le at the mixer's
+44.1 kHz, 1001/30000 s per frame) and travels with each picture; Program's
+sound is the sum of the inputs by how much of each it shows (A·(1−k̄) +
+B·k̄, latch wipes by pixel share, a key's `LK` source, a live bank 0 by its
+`IS` input; framestores and the matte are silent). It goes to Paula's mixer
+as a `videoslot` source and into the Program recording. The real card had
+no audio; this stands in for the audio-follow-video mixer beside it.
 
-Not modelled yet: line-addressed framestore playback (`LINP` off: DVE and
-LUT effects), `QUAF`/`TRANSQUAD` digital effects, PED/GAIN/phase trims,
-the blanking interval of digitised lines (the AutoHue camera test reads the
-colour burst there), and the Flyer.
+The digital effects (`dve.rs`) run with EH0 `LINP` and `LUT` both off. The
+framestore is then addressed per line and per quad by the Amiga picture
+itself: each picture line's header carries the source line number L
+(`((I>>12)<<4) | (B>>12)`, whatever the header kind), and each quad of its
+B/I data lines a source quad number Q (the quad labels of read-back, I high
+nibble and B low, first pixel most significant). Picture row y (field line
+fl = y+1, parity fl&1, Amiga line 21+(fl>>1)) shows framestore row
+2L+parity−1; card pixel p shows sample 4·Q(p>>2) + (p&3). Q below 192
+addresses a quad, $E8-$EF are the eight `_BCPalette` colours and the rest
+black. The same codes drive `QUAF` (key 0 on $FF, CD elsewhere) and
+`TRANSQUAD` (Q ≥ $F8 with the pixel's bit of Q's low nibble set: CD), so a
+digital effect is a frame of quad addresses the switcher builds in chip
+RAM, with A on background, B the moved framestore and the key from the
+same map. The map applies to every framestore bus except a live bank 0
+on `IS`.
+
+Not modelled yet: the LUT (`LUT` on: colour and posterise effects),
+PED/GAIN/phase trims, the blanking interval of digitised lines (the AutoHue
+camera test reads the colour burst there), and the Flyer.
 
 ## Interlace (`video/deinterlace.rs`)
 

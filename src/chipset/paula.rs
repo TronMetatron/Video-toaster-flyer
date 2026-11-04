@@ -437,6 +437,35 @@ impl MhiAudioRing {
     }
 }
 
+/// A video-slot card's sound at the mixer rate. The card pushes a video
+/// frame's worth (about 1471 samples) at the end of each frame and the
+/// mixer pops one per output sample, so it holds about a frame; the limit
+/// (a few frames) only guards against a consumer that stops.
+#[derive(Debug, Default)]
+pub struct VideoSlotAudioRing {
+    samples: std::collections::VecDeque<(f32, f32)>,
+}
+
+const VIDEO_SLOT_AUDIO_RING_LIMIT: usize = 8192;
+
+impl VideoSlotAudioRing {
+    pub fn push_frame(&mut self, left: f32, right: f32) -> bool {
+        if self.samples.len() >= VIDEO_SLOT_AUDIO_RING_LIMIT {
+            return false;
+        }
+        self.samples.push_back((left, right));
+        true
+    }
+
+    pub fn next_sample(&mut self) -> (f32, f32) {
+        self.samples.pop_front().unwrap_or((0.0, 0.0))
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+}
+
 /// Push one sample into a debugger oscilloscope ring, evicting the oldest
 /// once the ring is full so it always holds the most recent AUDIO_SCOPE_LEN.
 fn scope_push(ring: &mut std::collections::VecDeque<i8>, sample: i8) {
@@ -597,6 +626,11 @@ pub struct Paula {
     // own tick before it reaches this ring -- see `MhiAudioRing`'s doc
     // comment.
     mhi_audio: MhiAudioRing,
+    // Sound from a video-slot card (the Video Toaster's inputs, following
+    // its Program output), at the mixer rate, pushed a video frame at a
+    // time after each field. Not machine state a save state needs.
+    #[serde(skip, default)]
+    video_slot_audio: VideoSlotAudioRing,
     // Set once the device on the serial port has said it makes no sound
     // here, which is the usual answer: a machine with nothing on its MIDI
     // port then costs one predictable branch a sample and nothing else.
@@ -728,6 +762,7 @@ impl Paula {
             cd_audio: CdAudioRing::default(),
             toccata_audio: ToccataAudioRing::default(),
             mhi_audio: MhiAudioRing::default(),
+            video_slot_audio: VideoSlotAudioRing::default(),
             synth_silent: false,
             drive_sounds: DriveSounds::new(),
             dma_addr_mask: 0x001F_FFFF,
@@ -1071,6 +1106,10 @@ impl Paula {
 
     pub fn mhi_audio_mut(&mut self) -> &mut MhiAudioRing {
         &mut self.mhi_audio
+    }
+
+    pub fn video_slot_audio_mut(&mut self) -> &mut VideoSlotAudioRing {
+        &mut self.video_slot_audio
     }
 
     /// All three rings together, as disjoint field borrows -- the bus's
@@ -2410,6 +2449,11 @@ impl Paula {
         left += mhi_left;
         right += mhi_right;
         self.audio.push_source("mhi", mhi_left, mhi_right);
+        // A video-slot card's sound, line-mixed like CD-DA.
+        let (slot_left, slot_right) = self.video_slot_audio.next_sample();
+        left += slot_left;
+        right += slot_right;
+        self.audio.push_source("videoslot", slot_left, slot_right);
         if let (true, Some(capture)) = (observe_host, self.capture.as_mut()) {
             capture.push((left, right));
         }
@@ -3498,6 +3542,23 @@ mod tests {
             "muted CD must be silent"
         );
         assert!(paula.cd_scope_samples().iter().any(|&s| s != 0));
+    }
+
+    #[test]
+    fn a_video_slot_cards_sound_reaches_the_mix() {
+        let (mut paula, frames) = paula_with_collect_sink();
+        paula.set_led_filter_guest(false);
+        let ram = vec![0u8; 64];
+        // A frame of the Toaster's Program sound, nothing from Paula.
+        for _ in 0..1471 {
+            paula.video_slot_audio_mut().push_frame(0.25, -0.25);
+        }
+        paula.tick_audio(4000, DMACON_DMAEN, &ram);
+        let frames = frames.borrow();
+        assert!(
+            frames.iter().any(|&(l, r)| l > 0.1 && r < -0.1),
+            "the card's sound should reach the sink"
+        );
     }
 
     #[test]

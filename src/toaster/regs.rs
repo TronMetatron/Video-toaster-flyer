@@ -89,6 +89,11 @@ impl Regs<'_> {
     pub fn werb(&self) -> bool {
         self.eh(0).g & 0x0100 != 0
     }
+    /// LUT: the framestore plays through the card's look-up table (the B&W
+    /// and colour LUT modes), not a line-addressed DVE.
+    pub fn lut(&self) -> bool {
+        self.eh(0).b & 0x0200 != 0
+    }
 
     /// Lines flagged CERB carry Amiga data for the framestore (a write)
     /// rather than a request to digitise the input.

@@ -918,6 +918,13 @@ subfolders on first use:
   else; video files are decoded by ffmpeg, found as `ffmpeg.exe` (or
   `ffmpeg`) in the folder itself, beside Copperline, or on the `PATH`.
 - `Output`: recordings of the Program output (AVI, see below).
+
+A video file's sound comes along with its picture and follows the switcher:
+what is on Program is what you hear, through the emulator's sound output,
+mixed by how much of each input Program shows (a dissolve crossfades the
+sound, a wipe by area, framestores and mattes are silent). Recordings carry
+the same sound. The real card handles picture only; this stands in for the
+audio-follow-video mixer beside it.
 - `Flyer`: clips for the Video Flyer (not emulated yet).
 
 With `monitors` on, the card's two outputs open as windows of their own,

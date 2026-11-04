@@ -58,7 +58,7 @@ fn yiq(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
 }
 
 #[inline]
-fn rgba_of_yiq(y: f32, i: f32, q: f32) -> u32 {
+pub fn rgba_of_yiq(y: f32, i: f32, q: f32) -> u32 {
     let r = y + 0.956 * i + 0.621 * q;
     let g = y - 0.272 * i - 0.647 * q;
     let b = y - 1.106 * i + 1.703 * q;
