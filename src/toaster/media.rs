@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub use super::video::{PICTURE_H, PICTURE_W};
@@ -232,12 +232,26 @@ enum Message {
     NoSignal,
 }
 
+/// What an input's worker and its owner share: a file the input is held
+/// to instead of its folder's contents, and what it is playing.
+#[derive(Default)]
+struct Shared {
+    pinned: Mutex<Option<PathBuf>>,
+    playing: Mutex<Option<PathBuf>>,
+}
+
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// One input connector.
 pub struct InputFeed {
     rx: Receiver<Message>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     current: Option<Picture>,
+    dir: PathBuf,
+    shared: Arc<Shared>,
 }
 
 impl InputFeed {
@@ -248,16 +262,49 @@ impl InputFeed {
         let (tx, rx) = sync_channel(2);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let shared = Arc::new(Shared::default());
+        let worker_shared = Arc::clone(&shared);
+        let worker_dir = dir.clone();
         let worker = std::thread::Builder::new()
             .name(format!("toaster-input-{}", index + 1))
-            .spawn(move || Worker::new(index, dir, ffmpeg, tx, worker_stop).run())
+            .spawn(move || {
+                Worker::new(index, worker_dir, ffmpeg, tx, worker_stop, worker_shared).run()
+            })
             .ok();
         Self {
             rx,
             stop,
             worker,
             current: None,
+            dir,
+            shared,
         }
+    }
+
+    /// The input's folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The playable files in the folder, in the order they play.
+    pub fn files(&self) -> Vec<PathBuf> {
+        scan(&self.dir)
+    }
+
+    /// Hold the input to one file (anywhere on the host) instead of its
+    /// folder, or with `None` go back to the folder. The change lands
+    /// within a rescan.
+    pub fn pin(&self, file: Option<PathBuf>) {
+        *locked(&self.shared.pinned) = file;
+    }
+
+    pub fn pinned(&self) -> Option<PathBuf> {
+        locked(&self.shared.pinned).clone()
+    }
+
+    /// The file on the input now, if any.
+    pub fn playing(&self) -> Option<PathBuf> {
+        locked(&self.shared.playing).clone()
     }
 
     /// Take the next frame, if the source has one ready: call once per
@@ -294,6 +341,7 @@ struct Worker {
     ffmpeg: Option<PathBuf>,
     tx: SyncSender<Message>,
     stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     warned_no_ffmpeg: bool,
 }
 
@@ -304,6 +352,7 @@ impl Worker {
         ffmpeg: Option<PathBuf>,
         tx: SyncSender<Message>,
         stop: Arc<AtomicBool>,
+        shared: Arc<Shared>,
     ) -> Self {
         Self {
             index,
@@ -311,8 +360,24 @@ impl Worker {
             ffmpeg,
             tx,
             stop,
+            shared,
             warned_no_ffmpeg: false,
         }
+    }
+
+    /// What the input plays: the pinned file while it exists, else the
+    /// folder's files.
+    fn sources(&self) -> Vec<PathBuf> {
+        if let Some(file) = locked(&self.shared.pinned).clone() {
+            if file.is_file() && classify(&file).is_some() {
+                return vec![file];
+            }
+        }
+        scan(&self.dir)
+    }
+
+    fn set_playing(&self, file: Option<&Path>) {
+        *locked(&self.shared.playing) = file.map(Path::to_path_buf);
     }
 
     fn stopped(&self) -> bool {
@@ -353,7 +418,7 @@ impl Worker {
         let mut next = 0usize;
         let mut signal = false;
         while !self.stopped() {
-            let now = scan(&self.dir);
+            let now = self.sources();
             if now != files {
                 if !now.is_empty() {
                     log::info!(
@@ -367,6 +432,7 @@ impl Worker {
                 next = 0;
             }
             if files.is_empty() {
+                self.set_playing(None);
                 if signal {
                     signal = false;
                     if !self.send(Message::NoSignal) {
@@ -380,6 +446,7 @@ impl Worker {
             }
             let file = files[next % files.len()].clone();
             next = next.wrapping_add(1);
+            self.set_playing(Some(&file));
             let played = if classify(&file) == Some(true) {
                 self.play_video(&file, &files)
             } else {
@@ -416,7 +483,7 @@ impl Worker {
             if !self.nap(RESCAN.min(STILL_HOLD)) {
                 return Played::Stop;
             }
-            if scan(&self.dir) != files {
+            if self.sources() != files {
                 return Played::Shown;
             }
             if files.len() > 1 && started.elapsed() >= STILL_HOLD {
@@ -498,7 +565,7 @@ impl Worker {
             }
             if last_scan.elapsed() >= RESCAN {
                 last_scan = Instant::now();
-                if scan(&self.dir) != files {
+                if self.sources() != files {
                     break Played::Shown;
                 }
             }

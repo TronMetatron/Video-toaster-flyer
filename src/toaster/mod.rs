@@ -635,6 +635,42 @@ impl VideoSlotDevice for Toaster {
         self.video.outputs()
     }
 
+    fn control_status(&self) -> serde_json::Value {
+        self.status_value()
+    }
+
+    fn control(
+        &mut self,
+        command: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        match command {
+            "input" => {
+                let n = params
+                    .get("input")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|n| (1..=media_inputs()).contains(&(*n as usize)))
+                    .ok_or_else(|| format!("input must be 1-{}", media_inputs()))?
+                    as usize;
+                let file = match params.get("file") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(f)) if f.is_empty() => None,
+                    Some(serde_json::Value::String(f)) => {
+                        let path = std::path::PathBuf::from(f);
+                        if !path.is_file() {
+                            return Err(format!("{f}: no such file"));
+                        }
+                        Some(path)
+                    }
+                    Some(_) => return Err("file must be a path string or null".into()),
+                };
+                self.video.pin_input(n - 1, file)?;
+                Ok(serde_json::json!({ "inputs": self.video.input_status() }))
+            }
+            other => Err(format!("the toaster has no {other} control")),
+        }
+    }
+
     fn parallel_read(&mut self, live: &mut LiveField<'_>, _ddrb: u8) -> Option<u8> {
         self.scan_to_beam(live);
         if !self.active {
@@ -646,7 +682,80 @@ impl VideoSlotDevice for Toaster {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn media_inputs() -> usize {
+    media::INPUTS
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn media_inputs() -> usize {
+    4
+}
+
+/// The folder, under the card's host folder, through which the host hands
+/// ARexx jobs to the Amiga (S:Copperline-Link.rexx runs them).
+pub const LINK_FOLDER: &str = ".copperline";
+
 impl Toaster {
+    /// The card's state as the control protocol reports it.
+    fn status_value(&self) -> serde_json::Value {
+        use regs::{Cds, Mux};
+        let r = self.regs();
+        let mux = |m: Mux, seven: &str| -> String {
+            match m {
+                Mux::Vid(n) => format!("Input {}", n + 1),
+                Mux::Dac(b) => format!("DV{}", b + 1),
+                Mux::Encoder if r.matte() => "Matte".to_string(),
+                Mux::Encoder => "Amiga".to_string(),
+                Mux::Seven => seven.to_string(),
+            }
+        };
+        let cds = match r.cds() {
+            Cds::Quaf => "digital effect (QUAF, not emulated)",
+            Cds::PixelSw => "Amiga transparency (PIXELSW)",
+            Cds::TransQuad => "transparent quads (TRANSQUAD)",
+            Cds::LumKey => "luminance key (LUMKEY)",
+            Cds::Dibgr => "Amiga 4-bit key (DIBGR)",
+            Cds::Dib => "Amiga 2-bit wipe (DIB)",
+            Cds::RgQuad => "RGQUAD",
+            Cds::Cd => "mix (CD)",
+        };
+        let (ma, mb, mp) = r.matte_code();
+        let outputs: Vec<serde_json::Value> = self
+            .video
+            .outputs()
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "name": o.name(),
+                    "recording": o.recording_path().map(|p| p.display().to_string()),
+                })
+            })
+            .collect();
+        let root = self.video.media_root();
+        serde_json::json!({
+            "card": "NewTek Video Toaster 4000",
+            "switcher_active": self.active,
+            "program": {
+                "a": mux(r.am(), "Mono"),
+                "b": mux(r.bm(), "Mono"),
+                "fader": r.cd(),
+                "fader_note": "0 = all A, 255 = all B; the T-bar and AUTO move it",
+                "mode": cds,
+            },
+            "preview": mux(r.pv(), "Program"),
+            "framestore_input": mux(r.is(), "Program"),
+            "key_source": mux(r.lk(), "External"),
+            "luma_key_level": r.lka(),
+            "matte": {"a": ma, "b": mb, "hue": mp},
+            "live_framestore": r.abse(),
+            "outputs": outputs,
+            "inputs": self.video.input_status(),
+            "media_root": root.map(|p| p.display().to_string()),
+            "link_folder": root.map(|p| p.join(LINK_FOLDER).display().to_string()),
+        })
+    }
+
     /// What mux position `mux` carries, as a picture, into `out`.
     /// `role` says which mux it is: position 7 means a different thing on
     /// each.

@@ -763,6 +763,12 @@ pub(crate) struct RawVideoSlot {
     /// switcher asks (its preview-overlay preference). Default false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) preview_overlay: Option<bool>,
+    /// Also mount the card's host folder in the Amiga as a volume of this
+    /// name (e.g. "ToasterFiles"), so the Toaster software can load and
+    /// save there and the control link can reach the Amiga. Default: not
+    /// mounted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) volume: Option<String>,
 }
 
 /// `[parallel]` peripheral selection for the Amiga Centronics parallel port.
