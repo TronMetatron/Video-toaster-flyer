@@ -737,8 +737,16 @@ impl Toaster {
             "card": "NewTek Video Toaster 4000",
             "switcher_active": self.active,
             "program": {
-                "a": mux(r.am(), "Mono"),
-                "b": mux(r.bm(), "Mono"),
+                "a": if r.amwipe() && r.am() == Mux::Seven {
+                    "per pixel (latch effect)".to_string()
+                } else {
+                    mux(r.am(), "Mono")
+                },
+                "b": if r.bmwipe() && r.bm() == Mux::Seven {
+                    "per pixel (latch effect)".to_string()
+                } else {
+                    mux(r.bm(), "Mono")
+                },
                 "fader": r.cd(),
                 "fader_note": "0 = all A, 255 = all B; the T-bar and AUTO move it",
                 "mode": cds,
@@ -820,18 +828,53 @@ impl Toaster {
         out.copy_from_slice(&pic[..out.len()]);
     }
 
+    /// What a fader bus carries: its mux position, or with its WIPE bit
+    /// and position 7, a source per pixel chosen by the Amiga picture.
+    fn bus_picture(
+        &mut self,
+        mux: regs::Mux,
+        latched: bool,
+        field: &FieldPixels<'_>,
+        out: &mut [u32],
+    ) {
+        if !(latched && mux == regs::Mux::Seven) {
+            self.source_picture(mux, video::Role::Fader, field, out);
+            return;
+        }
+        let codes = video::latch_codes(field, Self::pixel0_column(field));
+        let mut used = [false; 8];
+        for c in codes.iter() {
+            used[usize::from(c.unwrap_or(7))] = true;
+        }
+        let mut src = vec![video::black(); out.len()];
+        for code in (0..8u8).filter(|&c| used[usize::from(c)]) {
+            self.source_picture(
+                regs::Mux::from_code(code),
+                video::Role::Fader,
+                field,
+                &mut src,
+            );
+            for ((o, s), c) in out.iter_mut().zip(&src).zip(&codes) {
+                if c.unwrap_or(7) == code {
+                    *o = *s;
+                }
+            }
+        }
+    }
+
     /// Compose and publish one frame of the Program and Preview outputs.
     fn produce_outputs(&mut self, field: &FieldPixels<'_>) {
         let (am, bm, pv) = (self.regs().am(), self.regs().bm(), self.regs().pv());
+        let (amwipe, bmwipe) = (self.regs().amwipe(), self.regs().bmwipe());
         let n = video::PICTURE_W * video::PICTURE_H;
         let mut a = self.video.scratch();
-        self.source_picture(am, video::Role::Fader, field, &mut a);
+        self.bus_picture(am, amwipe, field, &mut a);
         let mut program = vec![video::black(); n];
-        if bm == am {
+        if bm == am && bmwipe == amwipe {
             program.copy_from_slice(&a);
         } else {
             let mut b = vec![video::black(); n];
-            self.source_picture(bm, video::Role::Fader, field, &mut b);
+            self.bus_picture(bm, bmwipe, field, &mut b);
             let key = self.fader_key(field);
             video::mix(&a, &b, &key, &mut program);
         }
@@ -847,9 +890,11 @@ impl Toaster {
         if self.diag {
             let r = self.regs();
             let state = format!(
-                "AM={:?} BM={:?} PV={:?} IS={:?} LK={:?} CDS={:?} CD={} matte={} {:?} live={} OBR={}",
+                "AM={:?}{} BM={:?}{} PV={:?} IS={:?} LK={:?} CDS={:?} CD={} matte={} {:?} live={} OBR={}",
                 r.am(),
+                if r.amwipe() { "+wipe" } else { "" },
                 r.bm(),
+                if r.bmwipe() { "+wipe" } else { "" },
                 r.pv(),
                 r.is(),
                 r.lk(),
@@ -960,6 +1005,29 @@ mod tests {
     struct Line {
         pixels: Vec<u32>,
         vpos: u32,
+    }
+
+    #[test]
+    fn a_latch_effect_picks_each_pixel_source_from_the_amiga_colour() {
+        // Picture row 1 is Amiga line AMIGA_LINE0 + 1.
+        let mut line = Line::new(video::AMIGA_LINE0 + 1);
+        let x0 = Toaster::pixel0_column(&line.field());
+        // Picture column c is card pixel PICTURE_X0 + c.
+        let at = |c: usize| x0 as usize + video::PICTURE_X0 + c;
+        // Transparent (T) pixels latch: DV1 (code 4, r1) from picture
+        // column 10, input 3 (code 2, r2) from 100; opaque pixels keep it.
+        let latch = |r: u8, b: u8| u32::from_le_bytes([r, 0, b, 0]);
+        line.pixels[at(10)] = latch(0x02, 0);
+        line.pixels[at(100)] = latch(0x04, 0);
+        line.pixels[at(200)] = latch(0x00, 0x04);
+        let codes = video::latch_codes(&line.field(), x0);
+        let row = &codes[video::PICTURE_W..2 * video::PICTURE_W];
+        assert_eq!(row[5], None);
+        assert_eq!(row[10], Some(4));
+        assert_eq!(row[99], Some(4));
+        assert_eq!(row[100], Some(2));
+        assert_eq!(row[200], Some(1));
+        assert_eq!(row[700], Some(1));
     }
 
     impl Line {

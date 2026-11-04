@@ -388,6 +388,31 @@ pub fn amiga_picture(field: &FieldPixels<'_>, x0: i64, out: &mut [u32]) {
     }
 }
 
+/// The per-pixel source codes of a latch effect (`AMWIPE`/`BMWIPE` with
+/// the bus at 7): a pixel whose colour carries the genlock T bit (shown
+/// transparent) sets the source from its low nibbles, b2 + 2·r2 + 4·r1,
+/// in the muxes' numbering (`LatchLUT`, animfxhandler.a); other pixels
+/// keep the source last set on the line. `None` before the first.
+pub fn latch_codes(field: &FieldPixels<'_>, x0: i64) -> Vec<Option<u8>> {
+    let mut codes = vec![None; PICTURE_W * PICTURE_H];
+    for (y, line) in codes.chunks_exact_mut(PICTURE_W).enumerate() {
+        let Some(row) = amiga_row(field, x0, y) else {
+            continue;
+        };
+        let mut held = None;
+        for (slot, px) in line.iter_mut().zip(row) {
+            if let Some(px) = px {
+                let [r, _, b, a] = px.to_le_bytes();
+                if a == 0 {
+                    held = Some(((b >> 2) & 1) | (((r >> 2) & 1) << 1) | (((r >> 1) & 1) << 2));
+                }
+            }
+            *slot = held;
+        }
+    }
+    codes
+}
+
 /// A per-pixel fader mix from the Amiga's control bits (the AGA low
 /// nibbles), for the modes that take one.
 pub fn amiga_key(field: &FieldPixels<'_>, x0: i64, mode: Cds, cd: u8) -> Vec<u8> {
