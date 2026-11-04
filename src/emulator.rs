@@ -4617,6 +4617,10 @@ fn build_machine_inner(
     }
     bus.set_video_standard(cfg.video_standard);
     bus.set_genlock(cfg.genlock);
+    if cfg.video_slot == crate::config::VideoSlotCard::Toaster {
+        bus.attach_video_slot(Box::new(crate::toaster::Toaster::new()));
+        info!("video slot: Video Toaster 4000 fitted");
+    }
     bus.set_chipset_revisions(cfg.agnus_revision, cfg.denise_revision);
     bus.set_rtc_present(cfg.rtc_present);
     bus.set_rtc_chip(cfg.rtc_chip);

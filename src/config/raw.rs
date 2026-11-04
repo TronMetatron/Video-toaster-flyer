@@ -119,6 +119,8 @@ pub struct RawConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) parallel: RawParallel,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) video_slot: RawVideoSlot,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) whdload: RawWhdload,
     /// `[[filesys]]` host-directory mount entries, in file order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -739,6 +741,15 @@ pub(crate) struct RawSerial {
     /// transport has no inbound side).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) session: Option<String>,
+}
+
+/// `[video_slot]`: the card in the A2000/A3000/A4000 video slot.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawVideoSlot {
+    /// `none` (default) or `toaster` (NewTek Video Toaster 4000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) card: Option<String>,
 }
 
 /// `[parallel]` peripheral selection for the Amiga Centronics parallel port.

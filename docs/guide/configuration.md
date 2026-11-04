@@ -889,6 +889,27 @@ genlock probe also finds the genlock, so the OS hides the programmable 31 kHz
 modes that a genlock cannot follow. A [video-slot card](../internals/video)
 that supplies its own sync sets this for as long as it is fitted.
 
+## `[video_slot]`
+
+```toml
+[video_slot]
+card = "toaster"   # "none" (default) or "toaster"
+```
+
+`card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
+A4000's video slot: a card that watches the digital RGB output line by line
+and answers on the parallel port, as the real one does. The NewTek switcher
+(Toaster 4.x) then starts and passes its own card tests; the Toaster software
+and the Kickstart ROM are not included and must be supplied. The card
+supplies genlock sync while fitted (see `[chipset] genlock`). What the
+emulation covers so far -- the line-header protocol, the framestore, the
+read-back used by the switcher's self-test and calibration -- is described
+in [](../internals/video) and in `src/toaster.rs`; there is no video input
+yet, so the switcher's picture areas stay empty and AutoHue asks for a
+source on input 1 (Cancel it). `COPPERLINE_DIAG_TOASTER=1` logs the card's
+decoding of what the switcher draws; `=fields` also dumps one field's line
+headers in forty.
+
 ## `[display]`
 
 ```toml

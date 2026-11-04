@@ -608,13 +608,18 @@ painted by the same `render_from_input` the display uses:
   with `wants_completed_fields`, which skips the extra render.
 - **The field in progress.** A card that reacts within the same field gets
   a `LiveField` on every guest read of `$BFE101`. Its `pixels()` call
-  renders a `RenderInput` built from the capture side
+  renders the beam's own line, and `line(v)` any line above the beam, from
+  a `RenderInput` built from the capture side
   (`RenderInput::from_bus_in_progress`, the in-progress halves of the
   `frame_*`/`last_frame_*` pairs: the frame-start chip-RAM snapshot and its
   beam-timed write log, captured bitplane rows and sprite lines, and the
-  frame's register events so far) down to the beam's own line, whose
-  captured words reach the beam; the render is reused while the beam stays
-  put.
+  frame's register events so far), sliced to start at that line: one row
+  per render, so software that polls the port thousands of times a field
+  stays cheap. A render is reused while the beam stays put. Slicing a
+  render at line N folds the register and palette writes above N into row
+  0's base state (`apply_render_events` treats events above the first
+  rendered line as that row's start state, including the ones that follow
+  an event already mapped to row 0).
 
 Both views paint a line wider than the display framebuffer. A video card
 samples the whole active line -- the Toaster's 768 pixels start at lo-res
@@ -649,6 +654,43 @@ card). A fitted card blocks run-ahead, since
 it holds state run-ahead cannot rewind. Like the parallel peripheral it is
 host-attached (`Bus::attach_video_slot`) and survives save-state loads; it
 is not itself serialised.
+
+### The Video Toaster (`toaster.rs`)
+
+`[video_slot] card = "toaster"` fits the one card so far. The NewTek
+protocol it decodes is written up at the top of `toaster.rs`; the parts
+pinned against the real 4.2 switcher are:
+
+- Every line's first sixteen lo-res pixels from comparator position `$5C`
+  (the switcher's sprites 0 and 1 at HSTART `$5B`) are the line header: four
+  words, one per card input line (`R`, `G`, `B`, `I`, each wired to two
+  bits of the AGA low nibbles). `R` bits 15-12 select an extended header
+  (`%1000` EH0 ... `%0111` EH7, `%1011` EH6 with the page in bits 11-8) or a
+  read request's pixel-in-quad (`%0000 %0010 %1100 %1110`); `%1111` with
+  the `G` write bit clear is a line that carries nothing. The switcher's
+  normal display uses EH0 lines everywhere, so EH0's control bits (`OBR`,
+  the bank select, above all) change within a field: the card takes the
+  headers of the field in progress in beam order (`scan_to_beam`, through
+  `LiveField::line`) before answering a read, then the completed field
+  finishes the lines the scan did not reach.
+- A write (`G` bit 15) puts the line's `R|G<<1|B<<2|I<<3` nibbles into
+  framestore line `2L + 1` (fields I/III) or `2L` (II/IV), high or low
+  nibble, normal or complemented copy, in bank `OBR`. The card's pixel 0 is
+  lo-res `$5A`; the switcher's bitmaps start at pixel 12 (quad 3), which
+  is what its `TestReadScanLine` self-test compares against.
+- A read request labels every quad of the line with the quad to return
+  (the `I` line is the label's high nibble, `B` its low nibble; on the wire
+  the label is the plain quad number), and the port answers with byte
+  `4Q + pixel` of the requested line from bank `!OBR`, for the label ten
+  quads (`READ_PIPELINE_PIXELS`) before the beam: fitted so each of the
+  `HS.default` table's read positions lands inside its 18-quad label run
+  with the CIA access's E-clock slip either way.
+
+The emulated 4.2 switcher passes its read-back self-test and calibration
+with this and comes up on its main screen. Not modelled yet: the extended
+headers' meaning beyond `OBR` (input muxes, keyer, mattes), the framestore
+as a video *output* (the Toaster's program output is not shown anywhere),
+video inputs, and the Flyer.
 
 ## Interlace (`video/deinterlace.rs`)
 
