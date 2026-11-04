@@ -41,6 +41,8 @@ pub struct Video {
     inputs: Vec<InputFeed>,
     program: Arc<CardOutput>,
     preview: Arc<CardOutput>,
+    /// The host folder the connectors live in.
+    media_root: Option<PathBuf>,
     /// Pictures decoded from the two framestore banks this frame (lazily).
     decoded: [Option<Vec<u32>>; 2],
     /// The two fields of a frame: outputs publish on the second.
@@ -55,6 +57,7 @@ pub struct Video {
 
 impl Video {
     pub fn new(media_root: Option<PathBuf>) -> Self {
+        let root = media_root.clone();
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let (inputs, output_dir) = match media_root {
             Some(root) => {
@@ -85,6 +88,7 @@ impl Video {
             inputs,
             program: CardOutput::new("Program", ASPECT, output_dir.clone()),
             preview: CardOutput::new("Preview", ASPECT, output_dir),
+            media_root: root,
             decoded: [None, None],
             odd_field: false,
             scratch: Vec::new(),
@@ -96,6 +100,54 @@ impl Video {
 
     pub fn outputs(&self) -> Vec<Arc<CardOutput>> {
         vec![Arc::clone(&self.preview), Arc::clone(&self.program)]
+    }
+
+    pub fn media_root(&self) -> Option<&std::path::Path> {
+        self.media_root.as_deref()
+    }
+
+    /// Each input's folder, files, pinned file and what it plays now.
+    pub fn input_status(&self) -> Vec<serde_json::Value> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let show = |p: &std::path::Path| p.display().to_string();
+            self.inputs
+                .iter()
+                .enumerate()
+                .map(|(n, feed)| {
+                    serde_json::json!({
+                        "input": n + 1,
+                        "folder": show(feed.dir()),
+                        "files": feed.files().iter().map(|f| show(f)).collect::<Vec<_>>(),
+                        "pinned": feed.pinned().as_deref().map(show),
+                        "playing": feed.playing().as_deref().map(show),
+                        "signal": feed.picture().is_some(),
+                    })
+                })
+                .collect()
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Hold input `n` (0-based) to `file`, or back to its folder.
+    pub fn pin_input(&self, n: usize, file: Option<PathBuf>) -> Result<(), String> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let feed = self
+                .inputs
+                .get(n)
+                .ok_or_else(|| "the card has no host folder, so no inputs".to_string())?;
+            feed.pin(file);
+            Ok(())
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = (n, file);
+            Err("inputs are not available in this build".into())
+        }
     }
 
     /// The current picture of input `n`, if something is plugged in.

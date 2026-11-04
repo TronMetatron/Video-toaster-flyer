@@ -897,6 +897,7 @@ card = "toaster"          # "none" (default) or "toaster"
 media = "D:/Toster/Amiga Toaster Files"   # the card's host folder
 # monitors = true         # Preview and Program monitor windows (default true)
 # preview_overlay = false # the switcher interface over Preview (default false)
+# volume = "ToasterFiles"  # also mount media in the Amiga as ToasterFiles:
 ```
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
@@ -927,6 +928,34 @@ recording the Program output into `Output` (the power lamp lights red while
 it runs); **Recording > Record Toaster Program** does the same. The monitor
 artwork can be replaced by a `monitor.png` in the media folder: the tube is
 found as the area around the picture's centre enclosed by a near-black gap.
+
+`volume` also mounts the media folder in the Amiga as a volume of that
+name (like a `[[filesys]]` entry, never a boot candidate), so the Toaster
+software can load framestores from the input folders and save into
+`Output`, and so the control link below can reach the Amiga. The usual
+name is `ToasterFiles`.
+
+**Control link.** With `volume` set and `S:Copperline-Link.rexx` (from
+Copperline's `assets/toaster`) started by `S:User-Startup`
+(`Run >NIL: SYS:Rexxc/RX S:Copperline-Link.rexx`), an MCP client can drive
+the Toaster software itself: the bridge drops ARexx jobs into the media
+folder's `.copperline` subfolder and the script runs them inside the Amiga
+(see [MCP server](#mcp-server) in the control-protocol reference: tools
+`toaster_switcher`, `toaster_project`, `toaster_rexx`, next to
+`toaster_status`, `toaster_capture`, `toaster_record` and
+`toaster_input`).
+
+**Flyer clips.** The `flyerclip` program (built with Copperline) converts
+between video files and NewTek Video Flyer clips, the Flyer's own format:
+VTASC-coded NTSC composite fields and 16-bit stereo sound
+(`crates/flyerclip`, transcribed from NewTek's Flyer sources; the format is
+written up in `crates/flyerclip/FORMAT.md`). `flyerclip import movie.mp4`
+writes `movie.clip` into the media folder's `Flyer` folder; `flyerclip
+export movie.clip` writes `movie.mp4` beside it; `flyerclip info` describes
+a clip. Dropping a file on the program does the right one. `--hq5`/`--hq6`
+give each field a larger budget, `--no-audio` drops the sound and `--seconds
+N` stops early. ffmpeg does the decoding and encoding. The Flyer itself is
+not emulated yet; the clips are made for when it is.
 
 `preview_overlay` lets the switcher draw its interface over the Preview
 output when its own preference asks for it, as a one-monitor Toaster setup

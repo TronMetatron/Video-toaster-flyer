@@ -122,12 +122,76 @@ pub fn decode_line(normal: &[u8], complemented: &[u8], line: usize, out: &mut [u
     }
 }
 
+/// Decode one line from a single copy, with no complemented twin to pair
+/// it with (a Flyer field, or any one field of moving video): a notch at
+/// the subcarrier (`[1, 2, 1] / 4` over samples two apart) keeps luma, and
+/// chroma is what it takes out. `positive` is the line's subcarrier phase
+/// as stored (a complemented copy is the opposite of its picture line's).
+pub fn decode_single(samples: &[u8], positive: bool, out: &mut [u32]) {
+    let n = samples.len().min(out.len());
+    if n == 0 {
+        return;
+    }
+    let s = if positive { 1.0 } else { -1.0 };
+    let at = |p: isize| f32::from(samples[p.clamp(0, n as isize - 1) as usize]);
+    let luma: Vec<f32> = (0..n as isize)
+        .map(|p| (at(p - 2) + 2.0 * at(p) + at(p + 2)) / 4.0)
+        .collect();
+    // Chroma per sample, signed onto its axis: +I, +Q, +I, +Q.
+    let chroma = |p: usize| {
+        let p = p.min(n - 1);
+        let c = (f32::from(samples[p]) - luma[p]) * s;
+        if p % 4 < 2 {
+            -c
+        } else {
+            c
+        }
+    };
+    for p in 0..n {
+        let y = (luma[p] - BLACK) / SCALE;
+        let (i_at, q_at) = if p % 2 == 0 { (p, p + 1) } else { (p - 1, p) };
+        // Each axis twice in a quad: average the pair.
+        let i = (chroma(i_at) + chroma(i_at ^ 2)) / 2.0;
+        let q = (chroma(q_at) + chroma(q_at ^ 2)) / 2.0;
+        out[p] = rgba_of_yiq(y, i / SCALE, q / SCALE);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rgba(r: u8, g: u8, b: u8) -> u32 {
         u32::from_le_bytes([r, g, b, 0xFF])
+    }
+
+    #[test]
+    fn a_single_copy_decodes_flat_colour() {
+        for colour in [
+            rgba(191, 191, 0),
+            rgba(0, 191, 191),
+            rgba(191, 0, 0),
+            rgba(128, 128, 128),
+        ] {
+            let line = vec![colour; 64];
+            let (mut n, mut c) = (vec![0u8; 64], vec![0u8; 64]);
+            encode_line(&line, 7, &mut n, &mut c);
+            let mut out = vec![0u32; 64];
+            decode_single(&n, line_phase_positive(7), &mut out);
+            let want = colour.to_le_bytes();
+            for got in &out[8..56] {
+                let got = got.to_le_bytes();
+                for k in 0..3 {
+                    assert!(
+                        (i32::from(got[k]) - i32::from(want[k])).abs() <= 3,
+                        "{got:?} vs {want:?}"
+                    );
+                }
+            }
+            decode_single(&c, !line_phase_positive(7), &mut out);
+            let got = out[20].to_le_bytes();
+            assert!((i32::from(got[0]) - i32::from(want[0])).abs() <= 3);
+        }
     }
 
     #[test]

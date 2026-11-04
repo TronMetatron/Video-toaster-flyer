@@ -552,6 +552,22 @@ impl TryFrom<RawConfig> for Config {
             .map(PathBuf::from);
         let video_slot_monitors = raw.video_slot.monitors.unwrap_or(true);
         let video_slot_preview_overlay = raw.video_slot.preview_overlay.unwrap_or(false);
+        // `[video_slot] volume`: the card's host folder as an Amiga volume
+        // too, mounted after the `[[filesys]]` entries.
+        let video_slot_mount = match raw.video_slot.volume.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(_) if video_slot == VideoSlotCard::None => {
+                return Err(anyhow!("[video_slot] volume needs a card"))
+            }
+            Some(volume) => Some(crate::filesys::MountSpec {
+                path: video_slot_media
+                    .clone()
+                    .unwrap_or_else(crate::paths::toaster_files_dir),
+                volume: volume.trim_end_matches(':').to_string(),
+                boot_pri: -128,
+                readonly: false,
+            }),
+        };
         let parallel_joysticks = [
             parse_parallel_socket(
                 raw.input.port3.as_deref(),
@@ -1486,6 +1502,7 @@ impl TryFrom<RawConfig> for Config {
                     boot_pri: m.bootpri.unwrap_or(-128),
                     readonly: m.readonly.unwrap_or(false),
                 })
+                .chain(video_slot_mount)
                 .collect(),
             run_program_dir: raw.run_program_dir,
             chipset,

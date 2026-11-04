@@ -267,6 +267,22 @@ pub trait VideoSlotDevice: Send {
     fn video_outputs(&self) -> Vec<Arc<CardOutput>> {
         Vec::new()
     }
+
+    /// What the card is doing, for the control protocol's
+    /// `toaster.status`: the sources on its outputs, its inputs, its host
+    /// folders. Null for a card with nothing to report.
+    fn control_status(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
+    /// A card-specific control-protocol command (`toaster.input`).
+    fn control(
+        &mut self,
+        command: &str,
+        _params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err(format!("the {} card has no {command} control", self.name()))
+    }
 }
 
 /// One video output of a card: the latest frame it produced, and an
@@ -413,6 +429,20 @@ impl CardOutput {
 
     pub fn is_recording(&self) -> bool {
         self.state().recorder.is_some()
+    }
+
+    /// The file being recorded, while recording.
+    pub fn recording_path(&self) -> Option<std::path::PathBuf> {
+        self.state()
+            .recorder
+            .as_ref()
+            .map(|rec| rec.path().to_path_buf())
+    }
+
+    /// A copy of the latest frame with its size; `None` before the first.
+    pub fn snapshot(&self) -> Option<(usize, usize, Vec<u32>)> {
+        let st = self.state();
+        (!st.pixels.is_empty()).then(|| (st.width, st.height, st.pixels.clone()))
     }
 }
 

@@ -49,6 +49,9 @@ struct Options {
     mcp: bool,
     dap: bool,
     dap_listen: Option<String>,
+    /// `--mcp --attach-on-use FILE`: attach to the session in this
+    /// `--control-info` file when a tool first needs one.
+    attach_on_use: Option<std::path::PathBuf>,
     method: Option<String>,
     params: Value,
 }
@@ -56,7 +59,7 @@ struct Options {
 fn usage() -> &'static str {
     "usage: copperline-ctl (--info FILE | --connect ADDR --token TOKEN) \
      [--repl | METHOD [JSON-PARAMS]]\n       \
-     copperline-ctl --mcp [--info FILE | --connect ADDR --token TOKEN]\n       \
+     copperline-ctl --mcp [--info FILE | --connect ADDR --token TOKEN | --attach-on-use FILE]\n       \
      copperline-ctl --dap [--info FILE | --connect ADDR --token TOKEN]\n       \
      copperline-ctl --dap-listen ADDR [--info FILE | --connect ADDR --token TOKEN]\n       \
      copperline-ctl profile STATE [--rom ROM] --out PATH [--frames N] [--format native|bartman]\n       \
@@ -79,6 +82,7 @@ fn parse_options() -> Result<Options, String> {
     let mut mcp = false;
     let mut dap = false;
     let mut dap_listen = None;
+    let mut attach_on_use = None;
     let mut method = None;
     let mut params = Value::Null;
     let mut args = std::env::args().skip(1);
@@ -107,6 +111,11 @@ fn parse_options() -> Result<Options, String> {
                     .map(String::from)
                     .or(token);
             }
+            "--attach-on-use" => {
+                attach_on_use = Some(std::path::PathBuf::from(
+                    args.next().ok_or("--attach-on-use requires a file path")?,
+                ));
+            }
             "--repl" => repl = true,
             "--mcp" => mcp = true,
             "--dap" => dap = true,
@@ -133,6 +142,12 @@ fn parse_options() -> Result<Options, String> {
         if connect.is_some() && token.is_none() {
             return Err(format!("{mode} --connect needs --token\n{}", usage()));
         }
+        if attach_on_use.is_some() && (dap || connect.is_some()) {
+            return Err(format!(
+                "--attach-on-use is for --mcp without --info/--connect\n{}",
+                usage()
+            ));
+        }
     } else {
         if connect.is_none() {
             return Err(format!("no server address\n{}", usage()));
@@ -148,6 +163,7 @@ fn parse_options() -> Result<Options, String> {
         mcp,
         dap,
         dap_listen,
+        attach_on_use,
         method,
         params,
     })
@@ -353,7 +369,7 @@ fn run_mcp(options: &Options) -> ExitCode {
         },
         _ => None,
     };
-    match copperline::control::mcp::run_stdio(attach) {
+    match copperline::control::mcp::run_stdio_with(attach, options.attach_on_use.clone()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("copperline-ctl: mcp transport: {e}");
