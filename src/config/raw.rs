@@ -769,6 +769,11 @@ pub(crate) struct RawVideoSlot {
     /// mounted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) volume: Option<String>,
+    /// Also fit a NewTek Video Flyer (the Zorro II card that records and
+    /// plays clips into the Toaster's inputs 3 and 4). Needs `card =
+    /// "toaster"`. Default false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) flyer: Option<bool>,
 }
 
 /// `[parallel]` peripheral selection for the Amiga Centronics parallel port.

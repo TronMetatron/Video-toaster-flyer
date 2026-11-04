@@ -713,7 +713,9 @@ model (luma from (MA+MB)/2, chroma from |MA−MB|, hue 11.25° per MP step).
 
 `G` bit 15 on a non-header line is `CERB`, "record this line". In write
 mode (EH0 `WERB` set, `ABSE` clear) the line's data is the Amiga's, as
-above; otherwise the card digitises the `IS` input into bank `OBR`: every
+above (EH0 `LUST` clear stores it 16 samples right: the second pass of the
+switcher's AA "zipper" write, which scrolls its bitmap 16 hi-res pixels
+left, so a framestore or key page loaded from disk lines up with its key); otherwise the card digitises the `IS` input into bank `OBR`: every
 field while live (`ABSE` set), four fields for a grab. Live, bank 0 plays
 the input straight through.
 
@@ -737,7 +739,11 @@ file's sound is decoded by a second ffmpeg (stereo s16le at the mixer's
 sound is the sum of the inputs by how much of each it shows (A·(1−k̄) +
 B·k̄, latch wipes by pixel share, a key's `LK` source, a live bank 0 by its
 `IS` input; framestores and the matte are silent). It goes to Paula's mixer
-as a `videoslot` source and into the Program recording. The real card had
+as a `videoslot` source and into the Program recording. The emulator counts
+colour clocks at the PAL rate for every machine, so an Amiga NTSC frame
+lasts 1/29.70 s rather than 1/29.97: each frame's sound is stretched to
+the Amiga frame (0.9 %), and the mixer's ring steers its fill by up to 1 %
+more, so the sound neither gaps nor drifts. The real card had
 no audio; this stands in for the audio-follow-video mixer beside it.
 
 The digital effects (`dve.rs`) run with EH0 `LINP` and `LUT` both off. The

@@ -95,6 +95,14 @@ impl Regs<'_> {
         self.eh(0).b & 0x0200 != 0
     }
 
+    /// EH0 `LUST`: a write line is stored left-justified. The switcher's
+    /// AA "zipper" write sends a 768-sample line in two passes and clears
+    /// it for the second, whose bitmap is scrolled 16 hi-res pixels left:
+    /// the card then stores that pass 16 samples further right.
+    pub fn lust(&self) -> bool {
+        self.eh(0).i & 0x0100 != 0
+    }
+
     /// Lines flagged CERB carry Amiga data for the framestore (a write)
     /// rather than a request to digitise the input.
     pub fn write_mode(&self) -> bool {

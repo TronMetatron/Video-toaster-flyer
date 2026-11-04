@@ -290,6 +290,28 @@ pub trait VideoSlotDevice: Send {
     }
 }
 
+/// `src` stretched or squeezed to `n` samples by linear interpolation
+/// (silence for an empty `src`).
+pub fn resample(src: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
+    if src.is_empty() {
+        return vec![(0.0, 0.0); n];
+    }
+    if src.len() == n {
+        return src.to_vec();
+    }
+    let step = src.len() as f64 / n as f64;
+    (0..n)
+        .map(|j| {
+            let t = j as f64 * step;
+            let i = t as usize;
+            let f = (t - i as f64) as f32;
+            let a = src[i.min(src.len() - 1)];
+            let b = src[(i + 1).min(src.len() - 1)];
+            (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f)
+        })
+        .collect()
+}
+
 /// One video output of a card: the latest frame it produced, and an
 /// optional recording of every frame.
 ///
@@ -379,8 +401,12 @@ impl CardOutput {
                 recorder, pixels, ..
             } = &mut *st;
             if let Some(rec) = recorder.as_mut() {
-                let mut samples = sound.map(<[_]>::to_vec).unwrap_or_default();
-                samples.resize(n, samples.last().copied().unwrap_or((0.0, 0.0)));
+                // The frame's sound fitted to the recording's frame: a
+                // card's frame need not be exactly one recording frame long.
+                let samples = match sound {
+                    Some(s) => resample(s, n),
+                    None => vec![(0.0, 0.0); n],
+                };
                 rec.push_audio(&samples);
                 if let Err(e) = rec.push_frame(pixels) {
                     log::warn!("{} recording stopped: {e:#}", self.name);

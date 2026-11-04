@@ -32,6 +32,13 @@ pub const ASPECT: f32 = 4.0 / 3.0;
 /// One NTSC frame, in seconds.
 pub const FRAME_SECONDS: f64 = 1001.0 / 30000.0;
 
+/// How long the emulated Amiga takes over a frame (525 lines of 227.5
+/// colour clocks) by the emulator's clock, which counts colour clocks at
+/// the PAL rate for every machine: 1/29.70 s rather than NTSC's 1/29.97.
+/// The cards' outputs advance a frame per Amiga frame, so a frame's sound
+/// is stretched to this length (0.9 %) to keep step with the mixer.
+pub const AMIGA_FRAME_SECONDS: f64 = 525.0 * 227.5 / crate::chipset::paula::PAULA_CLOCK_HZ as f64;
+
 pub fn black() -> u32 {
     u32::from_le_bytes([0, 0, 0, 0xFF])
 }
@@ -271,9 +278,10 @@ impl Video {
         out.append(&mut self.audio_out);
     }
 
-    /// This frame's length in mixer samples (alternating 1471 and 1472).
+    /// This frame's length in mixer samples: the emulated Amiga frame's
+    /// length (about 1485; see [`AMIGA_FRAME_SECONDS`]).
     pub fn frame_samples(&mut self) -> usize {
-        self.audio_carry += FRAME_SECONDS * f64::from(crate::audio::MIX_SAMPLE_RATE);
+        self.audio_carry += AMIGA_FRAME_SECONDS * f64::from(crate::audio::MIX_SAMPLE_RATE);
         let n = self.audio_carry.floor() as usize;
         self.audio_carry -= n as f64;
         n

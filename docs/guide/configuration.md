@@ -898,6 +898,7 @@ media = "D:/Toster/Amiga Toaster Files"   # the card's host folder
 # monitors = true         # Preview and Program monitor windows (default true)
 # preview_overlay = false # the switcher interface over Preview (default false)
 # volume = "ToasterFiles"  # also mount media in the Amiga as ToasterFiles:
+# flyer = false           # also fit a Video Flyer (needs card = "toaster")
 ```
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
@@ -925,7 +926,7 @@ mixed by how much of each input Program shows (a dissolve crossfades the
 sound, a wipe by area, framestores and mattes are silent). Recordings carry
 the same sound. The real card handles picture only; this stands in for the
 audio-follow-video mixer beside it.
-- `Flyer`: clips for the Video Flyer (not emulated yet).
+- `Flyer`: clips for the Video Flyer (see `flyer` below).
 
 With `monitors` on, the card's two outputs open as windows of their own,
 each on a picture monitor: **Preview** and **Program**. Closing one only
@@ -961,8 +962,32 @@ writes `movie.clip` into the media folder's `Flyer` folder; `flyerclip
 export movie.clip` writes `movie.mp4` beside it; `flyerclip info` describes
 a clip. Dropping a file on the program does the right one. `--hq5`/`--hq6`
 give each field a larger budget, `--no-audio` drops the sound and `--seconds
-N` stops early. ffmpeg does the decoding and encoding. The Flyer itself is
-not emulated yet; the clips are made for when it is.
+N` stops early. ffmpeg does the decoding and encoding.
+
+**Video Flyer.** `flyer = true` (with `card = "toaster"`) also fits a
+NewTek Video Toaster Flyer, the Zorro II card that records and plays clips
+into the Toaster's inputs 3 and 4. The Toaster software finds it as
+NewTek's board (manufacturer 2191, product 0) and loads it as on a real
+machine: `FlyerInit` (or the switcher at start-up) downloads the Flyer's
+firmware and chip files from `NewTek:Programs/Flyer_Support` and reports
+"Okay", and the switcher then starts with its Flyer controls. The card's
+own processor is not emulated: the window is its shared memory, and the
+commands the software leaves there are answered by Copperline as the
+Flyer's firmware would (the board's serial number is in the 2CC range of
+the installed `chipset.dat`; its EEPROM settings last until the emulator
+quits). `COPPERLINE_DIAG_FLYER=1` logs every command it is sent.
+
+The Flyer's SCSI drives are folders in `media`'s `Flyer` folder: `FA0` (bus
+A, unit 0; created when missing), and `FB0`, `FC0`, ... when those folders
+exist. Files are the clips' bytes as the Flyer stores them (what
+`flyerclip import` writes into `Flyer`: move them into `Flyer/FA0`, or a
+clip copied off a real Flyer drive); a `.flyervol` file whose first line
+is a name renames the volume, which is otherwise `FlyerA0`, `FlyerB0`,
+... With the Toaster's `FA0` DOS driver mounted (copy
+`NewTek/Programs/System_Support/Devs/DOSDrivers/FA0` into
+`DEVS:DOSDrivers`), the drive is the `FlyerA0:` volume, which lists, reads
+and copies like any other. The drives are write-protected for now, and
+clips do not play into the Toaster's inputs yet.
 
 `preview_overlay` lets the switcher draw its interface over the Preview
 output when its own preference asks for it, as a one-monitor Toaster setup
