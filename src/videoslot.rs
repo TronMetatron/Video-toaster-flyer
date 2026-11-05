@@ -340,6 +340,95 @@ pub fn resample(src: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Turn a recording's AVI into an MP4 (H.264 with square pixels, AAC).
+fn make_mp4(
+    ffmpeg: &std::path::Path,
+    avi: &std::path::Path,
+    mp4: &std::path::Path,
+    width: u32,
+    high: bool,
+) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(avi)
+        .args([
+            "-vf",
+            &format!("scale={width}:480:flags=lanczos,setsar=1"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            if high { "12" } else { "18" },
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            if high { "320k" } else { "192k" },
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(mp4)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: no console flashing up.
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        anyhow::bail!("ffmpeg: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Where an output's recording settings are kept: `.copperline` in the
+/// card's folder (beside the recordings folder).
+fn settings_file(record_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    Some(
+        record_dir?
+            .parent()?
+            .join(".copperline")
+            .join("recording.json"),
+    )
+}
+
+fn load_settings(record_dir: Option<&std::path::Path>) -> RecordSettings {
+    let mut s = RecordSettings::default();
+    let Some(text) = settings_file(record_dir).and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return s;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return s;
+    };
+    if v.get("format").and_then(|f| f.as_str()) == Some("avi") {
+        s.format = RecordFormat::Avi;
+    }
+    s.high_quality = v
+        .get("high_quality")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    s
+}
+
+fn save_settings(record_dir: Option<&std::path::Path>, s: RecordSettings) {
+    let Some(path) = settings_file(record_dir) else {
+        return;
+    };
+    let v = serde_json::json!({
+        "format": match s.format { RecordFormat::Mp4 => "mp4", RecordFormat::Avi => "avi" },
+        "high_quality": s.high_quality,
+    });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, v.to_string());
+}
+
 /// One video output of a card: the latest frame it produced, and an
 /// optional recording of every frame.
 ///
@@ -356,6 +445,44 @@ pub struct CardOutput {
     state: Mutex<OutputState>,
     /// Signalled on every publish.
     published: Condvar,
+    /// How recordings are written.
+    settings: Mutex<RecordSettings>,
+    /// Recordings still being made into MP4s.
+    saving: std::sync::atomic::AtomicUsize,
+}
+
+/// The file a recording ends up as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordFormat {
+    /// H.264 and AAC in an MP4, made with ffmpeg once the recording stops.
+    Mp4,
+    /// The recorder's own lossless AVI (ZMBV and PCM), as it is.
+    Avi,
+}
+
+/// How an output records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordSettings {
+    pub format: RecordFormat,
+    /// MP4 at a higher quality (CRF 12, 320 kb/s AAC) rather than CRF 18
+    /// and 192 kb/s.
+    pub high_quality: bool,
+}
+
+impl Default for RecordSettings {
+    fn default() -> Self {
+        Self {
+            format: RecordFormat::Mp4,
+            high_quality: false,
+        }
+    }
+}
+
+/// Whether `path` names an MP4 (or QuickTime) file.
+fn is_mp4(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mp4" | "m4v" | "mov"))
 }
 
 #[derive(Default)]
@@ -367,6 +494,9 @@ struct OutputState {
     recorder: Option<crate::recorder::VideoRecorder>,
     /// Fractional audio samples owed to the recording's silent track.
     audio_carry: f64,
+    /// The MP4 the recording becomes when it stops (it is recorded into
+    /// an AVI beside it first).
+    mp4: Option<std::path::PathBuf>,
 }
 
 impl CardOutput {
@@ -378,10 +508,34 @@ impl CardOutput {
         Arc::new(Self {
             name,
             aspect,
+            settings: Mutex::new(load_settings(record_dir.as_deref())),
             record_dir,
             state: Mutex::new(OutputState::default()),
             published: Condvar::new(),
+            saving: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// How this output records.
+    pub fn record_settings(&self) -> RecordSettings {
+        *self.settings.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Change how this output records (from the next recording on); kept
+    /// for the next run beside the recordings.
+    pub fn set_record_settings(&self, settings: RecordSettings) {
+        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
+        save_settings(self.record_dir.as_deref(), settings);
+    }
+
+    /// The folder recordings go to.
+    pub fn record_dir(&self) -> Option<&std::path::Path> {
+        self.record_dir.as_deref()
+    }
+
+    /// Whether a stopped recording is still being made into an MP4.
+    pub fn saving(&self) -> bool {
+        self.saving.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     pub fn name(&self) -> &'static str {
@@ -485,7 +639,9 @@ impl CardOutput {
         Some((st.width, st.height, st.serial))
     }
 
-    /// Start recording into `path` (an AVI) from the next frame.
+    /// Start recording into `path` from the next frame: an AVI as it
+    /// is, or for an `.mp4` an AVI beside it that becomes the MP4 when
+    /// the recording stops.
     pub fn start_recording(&self, path: &std::path::Path) -> anyhow::Result<()> {
         let mut st = self.state();
         if st.width == 0 || st.height == 0 {
@@ -494,17 +650,31 @@ impl CardOutput {
         if let Some(mut old) = st.recorder.take() {
             let _ = old.finish();
         }
+        let (avi, mp4) = if is_mp4(path) {
+            (
+                path.with_extension("recording.avi"),
+                Some(path.to_path_buf()),
+            )
+        } else {
+            (path.to_path_buf(), None)
+        };
         st.recorder = Some(crate::recorder::VideoRecorder::create(
-            path, st.width, st.height,
+            &avi, st.width, st.height,
         )?);
+        st.mp4 = mp4;
         st.audio_carry = 0.0;
         Ok(())
     }
 
     /// Start recording into a new, time-stamped file in the output's
-    /// recording folder (the emulator's recordings folder without one).
+    /// recording folder (the emulator's recordings folder without one),
+    /// in the output's [`RecordSettings`] format.
     pub fn start_recording_auto(&self) -> anyhow::Result<std::path::PathBuf> {
-        let name = format!("{}-{}.avi", self.name, crate::timestamp::compact_now());
+        let ext = match self.record_settings().format {
+            RecordFormat::Mp4 => "mp4",
+            RecordFormat::Avi => "avi",
+        };
+        let name = format!("{}-{}.{ext}", self.name, crate::timestamp::compact_now());
         let path = match &self.record_dir {
             Some(dir) => dir.join(name),
             None => crate::paths::recording_file().with_file_name(name),
@@ -513,14 +683,66 @@ impl CardOutput {
         Ok(path)
     }
 
-    /// Stop recording; the finished file's path.
-    pub fn stop_recording(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
+    /// Stop recording; the finished file's path. An MP4 is made from the
+    /// recording on a thread of its own and appears at that path when it
+    /// is done ([`Self::saving`] until then); without ffmpeg the AVI is
+    /// kept and returned.
+    pub fn stop_recording(self: &Arc<Self>) -> anyhow::Result<Option<std::path::PathBuf>> {
         let mut st = self.state();
         let Some(mut rec) = st.recorder.take() else {
             return Ok(None);
         };
         rec.finish()?;
-        Ok(Some(rec.path().to_path_buf()))
+        let avi = rec.path().to_path_buf();
+        let Some(mp4) = st.mp4.take() else {
+            return Ok(Some(avi));
+        };
+        drop(st);
+        let Some(ffmpeg) = self.ffmpeg() else {
+            log::warn!(
+                "{}: no ffmpeg to make {}; the recording stays {}",
+                self.name,
+                mp4.display(),
+                avi.display()
+            );
+            return Ok(Some(avi));
+        };
+        let high = self.record_settings().high_quality;
+        let width = ((480.0 * self.aspect / 2.0).round() as u32 * 2).max(2);
+        let out = Arc::clone(self);
+        out.saving
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target = mp4.clone();
+        std::thread::Builder::new()
+            .name("toaster-mp4".into())
+            .spawn(move || {
+                match make_mp4(&ffmpeg, &avi, &target, width, high) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&avi);
+                        log::info!("{} recording saved: {}", out.name, target.display());
+                    }
+                    Err(e) => log::warn!(
+                        "{}: making {}: {e:#}; the recording stays {}",
+                        out.name,
+                        target.display(),
+                        avi.display()
+                    ),
+                }
+                out.saving
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            })?;
+        Ok(Some(mp4))
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn ffmpeg(&self) -> Option<std::path::PathBuf> {
+        let root = self.media_root()?;
+        crate::toaster::media::find_ffmpeg(&root)
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    fn ffmpeg(&self) -> Option<std::path::PathBuf> {
+        None
     }
 
     pub fn is_recording(&self) -> bool {
@@ -528,11 +750,11 @@ impl CardOutput {
     }
 
     /// The file being recorded, while recording.
+    /// For an MP4 recording, the MP4 it becomes.
     pub fn recording_path(&self) -> Option<std::path::PathBuf> {
-        self.state()
-            .recorder
-            .as_ref()
-            .map(|rec| rec.path().to_path_buf())
+        let st = self.state();
+        let rec = st.recorder.as_ref()?;
+        Some(st.mp4.clone().unwrap_or_else(|| rec.path().to_path_buf()))
     }
 
     /// A copy of the latest frame with its size; `None` before the first.
@@ -559,6 +781,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = CardOutput::new("Program", 4.0 / 3.0, Some(dir.path().join("Output")));
         assert_eq!(out.media_root().as_deref(), Some(dir.path()));
+        out.set_record_settings(RecordSettings {
+            format: RecordFormat::Avi,
+            high_quality: false,
+        });
         // Nothing to record before the first frame.
         assert!(out.start_recording_auto().is_err());
         let frame = vec![u32::from_le_bytes([200, 30, 30, 255]); 16 * 12];
@@ -579,5 +805,38 @@ mod tests {
         let (w, h, serial) = out.frame_since(0, &mut buf).unwrap();
         assert_eq!((w, h, buf.len()), (16, 12, 192));
         assert!(out.frame_since(serial, &mut buf).is_none());
+        // The setting is kept for the next run.
+        let again = CardOutput::new("Program", 4.0 / 3.0, Some(dir.path().join("Output")));
+        assert_eq!(again.record_settings().format, RecordFormat::Avi);
+    }
+
+    #[test]
+    fn an_mp4_recording_is_made_from_its_avi_when_it_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = CardOutput::new("Program", 4.0 / 3.0, Some(dir.path().join("Output")));
+        assert_eq!(out.record_settings(), RecordSettings::default());
+        let frame = vec![u32::from_le_bytes([30, 200, 30, 255]); 16 * 12];
+        out.publish(16, 12, &frame, 1001.0 / 30000.0, None);
+        let path = out.start_recording_auto().unwrap();
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("mp4"));
+        assert_eq!(out.recording_path(), Some(path.clone()));
+        let sound = vec![(0.25f32, -0.25f32); 1471];
+        for _ in 0..20 {
+            out.publish(16, 12, &frame, 1001.0 / 30000.0, Some(&sound));
+        }
+        let saved = out.stop_recording().unwrap().unwrap();
+        while out.saving() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if out.ffmpeg().is_some() {
+            assert_eq!(saved, path);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(&bytes[4..8], b"ftyp");
+            assert!(!path.with_extension("recording.avi").exists());
+        } else {
+            // Without ffmpeg the AVI stays.
+            assert_eq!(saved, path.with_extension("recording.avi"));
+            assert!(saved.is_file());
+        }
     }
 }

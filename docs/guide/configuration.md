@@ -919,7 +919,7 @@ subfolders on first use:
   picked up while the machine runs. Stills (PNG, JPEG, BMP) need nothing
   else; video files are decoded by ffmpeg, found as `ffmpeg.exe` (or
   `ffmpeg`) in the folder itself, beside Copperline, or on the `PATH`.
-- `Output`: recordings of the Program output (AVI, see below).
+- `Output`: recordings of the Program output (MP4 or AVI, see below).
 
 A video file's sound comes along with its picture and follows the switcher:
 what is on Program is what you hear, through the emulator's sound output,
@@ -945,11 +945,31 @@ menu switch the same settings live.
 With `monitors` on, the card's two outputs open as windows of their own,
 each on a picture monitor: **Preview** and **Program**. Closing one only
 hides it; **Recording > Show Toaster Monitors** brings both back. In the
-Program window, `R` or the monitor's power button starts and stops
-recording the Program output into `Output` (the power lamp lights red while
-it runs); **Recording > Record Toaster Program** does the same. The monitor
-artwork can be replaced by a `monitor.png` in the media folder: the tube is
-found as the area around the picture's centre enclosed by a near-black gap.
+Program window, the **REC** button on the monitor's top edge (or `R`, or
+the power button) starts and stops recording the Program output, picture
+and sound, into `Output` (the lamps light red while it runs); **Recording >
+Record Toaster Program** does the same. **SETUP** beside it opens the
+recording setup over the picture: the format, MP4 (H.264 video with square
+pixels and AAC sound; the default) or the recorder's lossless AVI, the
+MP4's quality (Standard, CRF 18 and 192 kb/s, or High, CRF 12 and 320
+kb/s), and a button that opens the `Output` folder. An MP4 is recorded
+into an AVI beside it first and made from it with ffmpeg when the
+recording stops (the button reads SAVING and the title says so until it
+is done; the AVI is then removed, or kept if ffmpeg is missing or fails).
+The setup is kept in the media folder's `.copperline/recording.json`. The
+monitor artwork can be replaced by a `monitor.png` in the media folder:
+the tube is found as the area around the picture's centre enclosed by a
+near-black gap.
+
+**Effect sounds.** Some transitions carry sounds (8SVX samples in the
+effect, such as Shatter, Falling Sheep or Camera Iris) that the switcher
+plays through the Amiga's own audio, which Copperline mixes into its sound
+output and the recordings. NewTek's switcher skips them when a Flyer is
+fitted (`animfxhandler.a`: "dont do sound if flyer!"), so with `flyer =
+true` they are silent, as they were on a real Toaster-Flyer. To hear them
+anyway, the switcher's working copy can be patched to drop that test:
+`tools/toaster/toaster-effect-sounds-with-flyer.py switcher.main switcher.main.3.0
+switcher.main.aa` in `Toaster:Programs` (`--undo` puts it back).
 
 `volume` also mounts the media folder in the Amiga as a volume of that
 name (like a `[[filesys]]` entry, never a boot candidate), so the Toaster

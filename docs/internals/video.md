@@ -961,7 +961,12 @@ size gets a table of every tube pixel's bilinear taps, glass shading and
 coverage in fixed point (`Layer::table`), a new frame is one integer pass
 over it straight into the surface's buffer, split across up to four
 threads above 60,000 tube pixels, and the artwork around the tube is
-painted only when the layer or the power lamp changes. (Painted on the
+painted only when the layer or the power lamp changes. The Program
+monitor's REC and SETUP buttons and its setup panel are drawn by the
+painter over the artwork in the 8x8 overlay font; the event loop hit-tests
+them from the same fractions of the artwork. Recordings go through the
+card output (`CardOutput`): the lossless AVI recorder runs on publish, and
+for an MP4 a thread runs ffmpeg on the AVI when the recording stops. (Painted on the
 emulation thread, the two windows were the bulk of what a project play
 cost the machine on a fast host: 3.5 ms of host time per NTSC frame
 idle against 15.5 ms with the outputs changing every frame, past real

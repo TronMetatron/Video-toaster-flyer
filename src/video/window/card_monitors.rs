@@ -37,7 +37,7 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use crate::videoslot::CardOutput;
+use crate::videoslot::{CardOutput, RecordFormat, RecordSettings};
 
 const DEFAULT_ART: &[u8] = include_bytes!("../../../assets/toaster/monitor.png");
 
@@ -589,7 +589,12 @@ struct MonitorWindow {
     painter: Painter,
     /// The power button in the window, for the event loop's hit test.
     button: Option<(f32, f32, f32, f32)>,
-    shown_recording: bool,
+    /// The window's size, for the controls' hit tests.
+    size: (u32, u32),
+    /// The recording setup panel is open.
+    setup: bool,
+    /// What the title shows: recording, saving an MP4.
+    shown: (bool, bool),
     cursor: (f64, f64),
 }
 
@@ -598,6 +603,8 @@ enum Paint {
     Resized(u32, u32),
     /// Paint the window again (it was exposed, or the lamp changed).
     Redraw,
+    /// Show or hide the recording setup panel.
+    Setup(bool),
     Stop,
 }
 
@@ -636,9 +643,255 @@ struct Canvas {
     seen: u64,
     video: Vec<u32>,
     video_size: (usize, usize),
-    /// The surface's buffer holds the current layer's artwork, with the
-    /// power lamp lit or not.
-    painted: Option<bool>,
+    /// The surface's buffer holds the current layer's artwork with these
+    /// controls drawn on it.
+    painted: Option<Controls>,
+    /// The recording setup panel is open.
+    setup: bool,
+}
+
+/// What the window's controls show: recording (the power lamp too), an
+/// MP4 being saved, the setup panel and its settings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Controls {
+    recording: bool,
+    saving: bool,
+    setup: bool,
+    settings: RecordSettings,
+}
+
+/// A control on the Program monitor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Control {
+    Record,
+    Setup,
+    Format,
+    Quality,
+    Folder,
+    Close,
+}
+
+/// The controls' places, as fractions of the artwork: the record and
+/// setup buttons on the bezel's top strip, right of the badge; the setup
+/// panel over the tube, a title and then one row per [`Control`] from
+/// `Format` on.
+const REC_BUTTON: (f32, f32, f32, f32) = (0.715, 0.017, 0.795, 0.058);
+const SETUP_BUTTON: (f32, f32, f32, f32) = (0.805, 0.017, 0.900, 0.058);
+const PANEL: (f32, f32, f32, f32) = (0.24, 0.22, 0.76, 0.66);
+const PANEL_ROWS: usize = 5;
+
+/// A rectangle given as fractions of the artwork, in window pixels.
+fn art_rect(art: &MonitorArt, w: usize, h: usize, f: (f32, f32, f32, f32)) -> Rect4 {
+    let (scale, _, _, ox, oy) = fit(art, w, h);
+    let (aw, ah) = (art.w as f32 * scale, art.h as f32 * scale);
+    (
+        ox as f32 + f.0 * aw,
+        oy as f32 + f.1 * ah,
+        ox as f32 + f.2 * aw,
+        oy as f32 + f.3 * ah,
+    )
+}
+
+type Rect4 = (f32, f32, f32, f32);
+
+/// The panel's row `k` (0 the title).
+fn panel_row(art: &MonitorArt, w: usize, h: usize, k: usize) -> Rect4 {
+    let (x0, y0, x1, y1) = art_rect(art, w, h, PANEL);
+    let rh = (y1 - y0) / PANEL_ROWS as f32;
+    (x0, y0 + rh * k as f32, x1, y0 + rh * (k + 1) as f32)
+}
+
+fn inside(r: Rect4, x: f64, y: f64) -> bool {
+    let (x, y) = (x as f32, y as f32);
+    x >= r.0 && x < r.2 && y >= r.1 && y < r.3
+}
+
+/// The control under `(x, y)` in a `w` x `h` window.
+fn control_at(
+    art: &MonitorArt,
+    w: usize,
+    h: usize,
+    setup: bool,
+    x: f64,
+    y: f64,
+) -> Option<Control> {
+    if setup {
+        for (k, c) in [
+            Control::Format,
+            Control::Quality,
+            Control::Folder,
+            Control::Close,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if inside(panel_row(art, w, h, k + 1), x, y) {
+                return Some(c);
+            }
+        }
+    }
+    if inside(art_rect(art, w, h, REC_BUTTON), x, y) {
+        return Some(Control::Record);
+    }
+    if inside(art_rect(art, w, h, SETUP_BUTTON), x, y) {
+        return Some(Control::Setup);
+    }
+    None
+}
+
+/// Fill a rectangle of an RGBA8 frame.
+fn fill(frame: &mut [u8], w: usize, h: usize, r: Rect4, rgba: [u8; 4]) {
+    let x0 = (r.0.max(0.0) as usize).min(w);
+    let x1 = (r.2.max(0.0) as usize).min(w);
+    let y0 = (r.1.max(0.0) as usize).min(h);
+    let y1 = (r.3.max(0.0) as usize).min(h);
+    let a = u32::from(rgba[3]);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (y * w + x) * 4;
+            for c in 0..3 {
+                let v = (u32::from(rgba[c]) * a + u32::from(frame[i + c]) * (255 - a) + 127) / 255;
+                frame[i + c] = v as u8;
+            }
+            frame[i + 3] = 0xFF;
+        }
+    }
+}
+
+/// A raised button in the monitor's dark plastic, with a label.
+fn plastic_button(
+    frame: &mut [u8],
+    w: usize,
+    h: usize,
+    r: Rect4,
+    label: &str,
+    lit: Option<[u8; 3]>,
+) {
+    let edge = ((r.3 - r.1) / 12.0).max(1.0);
+    fill(frame, w, h, r, [0x1C, 0x1C, 0x1E, 0xFF]);
+    fill(
+        frame,
+        w,
+        h,
+        (r.0, r.1, r.2, r.1 + edge),
+        [0x6A, 0x6A, 0x6E, 0xFF],
+    );
+    fill(
+        frame,
+        w,
+        h,
+        (r.0, r.1, r.0 + edge, r.3),
+        [0x6A, 0x6A, 0x6E, 0xFF],
+    );
+    fill(
+        frame,
+        w,
+        h,
+        (r.0, r.3 - edge, r.2, r.3),
+        [0x08, 0x08, 0x08, 0xFF],
+    );
+    fill(
+        frame,
+        w,
+        h,
+        (r.2 - edge, r.1, r.2, r.3),
+        [0x08, 0x08, 0x08, 0xFF],
+    );
+    let px = (((r.3 - r.1) * 0.42) / 8.0).floor().max(1.0) as usize;
+    let mut tx = r.0 + (r.2 - r.0 - crate::video::font::text_width(label, px) as f32) / 2.0;
+    if let Some(rgb) = lit {
+        // A lamp before the label.
+        let d = (px * 6) as f32;
+        tx += d * 0.6;
+        let cy = (r.1 + r.3) / 2.0;
+        let lx = tx - d * 1.3;
+        fill(
+            frame,
+            w,
+            h,
+            (lx, cy - d / 2.0, lx + d, cy + d / 2.0),
+            [rgb[0], rgb[1], rgb[2], 0xFF],
+        );
+    }
+    let ty = (r.1 + r.3) / 2.0 - (crate::video::font::text_height(px) as f32) / 2.0;
+    crate::video::font::draw_text(
+        frame,
+        w,
+        h,
+        tx.max(0.0) as usize,
+        ty.max(0.0) as usize,
+        label,
+        u32::from_le_bytes([0xD8, 0xD8, 0xD8, 0xFF]),
+        px,
+    );
+}
+
+/// Draw the Program monitor's controls (and the setup panel when open).
+fn draw_controls(frame: &mut [u8], art: &MonitorArt, w: usize, h: usize, c: Controls) {
+    let (rec_label, lamp) = if c.recording {
+        ("STOP", [0xFF, 0x30, 0x20])
+    } else if c.saving {
+        ("SAVING", [0xF0, 0xC0, 0x30])
+    } else {
+        ("REC", [0x70, 0x18, 0x14])
+    };
+    plastic_button(
+        frame,
+        w,
+        h,
+        art_rect(art, w, h, REC_BUTTON),
+        rec_label,
+        Some(lamp),
+    );
+    plastic_button(
+        frame,
+        w,
+        h,
+        art_rect(art, w, h, SETUP_BUTTON),
+        "SETUP",
+        None,
+    );
+    if !c.setup {
+        return;
+    }
+    let panel = art_rect(art, w, h, PANEL);
+    fill(frame, w, h, panel, [0x10, 0x10, 0x14, 0xE8]);
+    let rows = [
+        "RECORDING SETUP".to_string(),
+        match c.settings.format {
+            RecordFormat::Mp4 => "FORMAT   MP4 (H.264 + AAC)".to_string(),
+            RecordFormat::Avi => "FORMAT   AVI (LOSSLESS)".to_string(),
+        },
+        if c.settings.high_quality {
+            "QUALITY  HIGH".to_string()
+        } else {
+            "QUALITY  STANDARD".to_string()
+        },
+        "OPEN THE OUTPUT FOLDER".to_string(),
+        "CLOSE".to_string(),
+    ];
+    for (k, label) in rows.iter().enumerate() {
+        let r = panel_row(art, w, h, k);
+        let pad = (r.3 - r.1) * 0.12;
+        let r = (r.0 + pad, r.1 + pad, r.2 - pad, r.3 - pad);
+        if k == 0 {
+            let px = (((r.3 - r.1) * 0.45) / 8.0).floor().max(1.0) as usize;
+            let tx = r.0 + (r.2 - r.0 - crate::video::font::text_width(label, px) as f32) / 2.0;
+            let ty = (r.1 + r.3) / 2.0 - crate::video::font::text_height(px) as f32 / 2.0;
+            crate::video::font::draw_text(
+                frame,
+                w,
+                h,
+                tx.max(0.0) as usize,
+                ty.max(0.0) as usize,
+                label,
+                u32::from_le_bytes([0xF0, 0xC8, 0x50, 0xFF]),
+                px,
+            );
+        } else {
+            plastic_button(frame, w, h, r, label, None);
+        }
+    }
 }
 
 impl Canvas {
@@ -655,6 +908,10 @@ impl Canvas {
                         redraw = true;
                     }
                     Ok(Paint::Redraw) => redraw = true,
+                    Ok(Paint::Setup(open)) => {
+                        self.setup = open;
+                        redraw = true;
+                    }
                     Ok(Paint::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
                     Err(mpsc::TryRecvError::Empty) => break,
                 }
@@ -667,14 +924,27 @@ impl Canvas {
                 self.video_size = (vw, vh);
                 redraw = true;
             }
-            let recording = self.output.is_recording();
-            if redraw || self.painted != Some(recording) {
-                self.paint(recording);
+            let controls = self.controls();
+            if redraw || self.painted != Some(controls) {
+                self.paint(controls);
             }
         }
     }
 
-    fn paint(&mut self, recording: bool) {
+    /// What the controls show now; a Preview monitor has none, only its
+    /// lamp.
+    fn controls(&self) -> Controls {
+        let program = self.output.name() == "Program";
+        Controls {
+            recording: self.output.is_recording(),
+            saving: program && self.output.saving(),
+            setup: program && self.setup,
+            settings: self.output.record_settings(),
+        }
+    }
+
+    fn paint(&mut self, controls: Controls) {
+        let recording = controls.recording;
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return;
@@ -702,9 +972,18 @@ impl Canvas {
         ));
         // The artwork around the tube stays in the surface's buffer from
         // frame to frame; it is painted again only when it changes.
-        let background = self.painted != Some(recording);
+        let background = self.painted != Some(controls);
         layer.compose_rgba8(video, recording, self.pixels.frame_mut(), background);
-        self.painted = Some(recording);
+        if self.output.name() == "Program" {
+            draw_controls(
+                self.pixels.frame_mut(),
+                &self.art,
+                w as usize,
+                h as usize,
+                controls,
+            );
+        }
+        self.painted = Some(controls);
         if let Err(e) = self.pixels.render() {
             warn!("toaster monitor {}: {e}", self.output.name());
         }
@@ -729,6 +1008,8 @@ impl MonitorWindow {
         let name = self.output.name();
         if self.output.is_recording() {
             format!("Toaster {name} \u{25CF} REC (R to stop)")
+        } else if self.output.saving() {
+            format!("Toaster {name} (saving the MP4...)")
         } else if self.is_program() {
             format!("Toaster {name} (R to record)")
         } else {
@@ -742,6 +1023,7 @@ impl MonitorWindow {
 
     fn resized(&mut self, art: &MonitorArt, w: u32, h: u32) {
         let (w, h) = (w.max(1), h.max(1));
+        self.size = (w, h);
         self.button = button_in(art, w as usize, h as usize);
         self.painter.send(Paint::Resized(w, h));
     }
@@ -851,6 +1133,7 @@ impl CardMonitors {
                 video: Vec::new(),
                 video_size: (0, 0),
                 painted: None,
+                setup: false,
             };
             let (tx, rx) = mpsc::channel();
             let thread = std::thread::Builder::new()
@@ -871,7 +1154,9 @@ impl CardMonitors {
                 window,
                 painter: Painter { tx, thread },
                 button: button_in(&art, w as usize, h as usize),
-                shown_recording: false,
+                size: (w, h),
+                setup: false,
+                shown: (false, false),
                 cursor: (0.0, 0.0),
             };
             mw.window.set_title(&mw.title());
@@ -888,9 +1173,9 @@ impl CardMonitors {
     /// the frames and the lamp by themselves).
     pub(super) fn poll(&mut self) {
         for w in &mut self.windows {
-            let recording = w.output.is_recording();
-            if recording != w.shown_recording {
-                w.shown_recording = recording;
+            let shown = (w.output.is_recording(), w.output.saving());
+            if shown != w.shown {
+                w.shown = shown;
                 w.window.set_title(&w.title());
             }
         }
@@ -914,8 +1199,40 @@ impl CardMonitors {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if w.is_program() && hits(w.button, w.cursor.0, w.cursor.1) => {
-                return Some(toggle_recording(w));
+            } if w.is_program() => {
+                let (ww, wh) = (w.size.0 as usize, w.size.1 as usize);
+                match control_at(&art, ww, wh, w.setup, w.cursor.0, w.cursor.1) {
+                    Some(Control::Record) => return Some(toggle_recording(w)),
+                    Some(c @ (Control::Setup | Control::Close)) => {
+                        w.setup = c == Control::Setup && !w.setup;
+                        w.painter.send(Paint::Setup(w.setup));
+                    }
+                    Some(Control::Format) => {
+                        let mut s = w.output.record_settings();
+                        s.format = match s.format {
+                            RecordFormat::Mp4 => RecordFormat::Avi,
+                            RecordFormat::Avi => RecordFormat::Mp4,
+                        };
+                        w.output.set_record_settings(s);
+                        w.painter.send(Paint::Redraw);
+                    }
+                    Some(Control::Quality) => {
+                        let mut s = w.output.record_settings();
+                        s.high_quality = !s.high_quality;
+                        w.output.set_record_settings(s);
+                        w.painter.send(Paint::Redraw);
+                    }
+                    Some(Control::Folder) => {
+                        if let Some(dir) = w.output.record_dir() {
+                            let _ = std::fs::create_dir_all(dir);
+                            open_folder(dir);
+                        }
+                    }
+                    None if hits(w.button, w.cursor.0, w.cursor.1) => {
+                        return Some(toggle_recording(w));
+                    }
+                    None => {}
+                }
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -976,10 +1293,27 @@ impl CardMonitors {
     }
 }
 
+/// Show a folder in the desktop's file manager.
+fn open_folder(dir: &std::path::Path) {
+    #[cfg(windows)]
+    let cmd = "explorer";
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let cmd = "xdg-open";
+    if let Err(e) = std::process::Command::new(cmd).arg(dir).spawn() {
+        warn!("opening {}: {e}", dir.display());
+    }
+}
+
 fn toggle_recording(w: &mut MonitorWindow) -> String {
     let name = w.output.name();
     let message = if w.output.is_recording() {
         match w.output.stop_recording() {
+            Ok(Some(path)) if w.output.saving() => {
+                info!("toaster {name} recording: making {}", path.display());
+                format!("{name} recording: saving {}", path.display())
+            }
             Ok(Some(path)) => {
                 info!("toaster {name} recording saved: {}", path.display());
                 format!("{name} recording saved: {}", path.display())
@@ -1002,7 +1336,7 @@ fn toggle_recording(w: &mut MonitorWindow) -> String {
             }
         }
     };
-    w.shown_recording = w.output.is_recording();
+    w.shown = (w.output.is_recording(), w.output.saving());
     w.window.set_title(&w.title());
     w.painter.send(Paint::Redraw);
     message
