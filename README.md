@@ -12,11 +12,37 @@ Support: [Patreon](https://www.patreon.com/cw/Copperline)
 > Video Toaster 4000 in the video slot (the real 4.2 switcher, CG, effects,
 > framestores and keys run on it) and a high-level emulation of the Video
 > Toaster Flyer, with `flyer-convert`, a window in the Toaster's style
-> that turns video, stills and picture sequences into Flyer clips. See
-> [docs/toaster](docs/toaster/README.md) for the
-> working specs, `docs/internals/video.md` (Toaster section) for how it is
-> built, and `docs/guide/configuration.md` (`[video_slot]`) for setting it
-> up. NewTek's software is not included.
+> that turns video, stills and picture sequences into Flyer clips.
+>
+> **Still in development.** Much works (switching, effects, keys, CG
+> titles, framestores, Flyer clips and projects with sound, recording
+> Program to MP4), but expect rough edges and missing pieces: recording
+> into the Flyer, SMPTE and the TBC are not emulated yet, and long
+> transitions can still run behind real time on slower PCs.
+>
+> **What you need to supply.** Neither the Amiga ROMs nor NewTek's
+> software are included:
+>
+> - **Kickstart ROM and Workbench:** get them legally from
+>   [Amiga Forever](https://www.amigaforever.com/) (Cloanto). The Toaster
+>   needs an A4000 with Kickstart 3.1 (40.68) and Workbench 3.1.
+> - **Video Toaster 4.x / Flyer software:** see
+>   [Open Video Toaster](http://discreetfx.com/openvideotoaster.html).
+>   There are more files on that site you may need (software, effects,
+>   source), so look there first if something is missing.
+>
+> **Credits.** NewTek built the Video Toaster and the Flyer and released
+> their software's source code in 2004; the Open Video Toaster project,
+> run by DiscreetFX (Bill Panagouleas and team), hosts it and the files
+> around it. This emulation was written from those
+> sources, and would not exist without them. Copperline itself is by its
+> authors, upstream at [copperline.dev](https://copperline.dev/).
+>
+> See [docs/toaster](docs/toaster/README.md) for the working specs,
+> `docs/internals/video.md` (Toaster section) for how it is built, and
+> `docs/guide/configuration.md` (`[video_slot]`) for setting it up.
+>
+> ![flyer-convert: video, stills and picture sequences to Video Flyer clips](assets/toaster/flyer-convert.png)
 
 Copperline is a cycle-driven Commodore Amiga emulator (OCS, ECS, and AGA) written in Rust. It models the Amiga custom chipset, 680x0 CPU, memory subsystems, and common expansion hardware on a unified clock timeline.
 
