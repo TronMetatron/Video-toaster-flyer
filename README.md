@@ -1,3 +1,5 @@
+![The Video Toaster 4000 and Flyer emulated in Copperline: the 4.2 switcher, with the Preview and Program monitors](assets/toaster/screenshot.jpg)
+
 ![Copperline](assets/brand/copperline-logo.png)
 
 Website: [copperline.dev](https://copperline.dev/) |
