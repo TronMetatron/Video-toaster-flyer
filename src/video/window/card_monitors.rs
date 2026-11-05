@@ -12,7 +12,11 @@
 //!
 //! Composition is on the CPU at the window's own size (the artwork is
 //! resampled once per resize), presented through a `pixels` surface of
-//! the same size. In the Program window, `R` or the monitor's power button
+//! the same size. Each tube pixel's filter taps and glass lighting are
+//! worked out once per window and picture size, in fixed point, so a new
+//! frame is one pass of integer arithmetic straight into the surface's
+//! buffer, split across threads: this runs on the emulator's own thread,
+//! and must not slow the machine down. In the Program window, `R` or the monitor's power button
 //! starts and stops a recording of the output; the power lamp shows red
 //! while it runs.
 
@@ -226,11 +230,49 @@ fn resample_u8(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8
         .collect()
 }
 
+/// One tube pixel's recipe: the 2 x 2 of picture pixels it filters and how
+/// the glass lights it, in fixed point.
+#[derive(Clone, Copy, Debug)]
+struct Tap {
+    /// Window pixel.
+    i: u32,
+    /// Picture pixel at the top left of the 2 x 2.
+    base: u32,
+    /// The right and lower neighbours are one on (0 at the picture's edge).
+    dx: u8,
+    dy: u8,
+    /// Filter position within the 2 x 2, in 256ths.
+    tx: u8,
+    ty: u8,
+    /// The glass's shading (256 = 1) and sheen.
+    shade: u16,
+    sheen: u8,
+    /// Coverage: 255 inside the glass, less on its antialiased edge.
+    a: u8,
+}
+
+/// The taps of every tube pixel for one picture size, in window order, and
+/// where each window row's run starts.
+struct Table {
+    vw: usize,
+    vh: usize,
+    taps: Vec<Tap>,
+    /// `rows[r]`: the first tap on window row `screen.1 + r`.
+    rows: Vec<usize>,
+}
+
+/// Tube pixels below which a frame is composed on one thread.
+const PARALLEL_TAPS: usize = 60_000;
+
 /// The artwork laid out for one window size.
 pub(super) struct Layer {
     w: usize,
     h: usize,
     bg: Vec<u32>,
+    /// `bg` as the surface's bytes.
+    bg_bytes: Vec<u8>,
+    /// The taps for the last picture size composed.
+    table: std::sync::Mutex<Option<Arc<Table>>>,
     mask: Vec<u8>,
     glass: Vec<u8>,
     screen: (usize, usize, usize, usize),
@@ -287,10 +329,13 @@ impl Layer {
             let (c, d) = map(x1 as f32, y1 as f32);
             (a, b, c, d)
         });
+        let bg_bytes = bg.iter().flat_map(|p| p.to_le_bytes()).collect();
         Self {
             w,
             h,
             bg,
+            bg_bytes,
+            table: std::sync::Mutex::new(None),
             mask,
             glass,
             screen,
@@ -298,6 +343,58 @@ impl Layer {
             lamp,
             button,
         }
+    }
+
+    /// The taps for a `vw` x `vh` picture (made on first use).
+    fn table(&self, vw: usize, vh: usize) -> Arc<Table> {
+        let mut slot = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = slot.as_ref().filter(|t| (t.vw, t.vh) == (vw, vh)) {
+            return Arc::clone(t);
+        }
+        let (px, py, pw, ph) = self.picture;
+        let (x0, y0, x1, y1) = self.screen;
+        let sx = vw as f32 / pw;
+        let sy = vh as f32 / ph;
+        let mut taps = Vec::new();
+        let mut rows = Vec::with_capacity(y1.saturating_sub(y0) + 1);
+        for y in y0..y1 {
+            rows.push(taps.len());
+            let vy = ((y as f32 + 0.5 - py) * sy - 0.5).clamp(0.0, (vh - 1) as f32);
+            let ya = vy.floor() as usize;
+            let ty = vy - ya as f32;
+            for x in x0..x1 {
+                let i = y * self.w + x;
+                let m = self.mask[i];
+                if m == 0 {
+                    continue;
+                }
+                let vx = ((x as f32 + 0.5 - px) * sx - 0.5).clamp(0.0, (vw - 1) as f32);
+                let xa = vx.floor() as usize;
+                let tx = vx - xa as f32;
+                let g = f32::from(self.glass[i]);
+                // The tube's own shading darkens toward its edges; whatever
+                // is brighter than the bare glass (the reflection) lies on
+                // top.
+                let shade = 0.72 + 0.28 * (g / 45.0).min(1.0);
+                let sheen = (g - 50.0).max(0.0) * 0.9;
+                let fixed = |t: f32| (t * 256.0).round().min(255.0) as u8;
+                taps.push(Tap {
+                    i: i as u32,
+                    base: (ya * vw + xa) as u32,
+                    dx: u8::from(xa + 1 < vw),
+                    dy: u8::from(ya + 1 < vh),
+                    tx: fixed(tx),
+                    ty: fixed(ty),
+                    shade: (shade * 256.0).round() as u16,
+                    sheen: sheen.round().min(255.0) as u8,
+                    a: m,
+                });
+            }
+        }
+        rows.push(taps.len());
+        let table = Arc::new(Table { vw, vh, taps, rows });
+        *slot = Some(Arc::clone(&table));
+        table
     }
 
     fn hits_button(&self, x: f64, y: f64) -> bool {
@@ -314,55 +411,78 @@ impl Layer {
         lamp_on: bool,
         out: &mut [u32],
     ) {
-        out[..self.w * self.h].copy_from_slice(&self.bg);
+        let mut bytes = vec![0u8; self.w * self.h * 4];
+        self.compose_rgba8(video, lamp_on, &mut bytes, true);
+        for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+            *o = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        }
+    }
+
+    /// [`Self::compose`] into a surface's RGBA bytes (`w * h * 4`). With
+    /// `background` false the artwork around the tube is taken to be there
+    /// already (the frame before it was composed by this layer, with the
+    /// same lamp), and only the tube is drawn.
+    pub(super) fn compose_rgba8(
+        &self,
+        video: Option<(&[u32], usize, usize)>,
+        lamp_on: bool,
+        frame: &mut [u8],
+        background: bool,
+    ) {
+        let len = self.w * self.h * 4;
+        if frame.len() < len {
+            return;
+        }
+        let frame = &mut frame[..len];
+        if background || video.is_none() {
+            frame.copy_from_slice(&self.bg_bytes);
+        }
         if let Some((video, vw, vh)) =
             video.filter(|(v, vw, vh)| *vw > 0 && *vh > 0 && v.len() >= vw * vh)
         {
-            let (px, py, pw, ph) = self.picture;
-            let (x0, y0, x1, y1) = self.screen;
-            let sx = vw as f32 / pw;
-            let sy = vh as f32 / ph;
-            for y in y0..y1 {
-                let vy = ((y as f32 + 0.5 - py) * sy - 0.5).clamp(0.0, (vh - 1) as f32);
-                let ya = vy.floor() as usize;
-                let yb = (ya + 1).min(vh - 1);
-                let ty = vy - ya as f32;
-                for x in x0..x1 {
-                    let i = y * self.w + x;
-                    let m = self.mask[i];
-                    if m == 0 {
-                        continue;
-                    }
-                    let vx = ((x as f32 + 0.5 - px) * sx - 0.5).clamp(0.0, (vw - 1) as f32);
-                    let xa = vx.floor() as usize;
-                    let xb = (xa + 1).min(vw - 1);
-                    let tx = vx - xa as f32;
-                    let p00 = video[ya * vw + xa].to_le_bytes();
-                    let p01 = video[ya * vw + xb].to_le_bytes();
-                    let p10 = video[yb * vw + xa].to_le_bytes();
-                    let p11 = video[yb * vw + xb].to_le_bytes();
-                    let g = f32::from(self.glass[i]);
-                    // The tube's own shading darkens toward its edges;
-                    // whatever is brighter than the bare glass (the
-                    // reflection) lies on top.
-                    let shade = 0.72 + 0.28 * (g / 45.0).min(1.0);
-                    let sheen = (g - 50.0).max(0.0) * 0.9;
-                    let bg = self.bg[i].to_le_bytes();
-                    let a = f32::from(m) / 255.0;
-                    let mut px_out = [0u8; 4];
-                    for c in 0..3 {
-                        let top = f32::from(p00[c]) * (1.0 - tx) + f32::from(p01[c]) * tx;
-                        let bottom = f32::from(p10[c]) * (1.0 - tx) + f32::from(p11[c]) * tx;
-                        let v = (top * (1.0 - ty) + bottom * ty) * shade + sheen;
-                        let v = v * a + f32::from(bg[c]) * (1.0 - a);
-                        px_out[c] = v.round().clamp(0.0, 255.0) as u8;
-                    }
-                    px_out[3] = 0xFF;
-                    out[i] = u32::from_le_bytes(px_out);
+            let table = self.table(vw, vh);
+            let y0 = self.screen.1;
+            let rows = table.rows.len().saturating_sub(1);
+            let threads = if table.taps.len() < PARALLEL_TAPS {
+                1
+            } else {
+                std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 4))
+            };
+            // Each thread a band of rows: its own run of taps and of bytes.
+            let per = rows.div_ceil(threads).max(1);
+            let row_bytes = self.w * 4;
+            let mut rest = &mut frame[y0 * row_bytes..];
+            let mut bands = Vec::new();
+            for start in (0..rows).step_by(per) {
+                let end = (start + per).min(rows);
+                let (band, tail) = rest.split_at_mut((end - start) * row_bytes);
+                rest = tail;
+                let taps = &table.taps[table.rows[start]..table.rows[end]];
+                bands.push((band, taps, (y0 + start) * self.w));
+            }
+            let run = |(band, taps, first): (&mut [u8], &[Tap], usize)| {
+                for t in taps {
+                    let at = (t.i as usize - first) * 4;
+                    let bg = self.bg[t.i as usize];
+                    band[at..at + 4].copy_from_slice(&tap_pixel(t, video, vw, bg));
                 }
+            };
+            if bands.len() <= 1 {
+                bands.into_iter().for_each(run);
+            } else {
+                std::thread::scope(|scope| {
+                    let mut bands = bands.into_iter();
+                    let first = bands.next();
+                    for band in bands {
+                        scope.spawn(move || run(band));
+                    }
+                    if let Some(band) = first {
+                        run(band);
+                    }
+                });
             }
         }
-        if lamp_on {
+        if lamp_on && (background || video.is_none()) {
             if let Some((lx, ly, r)) = self.lamp {
                 let r = r.max(1.5);
                 let glow = r * 2.2;
@@ -382,17 +502,49 @@ impl Layer {
                         if a <= 0.0 {
                             continue;
                         }
-                        let i = y * self.w + x;
-                        let [r0, g0, b0, _] = out[i].to_le_bytes();
+                        let i = (y * self.w + x) * 4;
                         let mix = |base: u8, lit: f32| {
                             (f32::from(base) * (1.0 - a) + lit * a).round() as u8
                         };
-                        out[i] = rgba_u32(mix(r0, 255.0), mix(g0, 40.0), mix(b0, 30.0));
+                        frame[i] = mix(frame[i], 255.0);
+                        frame[i + 1] = mix(frame[i + 1], 40.0);
+                        frame[i + 2] = mix(frame[i + 2], 30.0);
+                        frame[i + 3] = 0xFF;
                     }
                 }
             }
         }
     }
+}
+
+/// One tube pixel: the picture filtered at its tap, lit by the glass, over
+/// the artwork by its coverage.
+#[inline]
+fn tap_pixel(t: &Tap, video: &[u32], vw: usize, bg: u32) -> [u8; 4] {
+    let b = t.base as usize;
+    let dx = usize::from(t.dx);
+    let below = b + usize::from(t.dy) * vw;
+    let (p00, p01, p10, p11) = (video[b], video[b + dx], video[below], video[below + dx]);
+    let (tx, ty) = (u32::from(t.tx), u32::from(t.ty));
+    let w00 = (256 - tx) * (256 - ty);
+    let w01 = tx * (256 - ty);
+    let w10 = (256 - tx) * ty;
+    let w11 = tx * ty;
+    let a = u32::from(t.a);
+    let mut out = [0, 0, 0, 0xFF];
+    for (c, o) in out.iter_mut().take(3).enumerate() {
+        let s = 8 * c as u32;
+        let ch = |p: u32| (p >> s) & 0xFF;
+        let v = (ch(p00) * w00 + ch(p01) * w01 + ch(p10) * w10 + ch(p11) * w11 + 32768) >> 16;
+        let v = ((v * u32::from(t.shade) + 128) >> 8) + u32::from(t.sheen);
+        let v = if a == 255 {
+            v
+        } else {
+            (v * a + ch(bg) * (255 - a) + 127) / 255
+        };
+        *o = v.min(255) as u8;
+    }
+    out
 }
 
 /// Compose `output`'s latest frame on the artwork at the artwork's own
@@ -422,7 +574,9 @@ struct MonitorWindow {
     video_size: (usize, usize),
     shown_recording: bool,
     cursor: (f64, f64),
-    scratch: Vec<u32>,
+    /// The surface's buffer holds the current layer's artwork, with the
+    /// power lamp lit or not.
+    painted: Option<bool>,
 }
 
 impl MonitorWindow {
@@ -457,24 +611,22 @@ impl MonitorWindow {
                 h as usize,
                 self.output.aspect(),
             ));
+            self.painted = None;
         }
         let Some(layer) = self.layer.as_ref() else {
             return;
         };
         let recording = self.output.is_recording();
-        let mut out = std::mem::take(&mut self.scratch);
-        out.resize((w * h) as usize, 0);
         let video = (!self.video.is_empty()).then_some((
             self.video.as_slice(),
             self.video_size.0,
             self.video_size.1,
         ));
-        layer.compose(video, recording, &mut out);
-        let frame = self.pixels.frame_mut();
-        for (dst, px) in frame.chunks_exact_mut(4).zip(&out) {
-            dst.copy_from_slice(&px.to_le_bytes());
-        }
-        self.scratch = out;
+        // The artwork around the tube stays in the surface's buffer from
+        // frame to frame; it is painted again only when it changes.
+        let background = self.painted != Some(recording);
+        layer.compose_rgba8(video, recording, self.pixels.frame_mut(), background);
+        self.painted = Some(recording);
         if let Err(e) = self.pixels.render() {
             warn!("toaster monitor {}: {e}", self.output.name());
         }
@@ -494,6 +646,7 @@ impl MonitorWindow {
             warn!("toaster monitor resize: {e}");
         }
         self.layer = None;
+        self.painted = None;
     }
 }
 
@@ -599,7 +752,7 @@ impl CardMonitors {
                 video_size: (0, 0),
                 shown_recording: false,
                 cursor: (0.0, 0.0),
-                scratch: Vec::new(),
+                painted: None,
             };
             mw.window.set_title(&mw.title());
             mw.window.request_redraw();
@@ -802,6 +955,61 @@ mod tests {
             "{:?}",
             art.screen
         );
+    }
+
+    #[test]
+    fn the_fixed_point_tube_follows_the_float_model() {
+        let art = MonitorArt::decode(DEFAULT_ART, true).expect("artwork");
+        let layer = Layer::new(&art, 1100, 817, 4.0 / 3.0);
+        // A picture with detail in every channel.
+        let (vw, vh) = (752, 480);
+        let video: Vec<u32> = (0..vw * vh)
+            .map(|k| {
+                let (x, y) = (k % vw, k / vw);
+                rgba_u32((x * 3) as u8, (y * 5) as u8, ((x + y) * 7) as u8)
+            })
+            .collect();
+        let mut out = vec![0u32; 1100 * 817];
+        layer.compose(Some((&video, vw, vh)), false, &mut out);
+        // The float model this replaced, at a spread of tube pixels.
+        let (px, py, pw, ph) = layer.picture;
+        let (sx, sy) = (vw as f32 / pw, vh as f32 / ph);
+        let (x0, y0, x1, y1) = layer.screen;
+        let mut checked = 0;
+        for y in (y0..y1).step_by(37) {
+            for x in (x0..x1).step_by(41) {
+                let i = y * 1100 + x;
+                let m = layer.mask[i];
+                if m == 0 {
+                    continue;
+                }
+                let vy = ((y as f32 + 0.5 - py) * sy - 0.5).clamp(0.0, (vh - 1) as f32);
+                let vx = ((x as f32 + 0.5 - px) * sx - 0.5).clamp(0.0, (vw - 1) as f32);
+                let (ya, xa) = (vy.floor() as usize, vx.floor() as usize);
+                let (yb, xb) = ((ya + 1).min(vh - 1), (xa + 1).min(vw - 1));
+                let (ty, tx) = (vy - ya as f32, vx - xa as f32);
+                let g = f32::from(layer.glass[i]);
+                let shade = 0.72 + 0.28 * (g / 45.0).min(1.0);
+                let sheen = (g - 50.0).max(0.0) * 0.9;
+                let a = f32::from(m) / 255.0;
+                let got = out[i].to_le_bytes();
+                let bg = layer.bg[i].to_le_bytes();
+                for c in 0..3 {
+                    let p = |k: usize| f32::from(video[k].to_le_bytes()[c]);
+                    let top = p(ya * vw + xa) * (1.0 - tx) + p(ya * vw + xb) * tx;
+                    let bottom = p(yb * vw + xa) * (1.0 - tx) + p(yb * vw + xb) * tx;
+                    let v = (top * (1.0 - ty) + bottom * ty) * shade + sheen;
+                    let v = (v * a + f32::from(bg[c]) * (1.0 - a)).clamp(0.0, 255.0);
+                    assert!(
+                        (f32::from(got[c]) - v).abs() <= 3.0,
+                        "({x}, {y}) channel {c}: {} vs {v}",
+                        got[c]
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 200, "{checked}");
     }
 
     #[test]

@@ -22,7 +22,9 @@
 //! framestore's sampling rate, 4:3, letterboxed or pillarboxed to fit.
 //! Frames are produced on a worker thread per input and consumed one per
 //! emulated video frame, so playback follows the emulated clock (a slow
-//! host plays slowly rather than dropping frames).
+//! host plays slowly rather than dropping frames). The workers wait until
+//! the switcher first drives the card: nothing is decoded while the
+//! machine boots.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,11 +243,14 @@ enum Message {
 }
 
 /// What an input's worker and its owner share: a file the input is held
-/// to instead of its folder's contents, and what it is playing.
+/// to instead of its folder's contents, what it is playing, and whether
+/// it may start (an input is not read before the switcher drives the
+/// card).
 #[derive(Default)]
 struct Shared {
     pinned: Mutex<Option<PathBuf>>,
     playing: Mutex<Option<PathBuf>>,
+    started: AtomicBool,
 }
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -265,7 +270,7 @@ pub struct InputFeed {
 }
 
 impl InputFeed {
-    /// Start watching `dir`.
+    /// An input watching `dir` once [`Self::start`] is called.
     pub fn spawn(index: usize, dir: PathBuf, ffmpeg: Option<PathBuf>) -> Self {
         // Eight frames (a quarter second) of buffer: a decoder or disk
         // hiccup on the host must not leave a frame without its picture and
@@ -291,6 +296,17 @@ impl InputFeed {
             dir,
             shared,
         }
+    }
+
+    /// Start reading the folder: until then the worker waits, and the
+    /// input has no signal.
+    pub fn start(&self) {
+        self.shared.started.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::start`] was called.
+    pub fn started(&self) -> bool {
+        self.shared.started.load(Ordering::Relaxed)
     }
 
     /// The input's folder.
@@ -439,6 +455,11 @@ impl Worker {
     }
 
     fn run(mut self) {
+        while !self.shared.started.load(Ordering::Relaxed) {
+            if !self.nap(Duration::from_millis(100)) {
+                return;
+            }
+        }
         let mut files: Vec<PathBuf> = Vec::new();
         let mut next = 0usize;
         let mut signal = false;

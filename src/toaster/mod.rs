@@ -555,6 +555,7 @@ impl Toaster {
                     log::info!(
                         "toaster: first extended header on line {vpos}: the switcher is driving the card"
                     );
+                    self.video.start_inputs();
                 }
                 self.active = true;
                 if self.diag && self.elh[index] != header {
@@ -675,7 +676,11 @@ impl VideoSlotDevice for Toaster {
         self.video.set_live(record && self.regs().abse());
         let frame_done = self.video.begin_field();
         if frame_done {
-            self.produce_outputs(field);
+            if self.active {
+                self.produce_outputs(field);
+            } else {
+                self.produce_idle_outputs();
+            }
         }
         if record {
             self.record_input(field);
@@ -1079,6 +1084,18 @@ impl Toaster {
         self.video.give_back(a);
     }
 
+    /// Until the switcher first drives the card, its outputs are black and
+    /// silent: the power-on mux settings would put inputs nobody chose on
+    /// Program and Preview while the machine boots.
+    fn produce_idle_outputs(&mut self) {
+        let black = vec![video::black(); video::PICTURE_W * video::PICTURE_H];
+        let silence = vec![(0.0f32, 0.0f32); self.video.frame_samples()];
+        if let Some(link) = &self.flyer {
+            link.take_sound();
+        }
+        self.video.publish(&black, &black, &silence, &silence);
+    }
+
     /// The Flyer's audio output is the system's: its fields of sound since
     /// the last frame, stretched to this frame, join Program's. The input
     /// files' sound (standing in for what reaches the Flyer's line inputs)
@@ -1253,6 +1270,59 @@ mod tests {
         assert!(program.iter().all(|&(l, r)| l == 0.5 && r == 0.25));
         assert!(link.take_sound().is_empty());
         assert_eq!(card.status_value()["flyer"]["input3"], true);
+    }
+
+    #[test]
+    fn the_outputs_are_black_and_silent_until_the_switcher_drives_the_card() {
+        use crate::flyer::link::{FieldSource, FlyerLink};
+        let link = FlyerLink::new();
+        let mut card = Toaster::new();
+        card.set_flyer_link(std::sync::Arc::clone(&link));
+        let white = u32::from_le_bytes([255, 255, 255, 255]);
+        link.set_routing(true, false);
+        link.show(0, FieldSource::Matte(white));
+        // Both buses on input 3, which the Flyer shows white.
+        card.elh[ELH_EH0 + 2].r = 0xA200;
+        card.elh[ELH_EH0 + 2].b = 0x0200;
+        let program = |card: &Toaster| {
+            let outputs = card.video_outputs();
+            let (_, _, pixels) = outputs[1].snapshot().expect("a frame");
+            pixels
+        };
+        let frame = |card: &mut Toaster| {
+            let blank = Line::new(30);
+            card.field_complete(&blank.field(), BeamPos::default());
+            card.field_complete(&blank.field(), BeamPos::default());
+            let mut sound = Vec::new();
+            card.take_audio(&mut sound);
+            sound
+        };
+        link.push_sound(&[(0.5, 0.25); 1470]);
+        let sound = frame(&mut card);
+        assert!(!card.active);
+        assert!(program(&card).iter().all(|&p| p == video::black()));
+        assert!(!sound.is_empty() && sound.iter().all(|&(l, r)| l == 0.0 && r == 0.0));
+        // The Flyer's sound from before is dropped, not played late.
+        assert!(link.take_sound().is_empty());
+        // The switcher's first header: from then on the outputs follow it.
+        let mut eh0 = Line::new(23);
+        eh0.header(Header {
+            r: 0x8000,
+            g: 0x0100,
+            b: 0xF000,
+            i: 0x0F00,
+        });
+        card.field_complete(&eh0.field(), BeamPos::default());
+        assert!(card.active);
+        card.elh[ELH_EH0 + 2].r = 0xA200;
+        card.elh[ELH_EH0 + 2].b = 0x0200;
+        link.push_sound(&[(0.5, 0.25); 1470]);
+        let blank = Line::new(30);
+        card.field_complete(&blank.field(), BeamPos::default());
+        let mut sound = Vec::new();
+        card.take_audio(&mut sound);
+        assert!(program(&card).iter().all(|&p| p == white));
+        assert!(sound.iter().any(|&(l, _)| l != 0.0));
     }
 
     #[test]

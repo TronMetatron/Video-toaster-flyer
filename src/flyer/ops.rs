@@ -18,7 +18,10 @@
 //!
 //! Commands are served synchronously, inside the Amiga's write of the
 //! opcode word: the library writes it last and then polls for done, and
-//! for GETCLOCK and CACHETEST it does so with interrupts off.
+//! for GETCLOCK and CACHETEST it does so with interrupts off. A command
+//! the firmware's task would wait in (DOSEARCH for the last frame to take,
+//! FLYPLAY for a channel a jog session holds) stays in progress and is
+//! tried again every field until it can finish.
 
 use super::fs::Filesystem;
 use super::link::FlyerLink;
@@ -186,6 +189,9 @@ pub enum Outcome {
     /// Still running; the slot stays in progress (CACHETEST waiting for
     /// the Amiga to clear `cont`, a clip playing).
     Held,
+    /// Waiting for something on the card: the slot stays in progress and
+    /// the command is tried again every field.
+    Waiting,
 }
 
 /// The Flyer's firmware state.
@@ -246,6 +252,10 @@ pub struct Firmware {
     /// Field clocks stepped since the last [`Self::run_fields`].
     #[serde(skip)]
     fields_due: Vec<u32>,
+    /// Commands waiting on the card ([`Outcome::Waiting`]), oldest first:
+    /// their slot and opcode.
+    #[serde(default)]
+    waiting: Vec<(Slot, u16)>,
 }
 
 impl Default for Firmware {
@@ -288,6 +298,7 @@ impl Firmware {
             reported: 0,
             link: None,
             fields_due: Vec::new(),
+            waiting: Vec::new(),
         }
     }
 
@@ -361,6 +372,26 @@ impl Firmware {
                 let cont = slot.cont(sram);
                 self.player
                     .cont_written(slot, cont, sram, self.link.as_deref());
+                // A clip still waiting for its channel, aborted: it ends
+                // having shown nothing.
+                if cont == 0 {
+                    if let Some(k) = self
+                        .waiting
+                        .iter()
+                        .position(|&(s, o)| s == slot && o == op::FLYPLAY)
+                    {
+                        self.waiting.remove(k);
+                        let r = Request::read(sram, play::action_of(sram, slot));
+                        let first = if r.flags & play::caf::VIDEO != 0 {
+                            r.vid_start
+                        } else {
+                            r.aud_start
+                        };
+                        mailbox::wr32(sram, r.action + play::ca::LAST_FIELD_DONE, first);
+                        slot.set_error(sram, err::OKAY);
+                        slot.mark_done(sram);
+                    }
+                }
             }
         }
     }
@@ -400,9 +431,44 @@ impl Firmware {
                 hex(&sram[slot.base() + 4..slot.base() + mailbox::CMD_LEN])
             );
         }
-        if let Outcome::Done(error) = outcome {
-            slot.set_error(sram, error);
-            slot.mark_done(sram);
+        match outcome {
+            Outcome::Done(error) => {
+                slot.set_error(sram, error);
+                slot.mark_done(sram);
+            }
+            Outcome::Waiting => self.waiting.push((slot, opcode)),
+            Outcome::Held => {}
+        }
+    }
+
+    /// Try the waiting commands again, in the order they came.
+    fn retry_waiting(&mut self, sram: &mut [u8]) {
+        let mut k = 0;
+        while k < self.waiting.len() {
+            let (slot, opcode) = self.waiting[k];
+            // The Amiga gave up on it (freed or reused the slot).
+            if slot.status(sram) != mailbox::STAT_INPROG || slot.opcode(sram) != opcode {
+                self.waiting.remove(k);
+                continue;
+            }
+            match self.run(sram, slot, opcode) {
+                Outcome::Waiting => k += 1,
+                outcome => {
+                    self.waiting.remove(k);
+                    if self.diag() {
+                        log::info!(
+                            "flyer: slot {} {} -> {:?} (after waiting)",
+                            slot.0,
+                            mailbox::opcode_name(opcode),
+                            outcome
+                        );
+                    }
+                    if let Outcome::Done(error) = outcome {
+                        slot.set_error(sram, error);
+                        slot.mark_done(sram);
+                    }
+                }
+            }
         }
     }
 
@@ -445,6 +511,7 @@ impl Firmware {
         // InitFileSys and DriveSurvey.
         self.fs.boot(sram);
         self.player = Player::default();
+        self.waiting.clear();
         self.publish_routing();
     }
 
@@ -456,6 +523,7 @@ impl Firmware {
         self.cache_test = None;
         self.leds = 0x04;
         self.player = Player::default();
+        self.waiting.clear();
     }
 
     fn ee(&self, addr: u8) -> u16 {
@@ -578,6 +646,15 @@ impl Firmware {
                 Done(err::OKAY)
             }
             op::FLYPLAY => self.fly_play(sram, slot),
+            op::SRCHARGS => self.search_args(sram, slot),
+            op::DOSEARCH => {
+                let action = play::action_of(sram, slot);
+                let link = self.link.clone();
+                step(
+                    self.player
+                        .do_search(slot, sram, action, self.field_clock, link.as_deref()),
+                )
+            }
             op::NEWSEQ => {
                 self.player.new_sequence();
                 Done(err::OKAY)
@@ -688,6 +765,15 @@ impl Firmware {
             r.vid_count,
             r.go_clock
         );
+        // A jog session holds the channel: FLYPLAY waits for it to close
+        // (the firmware's channel semaphore), or fails if asked to.
+        if r.flags & play::caf::VIDEO != 0 && self.player.channel_held(r.channel) {
+            return if r.permiss & play::CAPF_ERRIFBUSY != 0 {
+                Outcome::Done(play::ERR_CHANINUSE)
+            } else {
+                Outcome::Waiting
+            };
+        }
         let link = self.link.clone();
         match self
             .player
@@ -696,6 +782,32 @@ impl Firmware {
             Ok(()) => Outcome::Held,
             Err(e) => Outcome::Done(e),
         }
+    }
+
+    /// SRCHARGS (`SearchArgs`): open (1), change the sound of (2) or close
+    /// (0) the jog/shuttle session on the clip the ClipAction names.
+    fn search_args(&mut self, sram: &mut [u8], slot: Slot) -> Outcome {
+        let action = play::action_of(sram, slot);
+        let flag = slot.arg8(sram, 8);
+        let r = Request::read(sram, action);
+        let link = self.link.clone();
+        step(match flag {
+            0 => self
+                .player
+                .close_search(&r, self.field_clock, link.as_deref()),
+            1 if !self.player.search_open() => {
+                let volume = mailbox::rd32(sram, action + play::ca::VOLUME) as usize;
+                if mailbox::rd8(sram, volume + 5) >= super::fs::DRIVES {
+                    return Outcome::Done(err::BADPARAM);
+                }
+                match self.named_clip(sram, action) {
+                    Ok(clip) => self.player.open_search(&r, clip),
+                    Err(e) => play::Step::Done(e),
+                }
+            }
+            1 => self.player.open_search(&r, None),
+            _ => self.player.change_search(&r, self.field_clock),
+        })
     }
 
     /// ADDSEQCLIP (`AddSequenceClip`): one clip of the sequence.
@@ -756,6 +868,9 @@ impl Firmware {
         let link = self.link.clone();
         for clock in std::mem::take(&mut self.fields_due) {
             self.player.field(clock, sram, link.as_deref());
+            if !self.waiting.is_empty() {
+                self.retry_waiting(sram);
+            }
         }
     }
 
@@ -1121,6 +1236,14 @@ impl Firmware {
                 self.field_clock &= !3;
             }
         }
+    }
+}
+
+/// A player step as a command outcome.
+fn step(step: play::Step) -> Outcome {
+    match step {
+        play::Step::Done(e) => Outcome::Done(e),
+        play::Step::Wait => Outcome::Waiting,
     }
 }
 

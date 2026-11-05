@@ -168,6 +168,7 @@ pub struct Filesystem {
     /// Which grip slots are in use (slot 0 is the root grip).
     grips: Vec<bool>,
     /// The DRAM, allocated on first use.
+    #[serde(with = "crate::bytes_serde")]
     dram: Vec<u8>,
     /// The custom FIR coefficients (`CustomFIRcoefs`): pre and post
     /// compensation, eight coefficients and a scale each.
