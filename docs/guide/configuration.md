@@ -933,6 +933,14 @@ Until the switcher first drives the card, while the machine boots, both
 outputs are black and silent and the input folders are not read yet; the
 inputs start playing once the switcher is up.
 
+The switcher's own screen is an NTSC overscan display, taller and wider
+than the standard TV picture, so the default TV framing leaves its bottom
+rows (the AUTO/TAKE row and the version line) and its left edge off the
+glass. `[display] overscan = "smart"` with `autocrop = true` crops the
+window to the display window the switcher programs instead, which shows
+the whole screen; **Video Settings -> Framing** and **Autocrop** in the
+menu switch the same settings live.
+
 With `monitors` on, the card's two outputs open as windows of their own,
 each on a picture monitor: **Preview** and **Program**. Closing one only
 hides it; **Recording > Show Toaster Monitors** brings both back. In the

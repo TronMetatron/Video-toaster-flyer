@@ -861,6 +861,11 @@ impl Firmware {
     /// Play the fields whose clock stepped since the last call: video to
     /// the Toaster, a field of sound, commands that finished.
     pub fn run_fields(&mut self, sram: &mut [u8]) {
+        // Called at every instruction boundary: nothing to do between
+        // fields, and that is decided before anything is touched.
+        if self.fields_due.is_empty() {
+            return;
+        }
         if self.cpu != Cpu::Running {
             self.fields_due.clear();
             return;
