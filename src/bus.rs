@@ -6312,6 +6312,17 @@ impl Bus {
                 board.reattach_backend()?;
             }
         }
+        // The Flyer's ribbon to the Toaster (which stays with the live
+        // video slot) is not saved: the loaded card takes the live one's.
+        for (device, old) in self.devices.iter_mut().zip(&live.devices) {
+            if let (
+                crate::zorro_device::BoardDevice::Flyer(board),
+                crate::zorro_device::BoardDevice::Flyer(old),
+            ) = (device, old)
+            {
+                board.adopt_link_from(old);
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         self.materialize_saved_host_disks()?;
         std::mem::swap(&mut self.paula.serial, &mut live.paula.serial);

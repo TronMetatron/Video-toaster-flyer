@@ -77,6 +77,15 @@ pub fn call_body(function: &str, args: &[serde_json::Value]) -> String {
 
 /// `body` wrapped so it can use both Toaster ports and reports errors
 /// instead of hanging on them.
+///
+/// ARexx's list of function hosts is shared by every script in the Amiga,
+/// and the switcher's host answers every call put to it (and blocks while
+/// the CG is up), so the two ports go on the list only for the job, as
+/// NewTek's StartToaster does it: added behind the hosts other programs
+/// add (priority -1), and taken off again when the job is done. Left on
+/// the list they would take the calls of the CG's own macros -- its
+/// start-up macro, which loads its fonts, and its Alt-F keys -- and hang
+/// them.
 pub fn wrap(body: &str) -> String {
     format!(
         "/* Copperline link job */\n\
@@ -84,13 +93,26 @@ pub fn wrap(body: &str) -> String {
          SIGNAL ON SYNTAX\n\
          IF ~SHOW('Libraries','rexxsupport.library') THEN call addlib('rexxsupport.library', 0, -30, 0)\n\
          IF SHOW('Libraries','CG_AREXX') THEN call remlib('CG_AREXX')\n\
-         IF SHOW('Ports','ToasterARexx.port') & ~SHOW('Libraries','ToasterARexx.port') THEN call addlib('ToasterARexx.port', 0)\n\
-         IF SHOW('Ports','PROJECT_REXX_PORT') & ~SHOW('Libraries','PROJECT_REXX_PORT') THEN call addlib('PROJECT_REXX_PORT', 0)\n\
+         copperline_hosts = ''\n\
+         IF SHOW('Ports','ToasterARexx.port') & ~SHOW('Libraries','ToasterARexx.port') THEN DO\n  \
+         call addlib('ToasterARexx.port', -1); copperline_hosts = 'ToasterARexx.port'\n\
+         END\n\
+         IF SHOW('Ports','PROJECT_REXX_PORT') & ~SHOW('Libraries','PROJECT_REXX_PORT') THEN DO\n  \
+         call addlib('PROJECT_REXX_PORT', -1); copperline_hosts = copperline_hosts 'PROJECT_REXX_PORT'\n\
+         END\n\
          {body}\n\
+         call copperline_done\n\
          exit 0\n\
          SYNTAX:\n\
          say 'ARexx error' rc 'on line' sigl':' errortext(rc)\n\
-         exit 20\n"
+         call copperline_done\n\
+         exit 20\n\
+         copperline_done:\n\
+         DO WHILE copperline_hosts ~= ''\n  \
+         PARSE VAR copperline_hosts copperline_host copperline_hosts\n  \
+         call remlib(copperline_host)\n\
+         END\n\
+         RETURN\n"
     )
 }
 
@@ -174,12 +196,16 @@ pub fn app_body(app: &App, command: &str, args: &[serde_json::Value]) -> Result<
              say 'load' Switcher('{load}')\n"
         );
         if app.name == "paint" {
-            // STTP only returns when Paint is left: run it on its own.
+            // STTP only returns when Paint is left: run it on its own,
+            // with the switcher's host on the list for that call alone
+            // (this job's own comes off first; see `wrap`).
             body.push_str(
                 "IF OPEN('s', 'T:copperline-open.rexx', 'W') THEN DO\n  \
-                 call WRITELN('s', \"call addlib('ToasterARexx.port', 0)\")\n  \
+                 call WRITELN('s', \"call addlib('ToasterARexx.port', -1)\")\n  \
                  call WRITELN('s', \"call Switcher('STTP')\")\n  \
+                 call WRITELN('s', \"call remlib('ToasterARexx.port')\")\n  \
                  call CLOSE('s')\n  \
+                 call copperline_done\n  \
                  address command 'Run >NIL: SYS:Rexxc/RX T:copperline-open.rexx'\n  \
                  say 'entering ToasterPaint'\n\
                  END\n",
@@ -355,6 +381,31 @@ mod tests {
             })
         );
         assert!(std::fs::read_dir(&link).unwrap().next().is_none());
+    }
+
+    /// The switcher's hosts are on ARexx's shared function-host list only
+    /// while a job runs, behind any host added at the usual priority, and
+    /// come off on the way out, error or not: left there they take the
+    /// CG's own macros' calls.
+    #[test]
+    fn a_job_takes_the_toaster_hosts_off_the_list_when_done() {
+        let job = wrap("say 1+1");
+        for port in ["ToasterARexx.port", "PROJECT_REXX_PORT"] {
+            assert!(job.contains(&format!("call addlib('{port}', -1)")));
+            assert!(!job.contains(&format!("call addlib('{port}', 0)")));
+        }
+        let body = job.find("say 1+1").unwrap();
+        let done = job.find("copperline_done:").unwrap();
+        // Called after the body and from the error handler, defined last.
+        assert_eq!(job.matches("call copperline_done\n").count(), 2);
+        assert!(job[body..done].contains("SYNTAX:"));
+        assert!(job[done..].contains("call remlib(copperline_host)"));
+        assert!(job.trim_end().ends_with("RETURN"));
+        // Paint's own call, made after this job ends, adds its host itself.
+        let paint = app_body(app("paint").unwrap(), "open", &[]).unwrap();
+        let off = paint.find("call copperline_done").unwrap();
+        assert!(off < paint.find("Run >NIL:").unwrap());
+        assert!(paint.contains("call remlib('ToasterARexx.port')"));
     }
 
     #[test]

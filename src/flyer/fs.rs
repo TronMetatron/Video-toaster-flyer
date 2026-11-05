@@ -12,8 +12,11 @@
 //! the firmware's layout, in an area above the downloaded Flyer.bin that
 //! the Amiga never allocates from; the position in SRAM is the one used.
 //!
-//! The drives are read-only for now: they are reported write-protected,
-//! and commands that would change them fail with `PROTECTED`.
+//! Clips are read-only: a file whose first block is a CLIP header cannot
+//! be written, extended or deleted (`PROTECTED`), and nothing records into
+//! the drives yet. Other files (the Toaster's `.i` crouton icons, project
+//! data) can be created, written, renamed and deleted, and directories
+//! made: they go to the host folder at once.
 
 use super::drive::{self, HostDrive, BLOCK, TYPE_FILE, TYPE_ROOT};
 use super::mailbox::{self, err, op, rd16, rd32, rd8, wr16, wr32, wr8, Slot, SRAM_CPU_BASE};
@@ -129,6 +132,7 @@ mod fvi {
 const ID_ROOT: u32 = 0x524F_4F54;
 /// File modes (`MODE_` in `filesys.h`).
 const MODE_INPUT: u8 = 1;
+const MODE_OUTPUT: u8 = 2;
 const MODE_UPDATE: u8 = 3;
 /// Seek modes.
 const OFFSET_BEGIN: u8 = 0xFF;
@@ -140,12 +144,16 @@ const AMIPROT_READ: u32 = 1 << 3;
 const CIF_HASVIDEO: u8 = 1 << 0;
 const CIF_HASAUDIO: u8 = 1 << 1;
 /// `ERR_` codes used only here.
+const ERR_FULL: u8 = 0x21;
+const ERR_FSFAIL: u8 = 0x24;
 const ERR_WRONGTYPE: u8 = 0x25;
+const ERR_EXISTS: u8 = 0x2C;
+const ERR_DIRNOTEMPTY: u8 = 0x32;
 const ERR_OUTOFMEM: u8 = 0x2D;
 const ERR_PROTECTED: u8 = 0x2A;
 const ERR_READPROT: u8 = 0x2F;
 const ERR_BADSTATUS: u8 = 0x41;
-const ERR_BADVIDHDR: u8 = 0x06;
+pub(crate) const ERR_BADVIDHDR: u8 = 0x06;
 /// SCSI drives: three buses of eight targets.
 pub const DRIVES: u8 = 24;
 /// The Flyer's DRAM: 4 MB in 512-byte blocks, reached only by DMA.
@@ -300,6 +308,14 @@ impl Filesystem {
             op::FILESEEK => self.file_seek(sram, slot),
             op::FILEREAD => self.file_read(sram, slot),
             op::FILEHSREAD | op::FILEHSWRITE => self.file_hs(sram, slot),
+            op::FILEWRITE => self.file_write(sram, slot),
+            op::FILEEXTEND => self.file_extend(sram, slot),
+            op::CREATEDIR => self.create_dir(sram, slot),
+            op::DELETE => self.delete(sram, slot),
+            op::RENAME => self.rename(sram, slot),
+            // Protection bits, dates and comments are not kept; a host
+            // folder needs no defragmenting.
+            op::SETBITS | op::SETDATE | op::SETCOMMENT | op::DEFRAG => err::OKAY,
             op::READ10 => self.read10(sram, slot),
             op::LOCATEFLD => self.locate_field(sram, slot),
             op::GETCOMPINFO => self.get_comp_info(sram, slot),
@@ -309,24 +325,15 @@ impl Filesystem {
                 slot.set_arg32(sram, 10, BLOCK as u32);
                 err::OKAY
             }
-            // Everything that would write: the drives are read-only.
+            // Raw writes, recording and clip editing: clips are read-only.
             op::WRITE10
             | op::COPYDATA
-            | op::FILEWRITE
-            | op::CREATEDIR
-            | op::DELETE
-            | op::RENAME
             | op::RENAMEDISK
             | op::FORMAT
-            | op::DEFRAG
-            | op::SETBITS
-            | op::SETDATE
-            | op::SETCOMMENT
             | op::MAKEFILE
             | op::COPYCLIP
             | op::WRITETEST
             | op::STRIPAUDIO
-            | op::FILEEXTEND
             | op::OPENWRITEFLD
             | op::FLYRECORD => ERR_PROTECTED,
             _ => return None,
@@ -508,7 +515,7 @@ impl Filesystem {
         wr8(
             sram,
             info + fvi::FLAGS,
-            drive::FVIF_VIDEOREADY | drive::FVIF_AUDIOREADY | drive::FVIF_WRITEPROT,
+            drive::FVIF_VIDEOREADY | drive::FVIF_AUDIOREADY,
         );
         wr8(sram, info + fvi::DISK_OKAY, 1);
         wr16(sram, info + fvi::BLK_SIZE, BLOCK as u16);
@@ -578,6 +585,22 @@ impl Filesystem {
         }
         self.drives[d].scan();
         self.drives[d].lookup(from, path)
+    }
+
+    /// The host file of a file named from the root of drive `n` (a clip
+    /// to play).
+    pub fn clip_file(&mut self, n: u8, path: &str) -> Result<PathBuf, u8> {
+        let d = self.drive(n)?;
+        if drive::strip_device(path).is_empty() {
+            return Err(err::OBJNOTFOUND);
+        }
+        let index = self.find(d, 0, path).ok_or(err::OBJNOTFOUND)?;
+        let drive = &self.drives[d];
+        match drive.object(index) {
+            Some(o) if o.kind == TYPE_FILE => Ok(drive.host_path(index)),
+            Some(_) => Err(ERR_WRONGTYPE),
+            None => Err(err::OBJNOTFOUND),
+        }
     }
 
     /// PARENT: a grip on the parent directory and its header block.
@@ -752,9 +775,9 @@ impl Filesystem {
         }
     }
 
-    /// FILEOPEN (`FileOpen`): open a file for reading (MODE_INPUT, or
-    /// MODE_UPDATE on an existing file). Creating one needs a writable
-    /// drive.
+    /// FILEOPEN (`FileOpen`): open a file for reading (MODE_INPUT), make
+    /// a new empty one in its place (MODE_OUTPUT), or open one to change,
+    /// made if missing (MODE_UPDATE).
     fn file_open(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
         let action = slot.arg32(sram, 4) as usize;
         // Markers the firmware's stub leaves in the action.
@@ -764,14 +787,14 @@ impl Filesystem {
         let (n, path) = action_target(sram, action);
         let grip = rd32(sram, action + ca::GRIP);
         let mode = rd8(sram, action + ca::ACCESS);
-        let result = if mode == MODE_INPUT || mode == MODE_UPDATE {
-            self.open_existing(sram, n, grip, &path)
-        } else {
-            Err(ERR_PROTECTED)
-        };
-        let result = match result {
-            Err(err::OBJNOTFOUND) if mode == MODE_UPDATE => Err(ERR_PROTECTED),
-            r => r,
+        let result = match mode {
+            MODE_INPUT => self.open_existing(sram, n, grip, &path),
+            MODE_UPDATE => match self.open_existing(sram, n, grip, &path) {
+                Err(err::OBJNOTFOUND) => self.create_file(sram, n, grip, &path),
+                r => r,
+            },
+            MODE_OUTPUT => self.create_file(sram, n, grip, &path),
+            _ => Err(err::BADPARAM),
         };
         match result {
             Ok((id, block)) => {
@@ -895,12 +918,10 @@ impl Filesystem {
         let start = slot.arg32(sram, 10);
         let count = slot.arg32(sram, 14) as usize;
         let buffer = slot.arg32(sram, 18) as usize;
-        if let Err(e) = self.open_file(sram, slot.arg32(sram, 6)) {
-            return e;
-        }
-        if write {
-            return ERR_PROTECTED;
-        }
+        let at = match self.open_file(sram, slot.arg32(sram, 6)) {
+            Ok(at) => at,
+            Err(e) => return e,
+        };
         let d = match self.drive(n) {
             Ok(d) => d,
             Err(e) => return e,
@@ -911,6 +932,17 @@ impl Filesystem {
         if count > DRAM_BLOCKS || buffer.saturating_add(count * BLOCK) > mailbox::SRAM_SIZE {
             return ERR_OUTOFMEM;
         }
+        if write {
+            let index = match self.writable(sram, d, at) {
+                Ok(i) => i,
+                Err(e) => return e,
+            };
+            let data = sram[buffer..buffer + count * BLOCK].to_vec();
+            return match self.drives[d].write_blocks(index, start, &data) {
+                Ok(()) => err::OKAY,
+                Err(e) => io_error(n, &e),
+            };
+        }
         match self.drives[d].read_blocks(start, count, &mut sram[buffer..buffer + count * BLOCK]) {
             Ok(()) => err::OKAY,
             Err(e) => {
@@ -918,6 +950,216 @@ impl Filesystem {
                 ERR_BADSTATUS
             }
         }
+    }
+
+    /// MODE_OUTPUT: a new, empty file named by `path` from `grip` (an old
+    /// one of that name is emptied), open, with a grip on it.
+    fn create_file(
+        &mut self,
+        sram: &mut [u8],
+        n: u8,
+        grip: u32,
+        path: &str,
+    ) -> Result<(u32, u32), u8> {
+        let d = self.drive(n)?;
+        let (dir, name) = self.parent_and_name(sram, d, grip, path)?;
+        if let Some(old) = self.drives[d].child(dir, &name) {
+            if self.drives[d]
+                .object(old)
+                .is_some_and(|o| o.kind != TYPE_FILE)
+            {
+                return Err(ERR_WRONGTYPE);
+            }
+            if self.drives[d].is_clip(old) {
+                return Err(ERR_PROTECTED);
+            }
+        }
+        let index = self.drives[d]
+            .create_file(dir, &name)
+            .map_err(|e| io_error(n, &e))?;
+        let drive = &self.drives[d];
+        let (header, parent) = (drive.header_block(index), drive.header_block(dir));
+        let start = drive.object(index).map_or(0, |o| o.start);
+        let new = self.alloc_grip(sram, n, header, parent, TYPE_FILE)?;
+        let at = self.grip_at(sram, new).expect("just allocated");
+        wr8(sram, at + g::OPENED, 1);
+        wr32(sram, at + g::STARTBLK, start);
+        set_lengths(sram, at, 0);
+        log::info!(
+            "flyer: {} made {}",
+            drive::drive_name(n),
+            self.drives[d].host_path(index).display()
+        );
+        Ok((new, start))
+    }
+
+    /// The directory a path names a new object in, from `grip`, and the
+    /// object's name.
+    fn parent_and_name(
+        &mut self,
+        sram: &[u8],
+        d: usize,
+        grip: u32,
+        path: &str,
+    ) -> Result<(usize, String), u8> {
+        let from = self.grip_object(sram, d, grip).ok_or(err::OBJNOTFOUND)?;
+        let rel = drive::strip_device(path);
+        let (dir_part, name) = match rel.rfind('/') {
+            Some(i) => (&rel[..=i], &rel[i + 1..]),
+            None => ("", rel),
+        };
+        if name.is_empty() {
+            return Err(err::BADPARAM);
+        }
+        let dir = if dir_part.is_empty() {
+            from
+        } else {
+            self.find(d, from, dir_part).ok_or(err::OBJNOTFOUND)?
+        };
+        match self.drives[d].object(dir) {
+            Some(o) if o.kind == TYPE_FILE => Err(ERR_WRONGTYPE),
+            Some(_) => Ok((dir, name.to_string())),
+            None => Err(err::OBJNOTFOUND),
+        }
+    }
+
+    /// The file an open grip holds, if it may be written (not a clip).
+    fn writable(&self, sram: &[u8], d: usize, at: usize) -> Result<usize, u8> {
+        let index = self
+            .grip_object(sram, d, self.grip_handle(at))
+            .ok_or(err::OBJNOTFOUND)?;
+        if self.drives[d].is_clip(index) {
+            return Err(ERR_PROTECTED);
+        }
+        Ok(index)
+    }
+
+    /// FILEWRITE (`FileWrite`): bytes from SRAM into an open file at its
+    /// position, growing it.
+    fn file_write(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let n = slot.arg8(sram, 5);
+        let length = slot.arg32(sram, 10) as usize;
+        let buffer = slot.arg32(sram, 14) as usize;
+        let result = (|| {
+            let at = self.open_file(sram, slot.arg32(sram, 6))?;
+            let d = self.drive(n)?;
+            let index = self.writable(sram, d, at)?;
+            let cur = read64(sram, at + g::CURPOS_EXT, at + g::CURPOS);
+            let len = length.min(mailbox::SRAM_SIZE.saturating_sub(buffer));
+            let data = sram[buffer..buffer + len].to_vec();
+            self.drives[d]
+                .write_file(index, cur, &data)
+                .map_err(|e| io_error(n, &e))?;
+            let pos = cur + len as u64;
+            write64(sram, at + g::CURPOS_EXT, at + g::CURPOS, pos);
+            let bytes = self.drives[d].object(index).map_or(pos, |o| o.bytes);
+            set_lengths(sram, at, bytes);
+            Ok(len)
+        })();
+        match result {
+            Ok(len) => {
+                slot.set_arg32(sram, 18, len as u32);
+                err::OKAY
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// FILEEXTEND (`FileExtend`): make an open file longer by `+10` bytes;
+    /// the library then writes its blocks with FILEHSWRITE.
+    fn file_extend(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let n = slot.arg8(sram, 5);
+        let more = u64::from(slot.arg32(sram, 10));
+        let result = (|| {
+            let at = self.open_file(sram, slot.arg32(sram, 6))?;
+            let d = self.drive(n)?;
+            let index = self.writable(sram, d, at)?;
+            let len = read64(sram, at + g::FILELEN_EXT, at + g::FILELEN) + more;
+            self.drives[d]
+                .set_len(index, len)
+                .map_err(|e| io_error(n, &e))?;
+            set_lengths(sram, at, len);
+            Ok(())
+        })();
+        result.err().unwrap_or(err::OKAY)
+    }
+
+    /// The object a ClipAction names from its grip.
+    fn action_object(&mut self, sram: &[u8], action: usize) -> Result<(u8, usize, usize), u8> {
+        let (n, path) = action_target(sram, action);
+        let d = self.drive(n)?;
+        let from = self
+            .grip_object(sram, d, rd32(sram, action + ca::GRIP))
+            .ok_or(err::OBJNOTFOUND)?;
+        if drive::strip_device(&path).is_empty() {
+            return Err(err::OBJNOTFOUND);
+        }
+        let index = self.find(d, from, &path).ok_or(err::OBJNOTFOUND)?;
+        Ok((n, d, index))
+    }
+
+    /// CREATEDIR (`CreateDir`): a new directory; the action's grip becomes
+    /// a grip on it.
+    fn create_dir(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let action = slot.arg32(sram, 4) as usize;
+        let (n, path) = action_target(sram, action);
+        let result = (|| {
+            let d = self.drive(n)?;
+            let (dir, name) =
+                self.parent_and_name(sram, d, rd32(sram, action + ca::GRIP), &path)?;
+            let index = self.drives[d]
+                .create_dir(dir, &name)
+                .map_err(|e| io_error(n, &e))?;
+            let drive = &self.drives[d];
+            let (header, parent) = (drive.header_block(index), drive.header_block(dir));
+            self.alloc_grip(sram, n, header, parent, drive::TYPE_DIR)
+        })();
+        match result {
+            Ok(grip) => {
+                wr32(sram, action + ca::GRIP, grip);
+                err::OKAY
+            }
+            Err(e) => {
+                wr32(sram, action + ca::GRIP, 0);
+                e
+            }
+        }
+    }
+
+    /// DELETE (`Delete`): a file or an empty directory; not a clip.
+    fn delete(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let action = slot.arg32(sram, 4) as usize;
+        let result = (|| {
+            let (n, d, index) = self.action_object(sram, action)?;
+            let drive = &self.drives[d];
+            let obj = drive.object(index).ok_or(err::OBJNOTFOUND)?;
+            match obj.kind {
+                TYPE_ROOT => return Err(err::BADPARAM),
+                TYPE_FILE if drive.is_clip(index) => return Err(ERR_PROTECTED),
+                drive::TYPE_DIR if obj.children.iter().any(|&c| drive.object(c).is_some()) => {
+                    return Err(ERR_DIRNOTEMPTY)
+                }
+                _ => {}
+            }
+            self.drives[d].delete(index).map_err(|e| io_error(n, &e))
+        })();
+        result.err().unwrap_or(err::OKAY)
+    }
+
+    /// RENAME (`Rename`): move an object to a new name (`+12`) relative to
+    /// another grip (`+8`).
+    fn rename(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let action = slot.arg32(sram, 4) as usize;
+        let new_grip = slot.arg32(sram, 8);
+        let new_name = read_cstr(sram, slot.arg32(sram, 12) as usize);
+        let result = (|| {
+            let (n, d, index) = self.action_object(sram, action)?;
+            let (dir, name) = self.parent_and_name(sram, d, new_grip, &new_name)?;
+            self.drives[d]
+                .rename(index, dir, &name)
+                .map_err(|e| io_error(n, &e))
+        })();
+        result.err().unwrap_or(err::OKAY)
     }
 
     /// READ10: blocks from a drive into DRAM (`+12` is a DRAM block).
@@ -1045,6 +1287,29 @@ impl Filesystem {
     /// Grips in use, the root's included (for tests and the log).
     pub fn grips_in_use(&self) -> usize {
         self.grips.iter().filter(|&&used| used).count()
+    }
+}
+
+/// An open file's length in its grip, and the blocks that holds.
+fn set_lengths(sram: &mut [u8], at: usize, bytes: u64) {
+    let phys = u64::from(drive::blocks_for(bytes)) * BLOCK as u64;
+    write64(sram, at + g::FILELEN_EXT, at + g::FILELEN, bytes);
+    write64(sram, at + g::PHYSLEN_EXT, at + g::PHYSLEN, phys);
+}
+
+/// The Flyer error for a host file operation that failed.
+fn io_error(n: u8, e: &std::io::Error) -> u8 {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => err::OBJNOTFOUND,
+        ErrorKind::AlreadyExists => ERR_EXISTS,
+        ErrorKind::InvalidInput => err::BADPARAM,
+        ErrorKind::StorageFull => ERR_FULL,
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => ERR_PROTECTED,
+        _ => {
+            log::warn!("flyer: writing {}: {e}", drive::drive_name(n));
+            ERR_FSFAIL
+        }
     }
 }
 
@@ -1242,7 +1507,8 @@ mod tests {
         let s = &r.sram;
         assert_eq!(rd32(s, INFO + fvi::IDENT), ID_ROOT);
         assert_eq!(read_cstr(s, INFO + fvi::TITLE), "FlyerA0");
-        assert_eq!(rd8(s, INFO + fvi::FLAGS), 7);
+        // Video and audio ready; not write-protected.
+        assert_eq!(rd8(s, INFO + fvi::FLAGS), 3);
         assert_eq!(rd16(s, INFO + fvi::BLK_SIZE), 512);
         let blocks = rd32(s, INFO + fvi::BLOCKS);
         let free = rd32(s, INFO + fvi::BLKS_FREE);
@@ -1428,9 +1694,90 @@ mod tests {
         // A directory is not a file.
         r.action(0, "Stills", 0, MODE_INPUT);
         assert_eq!(r.send(op::FILEOPEN, &[(4, ACTION as u32)]).0, ERR_WRONGTYPE);
-        // Writing needs a writable drive.
-        r.action(0, "New", 0, 2);
+        // A clip cannot be replaced by a new file.
+        r.action(0, "Clip", 0, MODE_OUTPUT);
         assert_eq!(r.send(op::FILEOPEN, &[(4, ACTION as u32)]).0, ERR_PROTECTED);
+    }
+
+    #[test]
+    fn files_other_than_clips_can_be_made_written_and_deleted() {
+        let mut r = rig();
+        let fa0 = r._dir.path().join("Flyer/FA0");
+        // MODE_OUTPUT makes an empty file, as the switcher does for an
+        // icon, in a directory named in the path.
+        r.action(0, "Stills/Clip.i", 0, MODE_OUTPUT);
+        assert_eq!(r.send(op::FILEOPEN, &[(4, ACTION as u32)]).0, err::OKAY);
+        let id = rd32(&r.sram, ACTION + ca::FILE_ID);
+        let start = rd32(&r.sram, ACTION + ca::START_BLK);
+        assert_eq!(
+            std::fs::metadata(fa0.join("Stills/Clip.i")).unwrap().len(),
+            0
+        );
+        // FileWrite: ten bytes at the position.
+        r.sram[BUFFER..BUFFER + 10].copy_from_slice(b"FORM\0\0\0\x02IL");
+        let (e, slot) = r.send(
+            op::FILEWRITE,
+            &[(4, 0), (6, id), (10, 10), (14, BUFFER as u32)],
+        );
+        assert_eq!((e, arg32(&slot, 18)), (err::OKAY, 10));
+        // NewFileWrite: extend, then whole blocks by number.
+        assert_eq!(
+            r.send(op::FILEEXTEND, &[(4, 0), (6, id), (10, 1014)]).0,
+            err::OKAY
+        );
+        let at = (id - SRAM_CPU_BASE) as usize;
+        assert_eq!(rd32(&r.sram, at + g::FILELEN), 1024);
+        assert_eq!(rd32(&r.sram, at + g::PHYSLEN), 1024);
+        r.sram[BUFFER..BUFFER + 512].fill(0x77);
+        let (e, _) = r.send(
+            op::FILEHSWRITE,
+            &[
+                (4, 0x0100_0000),
+                (6, id),
+                (10, start + 1),
+                (14, 1),
+                (18, BUFFER as u32),
+            ],
+        );
+        assert_eq!(e, err::OKAY);
+        r.send(op::FILECLOSE, &[(4, 0), (6, id)]);
+        let bytes = std::fs::read(fa0.join("Stills/Clip.i")).unwrap();
+        assert_eq!(bytes.len(), 1024);
+        assert_eq!(&bytes[..4], b"FORM");
+        assert!(bytes[512..].iter().all(|&b| b == 0x77));
+        // Directories, renames and deletes reach the host folder.
+        r.action(0, "Icons", 0, 0);
+        assert_eq!(r.send(op::CREATEDIR, &[(4, ACTION as u32)]).0, err::OKAY);
+        assert!(fa0.join("Icons").is_dir());
+        r.action(0, "Stills/Clip.i", 0, 0);
+        r.sram[PATH + 0x80..PATH + 0x88].copy_from_slice(b"Icons/A\0");
+        assert_eq!(
+            r.send(
+                op::RENAME,
+                &[(4, ACTION as u32), (8, 0), (12, (PATH + 0x80) as u32)]
+            )
+            .0,
+            err::OKAY
+        );
+        assert!(fa0.join("Icons/A").is_file());
+        r.action(0, "Icons", 0, 0);
+        assert_eq!(r.send(op::DELETE, &[(4, ACTION as u32)]).0, ERR_DIRNOTEMPTY);
+        r.action(0, "Icons/A", 0, 0);
+        assert_eq!(r.send(op::DELETE, &[(4, ACTION as u32)]).0, err::OKAY);
+        assert!(!fa0.join("Icons/A").exists());
+        // Clips stay as they are.
+        r.action(0, "Clip", 0, 0);
+        assert_eq!(r.send(op::DELETE, &[(4, ACTION as u32)]).0, ERR_PROTECTED);
+        r.action(0, "Clip", 0, MODE_UPDATE);
+        r.send(op::FILEOPEN, &[(4, ACTION as u32)]);
+        let clip = rd32(&r.sram, ACTION + ca::FILE_ID);
+        assert_eq!(
+            r.send(op::FILEEXTEND, &[(4, 0), (6, clip), (10, 512)]).0,
+            ERR_PROTECTED
+        );
+        // The drive is no longer write-protected.
+        r.send(op::DRIVEINFO, &[(4, 0), (6, INFO as u32)]);
+        assert_eq!(r.sram[INFO + fvi::FLAGS] & drive::FVIF_WRITEPROT, 0);
     }
 
     #[test]

@@ -9,8 +9,9 @@
 //! ```
 //!
 //! Drag a video file onto flyerclip.exe to import it, or a clip to export
-//! it. Without an output name, an imported clip goes into the Flyer folder
-//! of the Toaster files folder (beside the source when there is none) and
+//! it. Without an output name, an imported clip goes onto the Flyer's drive
+//! FA0, the `Flyer/FA0` folder of the Toaster files folder (beside the
+//! source when there is no Flyer folder), and
 //! an exported video beside the clip. ffmpeg does the decoding and
 //! encoding: `COPPERLINE_FFMPEG`, the Toaster files folder, beside this
 //! program, or the `PATH`.
@@ -26,9 +27,9 @@ usage: flyerclip import VIDEO [CLIP] [--hq5|--hq6] [--no-audio] [--seconds N]
        flyerclip FILE        (a clip is exported, anything else imported)
 
 Converts between video files and NewTek Video Toaster Flyer clips. An
-imported clip goes to the Flyer folder of the Toaster files folder unless
-CLIP names a file; an exported video (MP4 unless VIDEO says otherwise) goes
-beside the clip. Without an output name nothing is overwritten: a name in
+imported clip goes to the Flyer's drive FA0 (Flyer/FA0 in the Toaster files
+folder) unless CLIP names a file; an exported video (MP4 unless VIDEO says
+otherwise) goes beside the clip. Without an output name nothing is overwritten: a name in
 use gets \" (2)\" added. Needs ffmpeg.";
 
 fn is_clip(path: &Path) -> bool {
@@ -63,9 +64,10 @@ fn clip_name(stem: &str) -> String {
 
 fn default_clip_path(input: &Path) -> PathBuf {
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("Clip");
+    // The Flyer's first drive, FA0, is the folder `Flyer/FA0`.
     let flyer = copperline::paths::toaster_files_dir().join("Flyer");
     let dir = if flyer.is_dir() {
-        flyer
+        flyer.join("FA0")
     } else {
         input.parent().map(Path::to_path_buf).unwrap_or_default()
     };

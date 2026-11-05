@@ -20,16 +20,21 @@
 //!
 //! Fitted with `[video_slot] flyer = true` next to the Toaster.
 
+pub mod clip;
 pub mod drive;
 pub mod fs;
+pub mod link;
 pub mod mailbox;
 pub mod ops;
+pub mod play;
 
 use crate::zorro::{BoardBacking, BoardSpec, ZorroVersion};
 use crate::zorro_device::{DeviceHost, ZorroDevice};
+use link::FlyerLink;
 use mailbox::SRAM_SIZE;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// NewTek's Zorro manufacturer number (`NEWTEK_ID`).
 pub const MANUFACTURER: u16 = 2191;
@@ -87,6 +92,18 @@ impl Flyer {
         }
     }
 
+    /// Connect the card to the Toaster beside it.
+    pub fn with_link(mut self, link: Option<Arc<FlyerLink>>) -> Self {
+        self.firmware = std::mem::take(&mut self.firmware).with_link(link);
+        self
+    }
+
+    /// Take over the ribbon to the Toaster from the card this one replaces
+    /// (a loaded state replaces the board; the Toaster stays).
+    pub fn adopt_link_from(&mut self, live: &Flyer) {
+        self.firmware.adopt_link(live.firmware.link().cloned());
+    }
+
     /// The firmware state, for tests and the debugger.
     pub fn firmware(&self) -> &ops::Firmware {
         &self.firmware
@@ -128,6 +145,7 @@ impl ZorroDevice for Flyer {
     fn tick(&mut self, _cck: u32, host: &mut DeviceHost) {
         if let Some(beam) = host.beam() {
             self.firmware.advance_beam(beam);
+            self.firmware.run_fields(&mut self.sram);
         }
     }
 
@@ -143,7 +161,7 @@ impl ZorroDevice for Flyer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flyer::mailbox::{err, op, Slot, STAT_DONE, STAT_NEW};
+    use crate::flyer::mailbox::{err, op, Slot, STAT_DONE, STAT_INPROG, STAT_NEW};
     use crate::memory::Memory;
     use crate::zorro_device::HostBeam;
 
@@ -265,6 +283,74 @@ mod tests {
             board.tick(100, &mut DeviceHost::new(&mut mem).with_beam(beam));
         }
         assert_eq!(board.firmware().field_clock, 2);
+    }
+
+    #[test]
+    fn a_clip_played_through_the_mailbox_reaches_the_toaster_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let fa0 = dir.path().join("Flyer/FA0");
+        std::fs::create_dir_all(&fa0).unwrap();
+        clip::tests::write_test_clip(&fa0.join("Clip"), 3);
+        let link = link::FlyerLink::new();
+        let mut board =
+            Flyer::new(Some(dir.path().to_path_buf())).with_link(Some(Arc::clone(&link)));
+        let mut mem = memory();
+        let mut host = DeviceHost::new(&mut mem);
+        command(&mut board, &mut host, Slot(0), op::FIRMWARE, &[]);
+        board.write(0x500, 2, 0, &mut host);
+        command(&mut board, &mut host, Slot(0), op::PLAYMODE, &[]);
+        board.write(0x500, 2, 0, &mut host);
+        // ToasterMux(1, 0, 0): channel A on input 3.
+        command(
+            &mut board,
+            &mut host,
+            Slot(0),
+            op::TOASTMUX,
+            &[(4, 0x0100_0000)],
+        );
+        board.write(0x500, 2, 0, &mut host);
+        assert_eq!(link.channel_on_input(2), Some(0));
+        // The library's PassClipAction: path, FlyerVolume, ClipAction.
+        let (path, volume, action) = (0x1000u32, 0x1040u32, 0x1080u32);
+        for (i, b) in b"FlyerA0:Clip\0".iter().enumerate() {
+            board.write(path + i as u32, 1, u32::from(*b), &mut host);
+        }
+        board.write(volume, 4, path, &mut host);
+        board.write(action, 4, volume, &mut host);
+        board.write(action + 8, 4, 0x0300_0700, &mut host); // RT_STOPPED, A, video+stereo
+        board.write(action + 38, 4, 0xFFFF_FFFF, &mut host); // full volume
+        board.write(action + 44, 4, 0x8000_7FFF, &mut host); // hard left, right
+        command(&mut board, &mut host, Slot(1), op::FLYPLAY, &[(4, action)]);
+        assert_eq!(Slot(1).status(board.sram()), STAT_INPROG);
+        assert_eq!(Slot(1).cont(board.sram()), 2);
+        // Fields go by: the clip starts 20 fields on, at a colour frame.
+        let mut sound = Vec::new();
+        for frame in 0..40u64 {
+            for vpos in [0, 200] {
+                let beam = HostBeam {
+                    vpos,
+                    long_frame: true,
+                    frame,
+                };
+                board.tick(100, &mut DeviceHost::new(&mut mem).with_beam(beam));
+            }
+            sound.extend(link.take_sound());
+            if frame == 25 {
+                let mut out = vec![0u32; link::PICTURE_W * link::PICTURE_H];
+                link.picture(0, &mut out);
+                assert!(out.iter().any(|&p| p != link::BLACK));
+            }
+        }
+        assert_eq!(Slot(1).opcode_word(board.sram()), op::FLYPLAY | STAT_DONE);
+        assert_eq!(Slot(1).error(board.sram()), mailbox::err::OKAY);
+        assert_eq!(mailbox::rd32(board.sram(), action as usize + 126), 12);
+        // A field of sound for every field, the clip's twelve not silent.
+        assert_eq!(sound.len() % clip::SAMPLES_PER_FIELD, 0);
+        let loud = sound
+            .chunks(clip::SAMPLES_PER_FIELD)
+            .filter(|f| f.iter().any(|&(l, _)| l != 0.0))
+            .count();
+        assert_eq!(loud, 11, "field 0 of the test clip is silent");
     }
 
     #[test]
