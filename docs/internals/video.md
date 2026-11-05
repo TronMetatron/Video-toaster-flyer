@@ -946,15 +946,22 @@ and its meters read the peak of the Toaster's sound. Not modelled:
 recording (FLYRECORD, still capture), cut lists, SMPTE, the TBC module and
 the camcorder input on Preview.
 
-The monitor windows (`video/window/card_monitors.rs`) compose on the
-emulator's own thread, so their cost is the machine's: each window size
-gets a table of every tube pixel's bilinear taps, glass shading and
+The monitor windows (`video/window/card_monitors.rs`) each have a painter
+thread of their own, which waits on the output (`CardOutput::
+wait_frame_since`) for the next frame, composes it and presents it; the
+event loop keeps only the windows' input, and passes resizes and repaint
+requests to the painter. Nothing of this is on the emulation thread, so
+the windows' size does not set the machine's pace, and a painter that
+falls behind the card skips to the latest frame. Composition: each window
+size gets a table of every tube pixel's bilinear taps, glass shading and
 coverage in fixed point (`Layer::table`), a new frame is one integer pass
 over it straight into the surface's buffer, split across up to four
 threads above 60,000 tube pixels, and the artwork around the tube is
-painted only when the layer or the power lamp changes. (The float version
-took 7.7 ms a window per frame at 728 x 540 on a 2.8 GHz Xeon, 20 ms at
-1100 x 817.)
+painted only when the layer or the power lamp changes. (Painted on the
+emulation thread, the two windows were the bulk of what a project play
+cost the machine on a fast host: 3.5 ms of host time per NTSC frame
+idle against 15.5 ms with the outputs changing every frame, past real
+time on a Ryzen 9 9950X3D, with the sound stopping and starting.)
 
 ## Interlace (`video/deinterlace.rs`)
 

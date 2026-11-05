@@ -15,12 +15,17 @@
 //! the same size. Each tube pixel's filter taps and glass lighting are
 //! worked out once per window and picture size, in fixed point, so a new
 //! frame is one pass of integer arithmetic straight into the surface's
-//! buffer, split across threads: this runs on the emulator's own thread,
-//! and must not slow the machine down. In the Program window, `R` or the monitor's power button
-//! starts and stops a recording of the output; the power lamp shows red
-//! while it runs.
+//! buffer, split across threads. Each window has a painter thread of its
+//! own that waits for the output's next frame, composes it and presents
+//! it, so none of this is on the emulator's thread: the machine runs at
+//! its own pace whatever the windows' size, and a painter that falls
+//! behind skips to the latest frame. The event loop keeps the windows'
+//! input and tells the painter about resizes and repaint requests. In the
+//! Program window, `R` or the monitor's power button starts and stops a
+//! recording of the output; the power lamp shows red while it runs.
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use log::{info, warn};
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
@@ -280,7 +285,37 @@ pub(super) struct Layer {
     /// across the glass's width, `(x, y, w, h)` in window pixels.
     picture: (f32, f32, f32, f32),
     lamp: Option<(f32, f32, f32)>,
-    button: Option<(f32, f32, f32, f32)>,
+}
+
+/// How the artwork fits a `w` x `h` window, centred: `(scale, aw, ah, ox,
+/// oy)`, its size and top-left corner in window pixels.
+fn fit(art: &MonitorArt, w: usize, h: usize) -> (f32, usize, usize, usize, usize) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let scale = (w as f32 / art.w as f32).min(h as f32 / art.h as f32);
+    let aw = ((art.w as f32 * scale).round() as usize).clamp(1, w);
+    let ah = ((art.h as f32 * scale).round() as usize).clamp(1, h);
+    (scale, aw, ah, (w - aw) / 2, (h - ah) / 2)
+}
+
+/// Where the artwork's power button lands in a `w` x `h` window, `(x0, y0,
+/// x1, y1)`.
+fn button_in(art: &MonitorArt, w: usize, h: usize) -> Option<(f32, f32, f32, f32)> {
+    let (scale, _, _, ox, oy) = fit(art, w, h);
+    art.button.map(|(x0, y0, x1, y1)| {
+        (
+            ox as f32 + x0 as f32 * scale,
+            oy as f32 + y0 as f32 * scale,
+            ox as f32 + x1 as f32 * scale,
+            oy as f32 + y1 as f32 * scale,
+        )
+    })
+}
+
+fn hits(button: Option<(f32, f32, f32, f32)>, x: f64, y: f64) -> bool {
+    button.is_some_and(|(x0, y0, x1, y1)| {
+        (x as f32) >= x0 && (x as f32) <= x1 && (y as f32) >= y0 && (y as f32) <= y1
+    })
 }
 
 impl Layer {
@@ -288,11 +323,7 @@ impl Layer {
         let w = w.max(1);
         let h = h.max(1);
         // Fit the artwork, centred, black around it.
-        let scale = (w as f32 / art.w as f32).min(h as f32 / art.h as f32);
-        let aw = ((art.w as f32 * scale).round() as usize).clamp(1, w);
-        let ah = ((art.h as f32 * scale).round() as usize).clamp(1, h);
-        let ox = (w - aw) / 2;
-        let oy = (h - ah) / 2;
+        let (scale, aw, ah, ox, oy) = fit(art, w, h);
         let art_bg = resample(&art.rgba, art.w, art.h, aw, ah);
         let art_mask = resample_u8(&art.mask, art.w, art.h, aw, ah);
         let art_glass = resample_u8(&art.glass, art.w, art.h, aw, ah);
@@ -324,11 +355,6 @@ impl Layer {
             let (lx, ly) = map(x, y);
             (lx, ly, r * scale)
         });
-        let button = art.button.map(|(x0, y0, x1, y1)| {
-            let (a, b) = map(x0 as f32, y0 as f32);
-            let (c, d) = map(x1 as f32, y1 as f32);
-            (a, b, c, d)
-        });
         let bg_bytes = bg.iter().flat_map(|p| p.to_le_bytes()).collect();
         Self {
             w,
@@ -341,7 +367,6 @@ impl Layer {
             screen,
             picture,
             lamp,
-            button,
         }
     }
 
@@ -395,12 +420,6 @@ impl Layer {
         let table = Arc::new(Table { vw, vh, taps, rows });
         *slot = Some(Arc::clone(&table));
         table
-    }
-
-    fn hits_button(&self, x: f64, y: f64) -> bool {
-        self.button.is_some_and(|(x0, y0, x1, y1)| {
-            (x as f32) >= x0 && (x as f32) <= x1 && (y as f32) >= y0 && (y as f32) <= y1
-        })
     }
 
     /// The monitor with `video` (`vw` x `vh` RGBA) on the tube, into `out`
@@ -566,17 +585,143 @@ pub(super) fn compose_native(art: &MonitorArt, output: &CardOutput) -> (Vec<u32>
 struct MonitorWindow {
     output: Arc<CardOutput>,
     window: Arc<Window>,
+    /// The thread that paints the window.
+    painter: Painter,
+    /// The power button in the window, for the event loop's hit test.
+    button: Option<(f32, f32, f32, f32)>,
+    shown_recording: bool,
+    cursor: (f64, f64),
+}
+
+/// What the event loop tells a window's painter.
+enum Paint {
+    Resized(u32, u32),
+    /// Paint the window again (it was exposed, or the lamp changed).
+    Redraw,
+    Stop,
+}
+
+/// The handle on a window's painter thread.
+struct Painter {
+    tx: mpsc::Sender<Paint>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Painter {
+    fn send(&self, msg: Paint) {
+        let _ = self.tx.send(msg);
+    }
+}
+
+impl Drop for Painter {
+    fn drop(&mut self) {
+        self.send(Paint::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// How long a painter waits for a frame before looking at its inbox.
+const PAINT_WAIT: Duration = Duration::from_millis(5);
+
+/// The painter's state: the surface and the layer for its size, the last
+/// frame taken, and what the surface's buffer holds.
+struct Canvas {
+    output: Arc<CardOutput>,
+    art: Arc<MonitorArt>,
     pixels: Pixels<'static>,
     layer: Option<Layer>,
     size: (u32, u32),
     seen: u64,
     video: Vec<u32>,
     video_size: (usize, usize),
-    shown_recording: bool,
-    cursor: (f64, f64),
     /// The surface's buffer holds the current layer's artwork, with the
     /// power lamp lit or not.
     painted: Option<bool>,
+}
+
+impl Canvas {
+    /// Paint until told to stop: every frame the output publishes (or the
+    /// latest, when painting is slower than the card), and whatever the
+    /// event loop asks for.
+    fn run(mut self, rx: mpsc::Receiver<Paint>) {
+        loop {
+            let mut redraw = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(Paint::Resized(w, h)) => {
+                        self.resize(w, h);
+                        redraw = true;
+                    }
+                    Ok(Paint::Redraw) => redraw = true,
+                    Ok(Paint::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+            if let Some((vw, vh, serial)) =
+                self.output
+                    .wait_frame_since(self.seen, PAINT_WAIT, &mut self.video)
+            {
+                self.seen = serial;
+                self.video_size = (vw, vh);
+                redraw = true;
+            }
+            let recording = self.output.is_recording();
+            if redraw || self.painted != Some(recording) {
+                self.paint(recording);
+            }
+        }
+    }
+
+    fn paint(&mut self, recording: bool) {
+        let (w, h) = self.size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self
+            .layer
+            .as_ref()
+            .is_none_or(|l| (l.w, l.h) != (w as usize, h as usize))
+        {
+            self.layer = Some(Layer::new(
+                &self.art,
+                w as usize,
+                h as usize,
+                self.output.aspect(),
+            ));
+            self.painted = None;
+        }
+        let Some(layer) = self.layer.as_ref() else {
+            return;
+        };
+        let video = (!self.video.is_empty()).then_some((
+            self.video.as_slice(),
+            self.video_size.0,
+            self.video_size.1,
+        ));
+        // The artwork around the tube stays in the surface's buffer from
+        // frame to frame; it is painted again only when it changes.
+        let background = self.painted != Some(recording);
+        layer.compose_rgba8(video, recording, self.pixels.frame_mut(), background);
+        self.painted = Some(recording);
+        if let Err(e) = self.pixels.render() {
+            warn!("toaster monitor {}: {e}", self.output.name());
+        }
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        let (w, h) = (w.max(1), h.max(1));
+        self.size = (w, h);
+        if let Err(e) = self.pixels.resize_surface(w, h) {
+            warn!("toaster monitor resize: {e}");
+        }
+        if let Err(e) = self.pixels.resize_buffer(w, h) {
+            warn!("toaster monitor resize: {e}");
+        }
+        self.layer = None;
+        self.painted = None;
+    }
 }
 
 impl MonitorWindow {
@@ -595,58 +740,10 @@ impl MonitorWindow {
         self.output.name() == "Program"
     }
 
-    fn redraw(&mut self, art: &MonitorArt) {
-        let (w, h) = self.size;
-        if w == 0 || h == 0 {
-            return;
-        }
-        if self
-            .layer
-            .as_ref()
-            .is_none_or(|l| (l.w, l.h) != (w as usize, h as usize))
-        {
-            self.layer = Some(Layer::new(
-                art,
-                w as usize,
-                h as usize,
-                self.output.aspect(),
-            ));
-            self.painted = None;
-        }
-        let Some(layer) = self.layer.as_ref() else {
-            return;
-        };
-        let recording = self.output.is_recording();
-        let video = (!self.video.is_empty()).then_some((
-            self.video.as_slice(),
-            self.video_size.0,
-            self.video_size.1,
-        ));
-        // The artwork around the tube stays in the surface's buffer from
-        // frame to frame; it is painted again only when it changes.
-        let background = self.painted != Some(recording);
-        layer.compose_rgba8(video, recording, self.pixels.frame_mut(), background);
-        self.painted = Some(recording);
-        if let Err(e) = self.pixels.render() {
-            warn!("toaster monitor {}: {e}", self.output.name());
-        }
-        if recording != self.shown_recording {
-            self.shown_recording = recording;
-            self.window.set_title(&self.title());
-        }
-    }
-
-    fn resize(&mut self, w: u32, h: u32) {
+    fn resized(&mut self, art: &MonitorArt, w: u32, h: u32) {
         let (w, h) = (w.max(1), h.max(1));
-        self.size = (w, h);
-        if let Err(e) = self.pixels.resize_surface(w, h) {
-            warn!("toaster monitor resize: {e}");
-        }
-        if let Err(e) = self.pixels.resize_buffer(w, h) {
-            warn!("toaster monitor resize: {e}");
-        }
-        self.layer = None;
-        self.painted = None;
+        self.button = button_in(art, w as usize, h as usize);
+        self.painter.send(Paint::Resized(w, h));
     }
 }
 
@@ -741,21 +838,41 @@ impl CardMonitors {
                 }
             };
             info!("toaster monitor window: {}", output.name());
-            let mw = MonitorWindow {
-                output,
-                window,
+            let canvas = Canvas {
+                output: Arc::clone(&output),
+                art: Arc::clone(&art),
                 pixels,
                 layer: None,
                 size: (w, h),
                 seen: 0,
                 video: Vec::new(),
                 video_size: (0, 0),
-                shown_recording: false,
-                cursor: (0.0, 0.0),
                 painted: None,
             };
+            let (tx, rx) = mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name(format!(
+                    "toaster-monitor-{}",
+                    output.name().to_ascii_lowercase()
+                ))
+                .spawn(move || canvas.run(rx));
+            let thread = match thread {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!("toaster monitor {}: no painter thread: {e}", output.name());
+                    None
+                }
+            };
+            let mw = MonitorWindow {
+                output,
+                window,
+                painter: Painter { tx, thread },
+                button: button_in(&art, w as usize, h as usize),
+                shown_recording: false,
+                cursor: (0.0, 0.0),
+            };
             mw.window.set_title(&mw.title());
-            mw.window.request_redraw();
+            mw.painter.send(Paint::Redraw);
             self.windows.push(mw);
         }
     }
@@ -764,15 +881,14 @@ impl CardMonitors {
         self.windows.iter().any(|w| w.window.id() == id)
     }
 
-    /// Pick up new frames; ask for a repaint where one arrived.
+    /// Keep each window's title with its recording (the painters follow
+    /// the frames and the lamp by themselves).
     pub(super) fn poll(&mut self) {
         for w in &mut self.windows {
-            if let Some((vw, vh, serial)) = w.output.frame_since(w.seen, &mut w.video) {
-                w.seen = serial;
-                w.video_size = (vw, vh);
-                w.window.request_redraw();
-            } else if w.output.is_recording() != w.shown_recording {
-                w.window.request_redraw();
+            let recording = w.output.is_recording();
+            if recording != w.shown_recording {
+                w.shown_recording = recording;
+                w.window.set_title(&w.title());
             }
         }
     }
@@ -783,11 +899,8 @@ impl CardMonitors {
         let art = self.art.get().cloned().flatten()?;
         let w = self.windows.iter_mut().find(|w| w.window.id() == id)?;
         match event {
-            WindowEvent::RedrawRequested => w.redraw(&art),
-            WindowEvent::Resized(size) => {
-                w.resize(size.width, size.height);
-                w.window.request_redraw();
-            }
+            WindowEvent::RedrawRequested => w.painter.send(Paint::Redraw),
+            WindowEvent::Resized(size) => w.resized(&art, size.width, size.height),
             WindowEvent::CloseRequested => {
                 // Closing a monitor turns it away rather than unplugging
                 // it: the menu brings it back.
@@ -798,11 +911,7 @@ impl CardMonitors {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if w.is_program()
-                && w.layer
-                    .as_ref()
-                    .is_some_and(|l| l.hits_button(w.cursor.0, w.cursor.1)) =>
-            {
+            } if w.is_program() && hits(w.button, w.cursor.0, w.cursor.1) => {
                 return Some(toggle_recording(w));
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -890,8 +999,9 @@ fn toggle_recording(w: &mut MonitorWindow) -> String {
             }
         }
     };
+    w.shown_recording = w.output.is_recording();
     w.window.set_title(&w.title());
-    w.window.request_redraw();
+    w.painter.send(Paint::Redraw);
     message
 }
 
