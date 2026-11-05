@@ -58,6 +58,9 @@ pub struct ClipWriter {
     rnd_freq: u8,
     ladder: Vec<(Algo, u8)>,
     frames: Vec<(FrameHeader, Vec<u8>)>,
+    /// The clip header a copied clip inherits (coder version, pedestal,
+    /// FIR set and custom coefficients) from the clip its frames come from.
+    template: Option<ClipHeader>,
 }
 
 impl ClipWriter {
@@ -80,7 +83,23 @@ impl ClipWriter {
                 (Algo::SubNyquist, 2),
             ],
             frames: Vec::new(),
+            template: None,
         }
+    }
+    /// A clip made of frames already coded in another clip, whose header
+    /// is `master` ([`Self::push_coded_frame`]): what the firmware's
+    /// cutting room builds (`MakeSubClips`, clip.c:1914).
+    pub fn copy_of(master: &ClipHeader, video: bool, audio_chans: u8) -> Self {
+        let grade = match master.vid_grade {
+            GRADE_HQ5 => Grade::Hq5,
+            GRADE_HQ6 => Grade::Hq6,
+            _ => Grade::Std,
+        };
+        let mut w = ClipWriter::new(grade, audio_chans);
+        w.video = video;
+        w.fir_set = Some(master.fir_set);
+        w.template = Some(master.clone());
+        w
     }
     /// An audio-only clip (`VidFlag` 0), like MakeAudClip.c.
     pub fn audio_only(audio_chans: u8) -> Self {
@@ -163,6 +182,15 @@ impl ClipWriter {
         hdr.length = 1 + (body.len() / BLOCK) as u32;
         self.frames.push((hdr, body));
         stats
+    }
+
+    /// Append a colour frame already coded: its header (numbering and
+    /// links are redone by [`Self::finish`]) and the blocks after it.
+    pub fn push_coded_frame(&mut self, mut header: FrameHeader, body: Vec<u8>) {
+        debug_assert_eq!(body.len() % BLOCK, 0);
+        header.frame_number = self.frames.len() as u32;
+        header.length = 1 + (body.len() / BLOCK) as u32;
+        self.frames.push((header, body));
     }
 
     fn encode_fitting(&self, lines: &[Vec<u8>], n: u32) -> (Vec<u8>, FieldStats) {
@@ -249,7 +277,9 @@ impl ClipWriter {
         let ndx_blks = index.len().div_ceil(STONESPERBLK).max(1) as u16;
         let tail = TailHeader::new(ndx_blks, index.len() as u16);
         let chans = self.audio_chans;
+        let base = self.template.take().unwrap_or_default();
         let ch = ClipHeader {
+            id: ID_CLIP,
             length: tail_lba + tail.chunk_len,
             vid_grade: if self.video {
                 self.grade.code()
@@ -264,7 +294,7 @@ impl ClipWriter {
             vid_flag: self.video as u8,
             audio_chans: chans,
             fir_set: self.fir_set.unwrap_or(DEFAULT_FIR_SET),
-            ..ClipHeader::default()
+            ..base
         };
         let mut out = Vec::with_capacity(ch.length as usize * BLOCK);
         out.extend_from_slice(&ch.to_bytes());

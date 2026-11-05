@@ -66,7 +66,7 @@ sources (`fly/Edit/Edit/src`, `vt/full/switcher/SRC`, `fly/amiflyer`). Nothing w
 | Item | Status |
 |---|---|
 | Name with .01 auto-increment, comment, in/out sliders, bump arrows, duration, segment timeline, Remove/Previous/Next, icon slider, Video+Audio/Audio/Video, Destination drive | The UI works, and the Program monitor follows the sliders (SRCHARGS/DOSEARCH) [guess: tested on the jog requester and the clip controls, not this panel] |
-| Perform | **No.** NEWCUTLIST, ADDSUBCLIP and MAKESUBCLIPS all answer OK and make nothing, so the Editor reports success. **Destructive Cut Clip then runs `CrDeleteFile(source)`**: the clip survives (PROTECTED), but its `.i`/`.info` files are deleted. See guard 1 |
+| Perform | OK. NEWCUTLIST/ADDSUBCLIP/MAKESUBCLIPS follow `clip.c` (`MakeSubClips`): each piece is copied from the master's coded frames (whole colour frames; picture, sound or both, `StripAudioRaw`/`StripVideoRaw`) into `_tmp_<ref>` on its drive, and flyer.library renames it; the Editor then makes its icon. Destructive: the master's file moves to `Flyer/Trash` (not deleted) |
 
 ### 1.5 Clip controls (F9): Fine Tune, Quick Tune, Ctrl quick adjust
 | Item | Status |
@@ -128,13 +128,9 @@ sources (`fly/Edit/Edit/src`, `vt/full/switcher/SRC`, `fly/amiflyer`). Nothing w
 ## 2. Disable or guard, by priority (least invasive fix first)
 
 1. **Destructive Cut Clip** (Alt-C, Tools, the Fine Tune button, Perform after a raw record).
-   - Risk: a false success, after which the Editor deletes the source. The clip survives, but its `.i`/`.info` are lost.
-   - Fix (emulator side): answer **ADDSUBCLIP** with an error (`BADCOMMAND` 5 or `CMDFAILED`). Today
-     `fs.rs` `target()` returns None for it and `ops.rs` `drive_command` answers OKAY.
-   - The error reaches the Editor (`Hand_AddClipCut` passes `ES_Reply` back to `DHD_AddClip`), which shows
-     "Unable to cut clip / Internal error N".
-   - Document "press **Cancel**": OK means "ignore" and still reaches the delete.
-   - Also fail NEWCUTLIST/MAKESUBCLIPS, so that Process Clip reports an error instead of doing nothing.
+   - Done: the cut list is modelled (see 1.4), so Perform makes the pieces. The master's file is moved
+     to `Flyer/Trash` beside the drive folders instead of being deleted, so a destructive cut can be
+     undone on the PC.
 2. **FlyerHDTools / flyerscsi.device.**
    - Risk: SCSIDIRECT, SCSICALL and READTEST to a present drive answer OKAY and do nothing. INQUIRY and READ
      CAPACITY come back empty and the speed test finishes at once: blank drive data, nonsense speeds, and a

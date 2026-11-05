@@ -256,6 +256,48 @@ pub struct Firmware {
     /// their slot and opcode.
     #[serde(default)]
     waiting: Vec<(Slot, u16)>,
+    /// The cutting room's list, between NEWCUTLIST and MAKESUBCLIPS.
+    #[serde(default)]
+    cut: Option<CutList>,
+}
+
+/// A clip being cut up (`NewCutList`, clip.c:1691): the master and the
+/// sub-clips defined so far, in field order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CutList {
+    drive: u8,
+    /// The master's host file.
+    master: PathBuf,
+    /// Fields in the master.
+    fields: u32,
+    /// `CLF_DESTRUCT`: the master goes once its sub-clips are made.
+    destructive: bool,
+    subs: Vec<SubClip>,
+}
+
+/// One sub-clip (`AddSubClip`, clip.c:1748).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SubClip {
+    drive: u8,
+    /// `AF_VIDEO`, `AF_AUDIOL`, `AF_AUDIOR`.
+    flags: u8,
+    refnum: u16,
+    start: u32,
+    fields: u32,
+}
+
+/// Cut-list flags (`CLF_`, `Clip.h`) and clip-action flags (`AF_`,
+/// `acts.h`).
+const CLF_DESTRUCT: u8 = 1 << 0;
+const AF_VIDEO: u8 = 1 << 0;
+const AF_AUDIOL: u8 = 1 << 1;
+const AF_AUDIOR: u8 = 1 << 2;
+
+/// The name a sub-clip is made under until flyer.library renames it
+/// (`MakeTempName`, clip.c): `_tmp_` and the reference number, three hex
+/// digits.
+fn temp_name(refnum: u16) -> String {
+    format!("_tmp_{:03X}", refnum & 0xFFF)
 }
 
 impl Default for Firmware {
@@ -299,6 +341,7 @@ impl Firmware {
             link: None,
             fields_due: Vec::new(),
             waiting: Vec::new(),
+            cut: None,
         }
     }
 
@@ -900,7 +943,10 @@ impl Firmware {
         // cut that "worked", and the drive tools read empty SCSI answers
         // as a drive. These fail the way a board without the feature would.
         match opcode {
-            op::NEWCUTLIST | op::ADDSUBCLIP | op::MAKESUBCLIPS | op::READTEST => {
+            op::NEWCUTLIST => return self.new_cut_list(sram, slot),
+            op::ADDSUBCLIP => return self.add_sub_clip(sram, slot),
+            op::MAKESUBCLIPS => return self.make_sub_clips(sram, slot),
+            op::READTEST => {
                 self.report_unmodelled(opcode);
                 return err::CMDFAILED;
             }
@@ -932,6 +978,141 @@ impl Firmware {
         }
         self.report_unmodelled(opcode);
         err::OKAY
+    }
+
+    /// NEWCUTLIST (`NewCutList`, clip.c:1691): open the cutting room on
+    /// the clip the ClipAction names (`+4`), with `CLF_` flags at `+8`.
+    fn new_cut_list(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        self.cut = None;
+        let action = slot.arg32(sram, 4) as usize;
+        let flags = slot.arg8(sram, 8);
+        let volume = mailbox::rd32(sram, action + play::ca::VOLUME) as usize;
+        let drive = mailbox::rd8(sram, volume + 5);
+        let path = super::fs::read_cstr(sram, mailbox::rd32(sram, volume) as usize);
+        let master = match self.fs.clip_file(drive, &path) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let mut head = [0u8; flyerclip::BLOCK];
+        let header = std::fs::File::open(&master)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+            .ok()
+            .and_then(|()| flyerclip::ClipHeader::parse(&head).ok());
+        let Some(header) = header else {
+            return super::fs::ERR_BADVIDHDR;
+        };
+        if self.diag() {
+            log::info!(
+                "flyer: NEWCUTLIST {} ({} fields){}",
+                master.display(),
+                header.fields,
+                if flags & CLF_DESTRUCT != 0 {
+                    ", destructive"
+                } else {
+                    ""
+                }
+            );
+        }
+        self.cut = Some(CutList {
+            drive,
+            master,
+            fields: header.fields,
+            destructive: flags & CLF_DESTRUCT != 0,
+            subs: Vec::new(),
+        });
+        err::OKAY
+    }
+
+    /// ADDSUBCLIP (`AddSubClip`, clip.c:1748): drive `+4`, `AF_` flags
+    /// `+5`, reference number `+6`, first field `+8`, fields `+12`.
+    fn add_sub_clip(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let Some(cut) = self.cut.as_mut() else {
+            return err::CMDFAILED;
+        };
+        let start = slot.arg32(sram, 8);
+        if start > cut.fields {
+            return err::BADPARAM;
+        }
+        // "Ensure not past end (but forgive -- sloppy UI is calling this!)"
+        let fields = slot.arg32(sram, 12).min(cut.fields - start);
+        let sub = SubClip {
+            drive: if cut.destructive {
+                cut.drive
+            } else {
+                slot.arg8(sram, 4)
+            },
+            flags: slot.arg8(sram, 5),
+            refnum: slot.arg16(sram, 6),
+            start,
+            fields,
+        };
+        log::debug!("flyer: ADDSUBCLIP {sub:?}");
+        let at = cut.subs.partition_point(|s| s.start <= sub.start);
+        cut.subs.insert(at, sub);
+        err::OKAY
+    }
+
+    /// MAKESUBCLIPS (`MakeSubClips`, clip.c:1914): with `+4` set, make
+    /// every sub-clip as a new clip named `_tmp_<ref>` in the root of its
+    /// drive (flyer.library then renames each to the name the user gave),
+    /// and on a destructive cut take the master away; either way the list
+    /// is closed. The first error is returned; a sub-clip that failed is
+    /// not made.
+    fn make_sub_clips(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let Some(cut) = self.cut.take() else {
+            return err::OKAY;
+        };
+        if slot.arg8(sram, 4) == 0 {
+            return err::OKAY;
+        }
+        let bytes = match std::fs::read(&cut.master) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("flyer: reading {}: {e}", cut.master.display());
+                return err::CMDFAILED;
+            }
+        };
+        let master = match flyerclip::Clip::read(&bytes) {
+            Ok(c) => c,
+            Err(_) => return super::fs::ERR_BADVIDHDR,
+        };
+        let mut first_error = err::OKAY;
+        let mut made = 0;
+        for sub in &cut.subs {
+            let parts = flyerclip::cut::Parts {
+                video: sub.flags & AF_VIDEO != 0,
+                audio: sub.flags & (AF_AUDIOL | AF_AUDIOR) != 0,
+            };
+            let error = match flyerclip::cut::sub_clip(&master, sub.start, sub.fields, parts) {
+                Ok(clip) => match self
+                    .fs
+                    .write_root_file(sub.drive, &temp_name(sub.refnum), &clip)
+                {
+                    Ok(()) => {
+                        made += 1;
+                        err::OKAY
+                    }
+                    Err(e) => e,
+                },
+                Err(_) => err::BADPARAM,
+            };
+            if error != err::OKAY {
+                log::warn!(
+                    "flyer: sub-clip {} not made (error {error:#04X})",
+                    sub.refnum
+                );
+                if first_error == err::OKAY {
+                    first_error = error;
+                }
+            }
+        }
+        log::info!("flyer: cut {} into {made} clip(s)", cut.master.display());
+        if cut.destructive && first_error == err::OKAY {
+            if let Err(e) = self.fs.retire_file(cut.drive, &cut.master) {
+                first_error = e;
+            }
+        }
+        first_error
     }
 
     /// PGMFPGA (`PgmFPGA`, `hard.c`): configure one FPGA, or a pair of
@@ -1515,14 +1696,142 @@ mod tests {
         assert_eq!(Slot(0).opcode_word(&sram), op::FIRMWARE | STAT_DONE);
     }
 
+    /// A running Flyer with drive FA0 holding `Master`, a clip of
+    /// `frames` colour frames; the ClipAction at 0x2000 names it.
+    fn cutting_room(frames: u32) -> (tempfile::TempDir, Firmware, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fa0 = dir.path().join("Flyer/FA0");
+        std::fs::create_dir_all(&fa0).unwrap();
+        crate::flyer::clip::tests::write_test_clip(&fa0.join("Master"), frames);
+        let (fw, mut sram) = running();
+        let mut fw = Firmware {
+            fs: Filesystem::new(Some(dir.path().join("Flyer"))),
+            ..fw
+        };
+        fw.fs.survey();
+        const ACTION: usize = 0x2000;
+        const VOLUME: usize = 0x2100;
+        const NAME: usize = 0x2200;
+        mailbox::wr32(&mut sram, ACTION + play::ca::VOLUME, VOLUME as u32);
+        mailbox::wr32(&mut sram, VOLUME, NAME as u32);
+        mailbox::wr8(&mut sram, VOLUME + 5, 0);
+        sram[NAME..NAME + 15].copy_from_slice(b"FlyerA0:Master\0");
+        (dir, fw, sram)
+    }
+
+    fn sub(fw: &mut Firmware, sram: &mut [u8], flags: u8, refnum: u16, start: u32, n: u32) -> u8 {
+        let e = send(
+            fw,
+            sram,
+            Slot(1),
+            op::ADDSUBCLIP,
+            &[
+                (4, (u32::from(flags) << 16) | u32::from(refnum)),
+                (8, start),
+                (12, n),
+            ],
+        );
+        free(fw, sram, Slot(1));
+        e
+    }
+
     #[test]
-    fn cut_lists_and_raw_scsi_fail_rather_than_pretend() {
+    fn the_cutting_room_makes_sub_clips_under_temporary_names() {
+        let (dir, mut fw, mut sram) = cutting_room(5);
+        let slot = Slot(1);
+        assert_eq!(
+            send(&mut fw, &mut sram, slot, op::NEWCUTLIST, &[(4, 0x2000)]),
+            err::OKAY
+        );
+        free(&mut fw, &mut sram, slot);
+        // Picture and sound from field 4 for 8 fields; sound alone from 0.
+        assert_eq!(
+            sub(
+                &mut fw,
+                &mut sram,
+                AF_VIDEO | AF_AUDIOL | AF_AUDIOR,
+                1,
+                4,
+                8
+            ),
+            err::OKAY
+        );
+        assert_eq!(
+            sub(&mut fw, &mut sram, AF_AUDIOL | AF_AUDIOR, 2, 0, 4),
+            err::OKAY
+        );
+        assert_eq!(
+            send(&mut fw, &mut sram, slot, op::MAKESUBCLIPS, &[(4, 1 << 24)]),
+            err::OKAY
+        );
+        free(&mut fw, &mut sram, slot);
+        let fa0 = dir.path().join("Flyer/FA0");
+        let one = std::fs::read(fa0.join("_tmp_001")).unwrap();
+        let one = flyerclip::Clip::read(&one).unwrap();
+        assert_eq!(one.field_count(), 8);
+        let master = std::fs::read(fa0.join("Master")).unwrap();
+        let master = flyerclip::Clip::read(&master).unwrap();
+        assert_eq!(
+            one.decode_field(0).unwrap(),
+            master.decode_field(4).unwrap()
+        );
+        let two = std::fs::read(fa0.join("_tmp_002")).unwrap();
+        let two = flyerclip::Clip::read(&two).unwrap();
+        assert_eq!(two.header.vid_flag, 0);
+        assert_eq!(two.audio().1[..], master.audio().1[..4 * 735 * 2]);
+        // The master stays: the cut was not destructive.
+        assert!(fa0.join("Master").is_file());
+    }
+
+    #[test]
+    fn a_destructive_cut_moves_its_master_to_the_trash() {
+        let (dir, mut fw, mut sram) = cutting_room(3);
+        let slot = Slot(1);
+        let flags = u32::from(CLF_DESTRUCT) << 24;
+        assert_eq!(
+            send(
+                &mut fw,
+                &mut sram,
+                slot,
+                op::NEWCUTLIST,
+                &[(4, 0x2000), (8, flags)]
+            ),
+            err::OKAY
+        );
+        free(&mut fw, &mut sram, slot);
+        assert_eq!(sub(&mut fw, &mut sram, AF_VIDEO, 7, 0, 12), err::OKAY);
+        assert_eq!(
+            send(&mut fw, &mut sram, slot, op::MAKESUBCLIPS, &[(4, 1 << 24)]),
+            err::OKAY
+        );
+        let flyer = dir.path().join("Flyer");
+        assert!(flyer.join("FA0/_tmp_007").is_file());
+        assert!(!flyer.join("FA0/Master").exists());
+        assert!(flyer.join("Trash/Master").is_file());
+    }
+
+    #[test]
+    fn an_abandoned_cut_list_makes_nothing() {
+        let (dir, mut fw, mut sram) = cutting_room(2);
+        let slot = Slot(1);
+        send(&mut fw, &mut sram, slot, op::NEWCUTLIST, &[(4, 0x2000)]);
+        free(&mut fw, &mut sram, slot);
+        sub(&mut fw, &mut sram, AF_VIDEO, 1, 0, 4);
+        assert_eq!(
+            send(&mut fw, &mut sram, slot, op::MAKESUBCLIPS, &[]),
+            err::OKAY
+        );
+        assert!(!dir.path().join("Flyer/FA0/_tmp_001").exists());
+        // With no list open, a sub-clip has nowhere to go.
+        free(&mut fw, &mut sram, slot);
+        assert_eq!(sub(&mut fw, &mut sram, AF_VIDEO, 1, 0, 4), err::CMDFAILED);
+    }
+
+    #[test]
+    fn raw_scsi_and_read_tests_fail_rather_than_pretend() {
         let (mut fw, mut sram) = running();
         let slot = Slot(3);
         for (opcode, expected) in [
-            (op::ADDSUBCLIP, err::CMDFAILED),
-            (op::NEWCUTLIST, err::CMDFAILED),
-            (op::MAKESUBCLIPS, err::CMDFAILED),
             (op::READTEST, err::CMDFAILED),
             (op::SCSIDIRECT, err::SELTIMEOUT),
             (op::SCSICALL, err::SELTIMEOUT),

@@ -604,6 +604,44 @@ impl Filesystem {
         }
     }
 
+    /// Write a new file `name` in the root of drive `n` (the cutting
+    /// room's `_tmp_` sub-clips), replacing one of that name.
+    pub fn write_root_file(&mut self, n: u8, name: &str, bytes: &[u8]) -> Result<(), u8> {
+        let d = self.drive(n)?;
+        if !drive::valid_name(name) {
+            return Err(err::BADPARAM);
+        }
+        if drive::blocks_for(bytes.len() as u64) > self.drives[d].usage().1 {
+            return Err(ERR_FULL);
+        }
+        let path = self.drives[d].folder().join(name);
+        std::fs::write(&path, bytes).map_err(|e| io_error(n, &e))?;
+        self.drives[d].scan();
+        Ok(())
+    }
+
+    /// Take a clip off drive `n`, as a destructive cut deletes its
+    /// master: the host file is moved into `Trash` beside the drive
+    /// folders (not a drive), so the Amiga no longer sees it but the PC
+    /// keeps it.
+    pub fn retire_file(&mut self, n: u8, host: &Path) -> Result<(), u8> {
+        let d = self.drive(n)?;
+        let folder = self.folder.clone().ok_or(err::OBJNOTFOUND)?;
+        let trash = folder.join("Trash");
+        std::fs::create_dir_all(&trash).map_err(|e| io_error(n, &e))?;
+        let name = host.file_name().ok_or(err::BADPARAM)?;
+        let mut to = trash.join(name);
+        let mut k = 2;
+        while to.exists() {
+            to = trash.join(format!("{} ({k})", name.to_string_lossy()));
+            k += 1;
+        }
+        std::fs::rename(host, &to).map_err(|e| io_error(n, &e))?;
+        log::info!("flyer: {} moved to {}", host.display(), to.display());
+        self.drives[d].scan();
+        Ok(())
+    }
+
     /// PARENT: a grip on the parent directory and its header block.
     fn parent(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
         let n = slot.arg8(sram, 5);
@@ -656,6 +694,9 @@ impl Filesystem {
             return err::OBJNOTFOUND;
         };
         if first {
+            // A listing starts from the folder as it is now: clips the
+            // PC put there since (the converter) show up.
+            self.drives[d].scan();
             wr8(sram, at + g::DL_DONE, 0);
             wr32(sram, at + g::DL_DIR, rd32(sram, at + g::HEADER));
             wr16(sram, at + g::DL_HASH, 0xFFFF);

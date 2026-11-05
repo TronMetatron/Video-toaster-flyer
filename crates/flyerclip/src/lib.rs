@@ -19,6 +19,7 @@
 pub mod audio;
 pub mod clip;
 pub mod composite;
+pub mod cut;
 pub mod header;
 pub mod vtasc;
 pub mod writer;

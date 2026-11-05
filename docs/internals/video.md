@@ -942,9 +942,13 @@ the switcher shows, so it reaches the host's speakers and the Program
 recording. The input folders' sound keeps following Program as before (it
 stands in for what would reach the Flyer's line inputs); an input the
 Flyer has is silent there. CODECCTRL stores the codec's input settings
-and its meters read the peak of the Toaster's sound. Not modelled:
-recording (FLYRECORD, still capture), cut lists, SMPTE, the TBC module and
-the camcorder input on Preview.
+and its meters read the peak of the Toaster's sound. The cutting room
+(NEWCUTLIST, ADDSUBCLIP, MAKESUBCLIPS; `clip.c` `MakeSubClips`) makes
+each sub-clip by copying the master's coded colour frames, whole or with
+the sound or picture stripped (`flyerclip::cut::sub_clip`), under the
+firmware's `_tmp_<ref>` name for flyer.library to rename; a destructive cut
+moves the master into `Flyer/Trash`. Not modelled: recording (FLYRECORD,
+still capture), SMPTE, the TBC module and the camcorder input on Preview.
 
 The monitor windows (`video/window/card_monitors.rs`) each have a painter
 thread of their own, which waits on the output (`CardOutput::

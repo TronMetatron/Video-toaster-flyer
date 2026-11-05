@@ -42,7 +42,8 @@ fn is_clip(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A clip name the Flyer accepts: at most 31 characters, no `/` or `:`.
+/// A clip name the Flyer accepts: at most 29 characters (31 with its
+/// icon's `.I`), no `/` or `:`.
 fn clip_name(stem: &str) -> String {
     let name: String = stem
         .chars()
@@ -53,7 +54,7 @@ fn clip_name(stem: &str) -> String {
                 c
             }
         })
-        .take(31)
+        .take(29)
         .collect();
     if name.is_empty() {
         "Clip".into()
