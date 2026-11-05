@@ -53,15 +53,28 @@
 //! two lo-res pixels before the header sprite; a quad label is the plain
 //! quad number on the wire; and ten quads of read pipeline put each of
 //! the `HS.default` read positions inside its label run.
+//!
+//! The card's outputs are composed on a thread of their own
+//! ([`Toaster`] hands each finished field to a `toaster-compose` thread as
+//! the frame's render input; `docs/internals/video.md`, "The Video
+//! Toaster"). Everything the guest can observe -- the extended headers,
+//! the framestore, the port -- is taken from the card's shared state
+//! after the thread has caught up, so the picture the switcher reads back
+//! does not depend on the host's speed.
 
 pub mod composite;
 pub mod dve;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod media;
+pub mod perf;
 pub mod regs;
 pub mod video;
 
+use crate::flyer::link::{FieldSource, FlyerLink};
+use crate::video::bitplane::RenderInput;
 use crate::videoslot::{BeamPos, FieldPixels, LiveField, VideoSlotDevice};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Pixels per framestore line (the AGA switcher's 768-wide bitmap).
 pub const LINE_PIXELS: usize = 768;
@@ -96,6 +109,13 @@ const PIXEL0_LORES: i32 = 0x5A;
 /// synchronised) happens up to five clocks after the beam position it
 /// waited for; ten quads keeps at least four quads of margin either way.
 const READ_PIPELINE_PIXELS: i64 = 40;
+
+/// Fields the compose thread may run behind the machine. The emulation
+/// thread waits for a field's work only when the thread is still this
+/// many fields behind, and takes a frame's sound only once its field is
+/// that far back, so the sound reaches the mixer at the same emulated
+/// time on every run, whatever the host's speed.
+const PIPELINE_DEPTH: u64 = 2;
 
 /// The extended headers as the switcher sets them up (`VTSetUp`), so the
 /// card shows something sensible before it has been told otherwise.
@@ -302,6 +322,9 @@ pub struct Stats {
     pub write_lines: u64,
     pub read_requests: u64,
     pub port_bytes: u64,
+    /// Pictures the card digitised (`CERB` outside a write) and later
+    /// encoded into the framestore because something read the bank.
+    pub grabs_encoded: u64,
 }
 
 /// The card's two framestore banks: `[bank][copy][line][pixel]` composite
@@ -333,8 +356,235 @@ impl FrameStore {
     }
 }
 
-pub struct Toaster {
+/// A rendered field the card owns: a [`FieldPixels`] copied for a job.
+pub struct OwnedField {
+    pixels: Vec<u32>,
+    width: usize,
+    rows: usize,
+    visible_start_vpos: u32,
+    first_cck: i32,
+    canvas_scale: usize,
+    long_frame: bool,
+    interlaced: bool,
+    valid_rows: usize,
+}
+
+impl OwnedField {
+    pub fn copy_of(field: &FieldPixels<'_>) -> Self {
+        let n = (field.width * field.rows).min(field.pixels.len());
+        Self {
+            pixels: field.pixels[..n].to_vec(),
+            width: field.width,
+            rows: field.rows,
+            visible_start_vpos: field.visible_start_vpos,
+            first_cck: field.first_cck,
+            canvas_scale: field.canvas_scale,
+            long_frame: field.long_frame,
+            interlaced: field.interlaced,
+            valid_rows: field.valid_rows,
+        }
+    }
+
+    pub fn field(&self) -> FieldPixels<'_> {
+        FieldPixels {
+            pixels: &self.pixels,
+            width: self.width,
+            rows: self.rows,
+            visible_start_vpos: self.visible_start_vpos,
+            first_cck: self.first_cck,
+            canvas_scale: self.canvas_scale,
+            long_frame: self.long_frame,
+            interlaced: self.interlaced,
+            valid_rows: self.valid_rows,
+        }
+    }
+}
+
+/// What a field reaches the compose thread as.
+pub enum FieldInput {
+    /// The frame's render input: the thread paints the field itself.
+    Render(Box<RenderInput>),
+    /// A field already painted.
+    Owned(OwnedField),
+}
+
+/// What the Flyer did during a field, taken on the emulation thread when
+/// the field is handed over: see [`crate::flyer::link`].
+struct FlyerState {
+    routed: [bool; 2],
+    shown: [Vec<FieldSource>; 2],
+    sound: Vec<(f32, f32)>,
+}
+
+/// One finished field, for the compose thread.
+struct Job {
+    id: u64,
+    input: FieldInput,
+    at: BeamPos,
+    /// Lines of the field the live scan already took in.
+    first_unscanned: u32,
+    flyer: Option<FlyerState>,
+}
+
+/// What a field's work produced for the host.
+struct JobResult {
+    id: u64,
+    /// Program's sound, when the field completed a frame.
+    sound: Vec<(f32, f32)>,
+    /// Peak of that sound, for the Flyer's meters.
+    peak: Option<(f32, f32)>,
+}
+
+#[derive(Default)]
+struct PipeState {
+    queue: VecDeque<Job>,
+    /// The id of the last job finished (ids count from 1).
+    completed: u64,
+    results: VecDeque<JobResult>,
+    /// Render inputs the thread is done with, for the bus to refill.
+    spent: Vec<Box<RenderInput>>,
+    stop: bool,
+}
+
+/// The queue between the emulation thread and the compose thread.
+#[derive(Default)]
+struct Pipe {
+    state: Mutex<PipeState>,
+    /// Signalled when a job is queued and when one is finished.
+    changed: Condvar,
+}
+
+impl Pipe {
+    fn lock(&self) -> MutexGuard<'_, PipeState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue `job`; back-pressure: wait until the thread is at most
+    /// [`PIPELINE_DEPTH`] fields behind.
+    fn submit(&self, job: Job) {
+        let mut st = self.lock();
+        let wait = perf::start();
+        while st.completed + PIPELINE_DEPTH < job.id && !st.stop {
+            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        wait.stop(perf::COMPOSE_WAIT);
+        st.queue.push_back(job);
+        drop(st);
+        self.changed.notify_all();
+    }
+
+    /// Wait until every queued job is done.
+    fn drain(&self, submitted: u64) {
+        let mut st = self.lock();
+        let wait = perf::start();
+        while st.completed < submitted && !st.stop {
+            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        wait.stop(perf::COMPOSE_WAIT);
+    }
+
+    /// The compose thread: fields in order, each painted (when it comes as
+    /// a render input) and taken in by the card.
+    fn work(&self, card: &Mutex<Card>) {
+        let mut fb = Vec::new();
+        let mut scratch = Vec::new();
+        loop {
+            let job = {
+                let mut st = self.lock();
+                loop {
+                    if st.stop {
+                        return;
+                    }
+                    if let Some(job) = st.queue.pop_front() {
+                        break job;
+                    }
+                    st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let (result, spent) = run_job(card, job, &mut fb, &mut scratch);
+            let mut st = self.lock();
+            st.completed = result.id;
+            st.results.push_back(result);
+            if let Some(input) = spent {
+                st.spent.push(input);
+            }
+            drop(st);
+            self.changed.notify_all();
+        }
+    }
+}
+
+/// Do one job: paint the field if it came as a render input, then hand it
+/// to the card. Returns the result and the render input, now spent.
+fn run_job(
+    card: &Mutex<Card>,
+    job: Job,
+    fb: &mut Vec<u32>,
+    scratch: &mut Vec<u32>,
+) -> (JobResult, Option<Box<RenderInput>>) {
+    let Job {
+        id,
+        input,
+        at,
+        first_unscanned,
+        flyer,
+    } = job;
+    let mut card = card.lock().unwrap_or_else(|e| e.into_inner());
+    match input {
+        FieldInput::Owned(owned) => {
+            let result = card.take_field(&owned.field(), at, first_unscanned, flyer, id);
+            (result, None)
+        }
+        FieldInput::Render(mut input) => {
+            let timer = perf::start();
+            let wide = crate::video::bitplane::render_wide(
+                &mut input,
+                crate::videoslot::SLOT_FIRST_CCK,
+                crate::videoslot::SLOT_LINE_CCK,
+                usize::MAX,
+                fb,
+                scratch,
+            );
+            timer.stop(perf::FIELD_RENDER);
+            // LOF has already toggled for the new field on a laced
+            // screen; the completed field was the other one.
+            let long_frame = if wide.interlaced {
+                !at.long_frame
+            } else {
+                at.long_frame
+            };
+            let field = FieldPixels {
+                pixels: fb,
+                width: wide.stride,
+                rows: wide.rows,
+                visible_start_vpos: wide.visible_start_vpos,
+                first_cck: crate::videoslot::SLOT_FIRST_CCK,
+                canvas_scale: wide.canvas_scale,
+                long_frame,
+                interlaced: wide.interlaced,
+                valid_rows: wide.rows,
+            };
+            let result = card.take_field(&field, at, first_unscanned, flyer, id);
+            // The frame's buffers go back to the machine as soon as the
+            // field is painted.
+            input.release_shared_buffers();
+            (result, Some(input))
+        }
+    }
+}
+
+/// The card proper: its framestore, registers, video side and the state
+/// of a frame being composed. Shared between [`Toaster`] (the host's and
+/// the guest's side) and the compose thread, which holds it while it
+/// works on a field.
+pub struct Card {
     frame_store: FrameStore,
+    /// A picture the card digitised into a bank (the `IS` input, live or a
+    /// grab) that is not yet encoded into it: encoding costs milliseconds
+    /// a field and a live input is replaced every field, so it is done
+    /// when something reads the bank (`settle`). What the bank holds is
+    /// the same either way.
+    pending_grab: [Option<Vec<u32>>; 2],
     video: video::Video,
     /// Lines this field that asked the card to record its input (`CERB`
     /// outside a framestore write).
@@ -343,9 +593,6 @@ pub struct Toaster {
     elh: [Header; ELH_COUNT],
     /// Seen a valid extended header: the switcher is driving the card.
     active: bool,
-    /// Lines of the field in progress already taken in through the live
-    /// scan: `(field number, next line to take)`.
-    scanned: Option<(u64, u32)>,
     stats: Stats,
     diag: bool,
     diag_lines_logged: u32,
@@ -354,11 +601,37 @@ pub struct Toaster {
     /// Show the switcher's interface over Preview when it asks to
     /// (`USERON`, the Toaster's "preview overlay" for one-monitor setups).
     preview_overlay: bool,
-    /// The digital effect's addressing for the frame being composed.
-    dve: Option<dve::DveMap>,
+    /// The digital effect's addressing for the frame being composed, and
+    /// whether the frame has one.
+    dve: dve::DveMap,
+    dve_on: bool,
     /// The Video Flyer beside the card: it can take over inputs 3 and 4,
     /// and its sound is the system's.
-    flyer: Option<std::sync::Arc<crate::flyer::link::FlyerLink>>,
+    flyer: Option<Arc<FlyerLink>>,
+    /// What the Flyer did, as the fields' jobs reported it: the routing,
+    /// what each channel showed since the last frame, and its sound.
+    flyer_routed: [bool; 2],
+    flyer_shown: [Vec<FieldSource>; 2],
+    flyer_sound: Vec<(f32, f32)>,
+    /// Per-pixel scratch, reused from frame to frame.
+    key_buf: Vec<u8>,
+    codes_buf: Vec<Option<u8>>,
+}
+
+/// The NewTek Video Toaster 4000 in the video slot: the host's handle on
+/// the [`Card`] and the thread that composes its outputs.
+pub struct Toaster {
+    card: Arc<Mutex<Card>>,
+    pipe: Arc<Pipe>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    outputs: Vec<Arc<crate::videoslot::CardOutput>>,
+    flyer: Option<Arc<FlyerLink>>,
+    /// Lines of the field in progress already taken in through the live
+    /// scan: `(field number, next line to take)`.
+    scanned: Option<(u64, u32)>,
+    /// Jobs handed over, and the last one known finished.
+    submitted: u64,
+    joined: u64,
 }
 
 impl Default for Toaster {
@@ -377,17 +650,212 @@ impl Toaster {
     /// A card whose connectors are the folders under `media_root`
     /// (created if missing): see [`media`].
     pub fn with_media(media_root: Option<std::path::PathBuf>) -> Self {
+        let card = Card::new(media_root);
+        let outputs = card.video.outputs();
+        let card = Arc::new(Mutex::new(card));
+        let pipe = Arc::new(Pipe::default());
+        let worker = {
+            let pipe = Arc::clone(&pipe);
+            let card = Arc::clone(&card);
+            std::thread::Builder::new()
+                .name("toaster-compose".into())
+                .spawn(move || pipe.work(&card))
+                .ok()
+        };
+        if worker.is_none() {
+            log::warn!("toaster: no compose thread; composing outputs on the emulation thread");
+        }
+        Self {
+            card,
+            pipe,
+            worker,
+            outputs,
+            flyer: None,
+            scanned: None,
+            submitted: 0,
+            joined: 0,
+        }
+    }
+
+    /// Fit a Video Flyer beside the card: inputs 3 and 4 show its channels
+    /// A and B when it routes them there, and its sound joins Program's.
+    pub fn set_flyer_link(&mut self, link: Arc<FlyerLink>) {
+        self.flyer = Some(Arc::clone(&link));
+        self.card().flyer = Some(link);
+    }
+
+    /// The card, once the compose thread has caught up: the state the
+    /// guest sees. Not to be held across a field.
+    pub(crate) fn card(&mut self) -> MutexGuard<'_, Card> {
+        self.drain();
+        self.card.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn drain(&mut self) {
+        if self.joined < self.submitted {
+            if self.worker_alive() {
+                self.pipe.drain(self.submitted);
+            }
+            self.joined = self.submitted;
+        }
+    }
+
+    pub fn stats(&mut self) -> Stats {
+        self.card().stats
+    }
+
+    pub fn elh(&mut self, index: usize) -> Header {
+        self.card().elh[index]
+    }
+
+    /// Show the switcher's interface over the Preview output when it asks
+    /// for that (its "preview overlay", meant for a single composite
+    /// monitor). Off by default: the interface has a window of its own.
+    pub fn set_preview_overlay(&mut self, on: bool) {
+        self.card().preview_overlay = on;
+    }
+
+    /// One framestore byte.
+    pub fn frame_store_byte(
+        &mut self,
+        bank: usize,
+        complemented: bool,
+        line: usize,
+        pixel: usize,
+    ) -> u8 {
+        self.card()
+            .frame_store_byte(bank, complemented, line, pixel)
+    }
+
+    /// Hand a finished field to the compose thread. Jobs run in order; a
+    /// job is waited for only when the thread is [`PIPELINE_DEPTH`] fields
+    /// behind. Without a thread the job runs here.
+    fn submit(&mut self, input: FieldInput, at: BeamPos) {
+        let timer = perf::start();
+        // Lines the live scan already took in this field are done.
+        let first_unscanned = match self.scanned.take() {
+            Some((frame, next)) if frame == at.frame => next,
+            _ => 0,
+        };
+        // What the Flyer did since the last field, taken now so the
+        // frame composed later sees the same whatever the thread's pace.
+        let flyer = self.flyer.as_ref().map(|link| FlyerState {
+            routed: link.routing(),
+            shown: [link.take_shown(0), link.take_shown(1)],
+            sound: link.take_sound(),
+        });
+        self.submitted += 1;
+        let job = Job {
+            id: self.submitted,
+            input,
+            at,
+            first_unscanned,
+            flyer,
+        };
+        if self.worker_alive() {
+            self.pipe.submit(job);
+            self.joined = self.joined.max(job_id_joined(self.submitted));
+        } else {
+            self.run_inline(job);
+            self.joined = self.submitted;
+        }
+        timer.stop(perf::SUBMIT);
+    }
+
+    /// Whether the compose thread is there to take jobs. One that died
+    /// (a panic) is reported once; from then on jobs run here.
+    fn worker_alive(&mut self) -> bool {
+        match &self.worker {
+            Some(worker) if !worker.is_finished() => true,
+            Some(_) => {
+                if let Some(worker) = self.worker.take() {
+                    if worker.join().is_err() {
+                        log::error!(
+                            "toaster: the compose thread died; composing on the emulation thread"
+                        );
+                    }
+                }
+                // Jobs it left behind are run here, in order.
+                let left: Vec<Job> = self.pipe.lock().queue.drain(..).collect();
+                for job in left {
+                    self.run_inline(job);
+                }
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Do a job on this thread.
+    fn run_inline(&mut self, job: Job) {
+        let mut fb = Vec::new();
+        let mut scratch = Vec::new();
+        let (result, spent) = run_job(&self.card, job, &mut fb, &mut scratch);
+        let mut st = self.pipe.lock();
+        st.completed = result.id;
+        st.results.push_back(result);
+        st.spent.extend(spent);
+    }
+
+    /// Scan the lines of the field in progress that the beam has passed
+    /// since the last scan, so a read on line N sees the headers (bank
+    /// select, above all) of lines 0..N of its own field, as the card
+    /// does. The compose thread has caught up first: the field before is
+    /// in.
+    fn scan_to_beam(&mut self, live: &mut LiveField<'_>) {
+        let beam = live.beam();
+        let mut next = match self.scanned {
+            Some((frame, next)) if frame == beam.frame => next,
+            _ => live.first_vpos(),
+        };
+        let timer = perf::start();
+        let mut lines = 0;
+        let mut card = self.card();
+        while next < beam.vpos {
+            if let Some(field) = live.line(next) {
+                lines += 1;
+                if let Some(header) = Card::header(&field, next) {
+                    card.take_line(&field, next, header);
+                }
+            }
+            next += 1;
+        }
+        drop(card);
+        perf::count(perf::SCAN, lines);
+        timer.stop(perf::SCAN);
+        self.scanned = Some((beam.frame, next));
+    }
+}
+
+/// The job an emulation thread that just submitted job `submitted` knows
+/// to be finished.
+fn job_id_joined(submitted: u64) -> u64 {
+    submitted.saturating_sub(PIPELINE_DEPTH)
+}
+
+impl Drop for Toaster {
+    fn drop(&mut self) {
+        self.pipe.lock().stop = true;
+        self.pipe.changed.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Card {
+    fn new(media_root: Option<std::path::PathBuf>) -> Self {
         let mut elh = [Header::default(); ELH_COUNT];
         for (index, header) in ELH_DEFAULTS {
             elh[index] = header;
         }
         Self {
             frame_store: FrameStore::new(),
+            pending_grab: [None, None],
             video: video::Video::new(media_root),
             record_lines: 0,
             elh,
             active: false,
-            scanned: None,
             stats: Stats::default(),
             diag: crate::envcfg::flag("COPPERLINE_DIAG_TOASTER"),
             diag_lines_logged: 0,
@@ -395,28 +863,31 @@ impl Toaster {
                 .is_some_and(|v| v == "fields"),
             diag_outputs: String::new(),
             preview_overlay: false,
-            dve: None,
+            dve: dve::DveMap::empty(),
+            dve_on: false,
             flyer: None,
+            flyer_routed: [false; 2],
+            flyer_shown: [Vec::new(), Vec::new()],
+            flyer_sound: Vec::new(),
+            key_buf: Vec::new(),
+            codes_buf: Vec::new(),
         }
     }
 
-    /// Fit a Video Flyer beside the card: inputs 3 and 4 show its channels
-    /// A and B when it routes them there, and its sound joins Program's.
-    pub fn set_flyer_link(&mut self, link: std::sync::Arc<crate::flyer::link::FlyerLink>) {
-        self.flyer = Some(link);
-    }
-
-    /// The Flyer channel on input `n` (0-based), when the Flyer has it.
+    /// The Flyer channel on input `n` (0-based), when the Flyer has it:
+    /// channel A on input 3, B on input 4.
     fn flyer_channel(&self, n: usize) -> Option<usize> {
-        self.flyer.as_ref()?.channel_on_input(n)
+        let ch = n.checked_sub(2).filter(|&c| c < 2)?;
+        (self.flyer.is_some() && self.flyer_routed[ch]).then_some(ch)
     }
 
     /// Input `n`'s picture into `out`: the Flyer's channel where it has
     /// the input, else the input's host folder. False when nothing is
     /// plugged in.
-    fn input_into(&self, n: usize, out: &mut [u32]) -> bool {
+    fn input_into(&mut self, n: usize, out: &mut [u32]) -> bool {
         if let (Some(ch), Some(link)) = (self.flyer_channel(n), &self.flyer) {
-            link.picture(ch, out);
+            let shown = std::mem::take(&mut self.flyer_shown[ch]);
+            link.weave_shown(ch, &shown, out);
             return true;
         }
         match self.video.input_picture(n) {
@@ -436,13 +907,6 @@ impl Toaster {
         self.elh[index]
     }
 
-    /// Show the switcher's interface over the Preview output when it asks
-    /// for that (its "preview overlay", meant for a single composite
-    /// monitor). Off by default: the interface has a window of its own.
-    pub fn set_preview_overlay(&mut self, on: bool) {
-        self.preview_overlay = on;
-    }
-
     /// The latched control registers.
     pub fn regs(&self) -> regs::Regs<'_> {
         regs::Regs { elh: &self.elh }
@@ -450,13 +914,26 @@ impl Toaster {
 
     /// One framestore byte.
     pub fn frame_store_byte(
-        &self,
+        &mut self,
         bank: usize,
         complemented: bool,
         line: usize,
         pixel: usize,
     ) -> u8 {
+        self.settle(bank);
         self.frame_store.line(bank, complemented, line)[pixel]
+    }
+
+    /// Encode the picture digitised into `bank`, if one is waiting, before
+    /// the bank is read or written.
+    fn settle(&mut self, bank: usize) {
+        if let Some(pic) = self.pending_grab[bank & 1].take() {
+            let timer = perf::start();
+            video::Video::grab(&mut self.frame_store, bank, &pic);
+            self.video.give_back(pic);
+            self.stats.grabs_encoded += 1;
+            timer.stop(perf::GRAB_ENCODE);
+        }
     }
 
     /// Bank a write goes to: EH0 `OBR`.
@@ -508,7 +985,10 @@ impl Toaster {
         if line >= LINES {
             return;
         }
+        let timer = perf::start();
         let bank = self.write_bank();
+        self.settle(bank);
+        self.video.invalidate(bank);
         let x0 = Self::pixel0_column(field);
         let step = field.canvas_scale as i64;
         // The second pass of a zipper write (LUST clear) lands 16 samples
@@ -537,6 +1017,7 @@ impl Toaster {
             };
         }
         self.stats.write_lines += 1;
+        timer.stop(perf::WRITE_LINES);
         if self.diag && self.diag_lines_logged < 400 {
             self.diag_lines_logged += 1;
             let bytes: Vec<u8> = self.frame_store.line(bank, complemented, line)[8..56].to_vec();
@@ -591,27 +1072,6 @@ impl Toaster {
         }
     }
 
-    /// Take in the lines of the field in progress that the beam has
-    /// passed since the last scan, so a read on line N sees the headers
-    /// (bank select, above all) of lines 0..N of its own field, as the
-    /// card does.
-    fn scan_to_beam(&mut self, live: &mut LiveField<'_>) {
-        let beam = live.beam();
-        let mut next = match self.scanned {
-            Some((frame, next)) if frame == beam.frame => next,
-            _ => live.first_vpos(),
-        };
-        while next < beam.vpos {
-            if let Some(field) = live.line(next) {
-                if let Some(header) = Self::header(&field, next) {
-                    self.take_line(&field, next, header);
-                }
-            }
-            next += 1;
-        }
-        self.scanned = Some((beam.frame, next));
-    }
-
     /// The quad label drawn at canvas column `col` on `row`: the `I` line
     /// across the quad's four pixels is the label's high nibble, the `B`
     /// line its low nibble, first pixel = bit 3. (The switcher's source
@@ -628,27 +1088,33 @@ impl Toaster {
         }
         Some((hi << 4) | lo)
     }
-}
 
-impl VideoSlotDevice for Toaster {
-    fn name(&self) -> &'static str {
-        "Video Toaster 4000"
-    }
-
-    fn supplies_sync(&self) -> bool {
-        true
-    }
-
-    fn field_complete(&mut self, field: &FieldPixels<'_>, at: BeamPos) {
+    /// Take in a finished field (job `id`): its line headers from
+    /// `first_unscanned` on, then, on the second field of a frame, the
+    /// outputs. `at` is the beam at the wrap.
+    fn take_field(
+        &mut self,
+        field: &FieldPixels<'_>,
+        at: BeamPos,
+        first_unscanned: u32,
+        flyer: Option<FlyerState>,
+        id: u64,
+    ) -> JobResult {
+        let timer = perf::start();
         self.stats.fields += 1;
-        // Lines the live scan already took in this field are done.
-        let first_unscanned = match self.scanned.take() {
-            Some((frame, next)) if frame == at.frame => next,
-            _ => 0,
-        };
+        if let Some(flyer) = flyer {
+            self.flyer_routed = flyer.routed;
+            for (ch, shown) in flyer.shown.into_iter().enumerate() {
+                for source in shown {
+                    crate::flyer::link::push_shown(&mut self.flyer_shown[ch], source);
+                }
+            }
+            self.flyer_sound.extend_from_slice(&flyer.sound);
+        }
         // `COPPERLINE_DIAG_TOASTER=fields`: dump every line header of one
         // field in forty.
         let dump = self.diag_fields && self.active && self.stats.fields.is_multiple_of(40);
+        let scan = perf::start();
         for row in 0..field.rows {
             let vpos = field.visible_start_vpos + row as u32;
             if vpos < first_unscanned {
@@ -670,33 +1136,102 @@ impl VideoSlotDevice for Toaster {
             }
             self.take_line(field, vpos, header);
         }
+        scan.stop(perf::HEADER_SCAN);
         // A field with CERB lines outside a framestore write digitised the
         // IS input into the recording bank: live video, or a grab.
         let record = std::mem::take(&mut self.record_lines) > 0;
         self.video.set_live(record && self.regs().abse());
         let frame_done = self.video.begin_field();
+        let mut result = JobResult {
+            id,
+            sound: Vec::new(),
+            peak: None,
+        };
         if frame_done {
+            let outputs = perf::start();
             if self.active {
-                self.produce_outputs(field);
+                self.produce_outputs(field, &mut result);
             } else {
-                self.produce_idle_outputs();
+                self.produce_idle_outputs(&mut result);
             }
+            outputs.stop(perf::OUTPUTS);
         }
         if record {
+            let rec = perf::start();
             self.record_input(field);
+            rec.stop(perf::RECORD_INPUT);
         }
+        timer.stop(perf::FIELD_COMPLETE);
+        if perf::on() && self.stats.fields.is_multiple_of(60) {
+            let flyer = self
+                .flyer
+                .as_ref()
+                .map(|l| l.decode_stats())
+                .unwrap_or_default();
+            log::info!(
+                "toaster perf: field {} {} flyer decoded={} waited={} at {:?}",
+                self.stats.fields,
+                perf::report(),
+                flyer.0,
+                flyer.1,
+                at.frame
+            );
+        }
+        result
+    }
+}
+
+impl VideoSlotDevice for Toaster {
+    fn name(&self) -> &'static str {
+        "Video Toaster 4000"
     }
 
-    fn video_outputs(&self) -> Vec<std::sync::Arc<crate::videoslot::CardOutput>> {
-        self.video.outputs()
+    fn supplies_sync(&self) -> bool {
+        true
     }
 
-    fn control_status(&self) -> serde_json::Value {
-        self.status_value()
+    fn takes_render_input(&self) -> bool {
+        true
     }
 
+    fn field_render_input(&mut self, input: Box<RenderInput>, at: BeamPos) {
+        self.submit(FieldInput::Render(input), at);
+    }
+
+    fn take_spent_render_inputs(&mut self, pool: &mut Vec<Box<RenderInput>>) {
+        let mut st = self.pipe.lock();
+        pool.append(&mut st.spent);
+    }
+
+    /// A field already painted: taken in on the compose thread like any
+    /// other, and waited for, so what follows sees its effect.
+    fn field_complete(&mut self, field: &FieldPixels<'_>, at: BeamPos) {
+        self.submit(FieldInput::Owned(OwnedField::copy_of(field)), at);
+        self.drain();
+    }
+
+    fn video_outputs(&self) -> Vec<Arc<crate::videoslot::CardOutput>> {
+        self.outputs.clone()
+    }
+
+    fn control_status(&mut self) -> serde_json::Value {
+        self.card().status_value()
+    }
+
+    /// Program's sound of the frames whose fields are known finished: a
+    /// frame's sound is taken [`PIPELINE_DEPTH`] fields after its own, on
+    /// every run.
     fn take_audio(&mut self, out: &mut Vec<(f32, f32)>) {
-        self.video.take_audio(out);
+        let mut st = self.pipe.lock();
+        while st.results.front().is_some_and(|r| r.id <= self.joined) {
+            let Some(result) = st.results.pop_front() else {
+                break;
+            };
+            out.extend_from_slice(&result.sound);
+            if let (Some(peak), Some(link)) = (result.peak, &self.flyer) {
+                link.set_line_peak(peak);
+            }
+        }
     }
 
     fn control(
@@ -724,21 +1259,31 @@ impl VideoSlotDevice for Toaster {
                     }
                     Some(_) => return Err("file must be a path string or null".into()),
                 };
-                self.video.pin_input(n - 1, file)?;
-                Ok(serde_json::json!({ "inputs": self.video.input_status() }))
+                let card = self.card();
+                card.video.pin_input(n - 1, file)?;
+                Ok(serde_json::json!({ "inputs": card.video.input_status() }))
             }
             other => Err(format!("the toaster has no {other} control")),
         }
     }
 
     fn parallel_read(&mut self, live: &mut LiveField<'_>, _ddrb: u8) -> Option<u8> {
+        let timer = perf::start();
         self.scan_to_beam(live);
-        if !self.active {
+        let mut card = self.card();
+        if !card.active {
+            drop(card);
+            timer.stop(perf::PAR_READ);
             return None;
         }
         let beam = live.beam();
+        let port = perf::start();
         let field = live.pixels();
-        self.port_byte(&field, beam)
+        let byte = card.port_byte(&field, beam);
+        drop(card);
+        port.stop(perf::PORT_BYTE);
+        timer.stop(perf::PAR_READ);
+        byte
     }
 }
 
@@ -765,11 +1310,18 @@ impl Inputs {
     }
 }
 
+/// The fader's mix for a frame: one value, or the per-pixel map in
+/// `Card::key_buf`.
+enum FaderKey {
+    Flat(u8),
+    Map,
+}
+
 /// The folder, under the card's host folder, through which the host hands
 /// ARexx jobs to the Amiga (S:Copperline-Link.rexx runs them).
 pub const LINK_FOLDER: &str = ".copperline";
 
-impl Toaster {
+impl Card {
     /// The card's state as the control protocol reports it.
     fn status_value(&self) -> serde_json::Value {
         use regs::{Cds, Mux};
@@ -854,15 +1406,30 @@ impl Toaster {
         use regs::Mux;
         match (mux, role) {
             (Mux::Vid(n), _) => {
+                let timer = perf::start();
+                let flyer = self.flyer_channel(n).is_some();
                 if !self.input_into(n, out) {
                     out.fill(video::black());
                 }
+                timer.stop(if flyer {
+                    perf::SRC_FLYER
+                } else {
+                    perf::SRC_INPUT
+                });
             }
             // On the IS mux, 4 is the Program output fed back and 5 the
             // external input (DAC0).
             (Mux::Dac(0), video::Role::Is) => self.video.last_program(out),
-            (Mux::Dac(1), video::Role::Is) => self.dac_picture(0, false, out),
-            (Mux::Dac(bank), _) => self.dac_picture(bank, true, out),
+            (Mux::Dac(1), video::Role::Is) => {
+                let timer = perf::start();
+                self.dac_picture(0, false, out);
+                timer.stop(perf::SRC_DAC);
+            }
+            (Mux::Dac(bank), _) => {
+                let timer = perf::start();
+                self.dac_picture(bank, true, out);
+                timer.stop(perf::SRC_DAC);
+            }
             (Mux::Encoder, _) => {
                 if self.regs().matte() {
                     let (ma, mb, mp) = self.regs().matte_code();
@@ -872,7 +1439,9 @@ impl Toaster {
                         out.fill(video::matte_colour(ma, mb, mp));
                     }
                 } else {
+                    let timer = perf::start();
                     video::amiga_picture(field, Self::pixel0_column(field), out);
+                    timer.stop(perf::SRC_AMIGA);
                 }
             }
             // MONO: the luminance of the LK source.
@@ -894,31 +1463,34 @@ impl Toaster {
     /// With `mapped`, a digital effect in progress readdresses the playback
     /// (see [`dve`]).
     fn dac_picture(&mut self, bank: usize, mapped: bool, out: &mut [u32]) {
-        let map = if mapped { self.dve.take() } else { None };
-        let linear = |this: &mut Self, out: &mut [u32]| {
-            if bank == 0 && this.video.live() {
-                if let regs::Mux::Vid(n) = this.regs().is() {
-                    if !this.input_into(n, out) {
-                        out.fill(video::black());
-                    }
-                    return;
+        let live = bank == 0 && self.video.live();
+        if live {
+            if let regs::Mux::Vid(n) = self.regs().is() {
+                let mut src = self.video.take_picture();
+                if !self.input_into(n, &mut src) {
+                    src.fill(video::black());
                 }
+                if mapped && self.dve_on {
+                    self.dve.apply(&src, out);
+                } else {
+                    out.copy_from_slice(&src[..out.len()]);
+                }
+                self.video.give_back(src);
+                return;
             }
-            let pic = this.video.framestore_picture(&this.frame_store, bank);
+        }
+        self.settle(bank);
+        if mapped && self.dve_on {
+            let below = self.dve.reaches_below();
+            let pic = self
+                .video
+                .framestore_picture(&self.frame_store, bank, below);
+            self.dve.apply(pic, out);
+        } else {
+            let pic = self
+                .video
+                .framestore_picture(&self.frame_store, bank, false);
             out.copy_from_slice(&pic[..out.len()]);
-        };
-        match map {
-            Some(map) => {
-                let mut src = vec![video::black(); out.len()];
-                linear(self, &mut src);
-                let live = bank == 0 && self.video.live();
-                if map.reaches_below() && !live {
-                    src.extend(video::Video::framestore_below(&self.frame_store, bank));
-                }
-                map.apply(&src, out);
-                self.dve = Some(map);
-            }
-            None => linear(self, out),
         }
     }
 
@@ -936,7 +1508,10 @@ impl Toaster {
             self.source_picture(mux, video::Role::Fader, field, out);
             return self.source_inputs(mux, video::Role::Fader);
         }
-        let codes = video::latch_codes(field, Self::pixel0_column(field));
+        let timer = perf::start();
+        let mut codes = std::mem::take(&mut self.codes_buf);
+        video::latch_codes_into(field, Self::pixel0_column(field), &mut codes);
+        timer.stop(perf::LATCH);
         let mut count = [0usize; 8];
         for c in codes.iter() {
             count[usize::from(c.unwrap_or(7))] += 1;
@@ -951,7 +1526,7 @@ impl Toaster {
                 );
             }
         }
-        let mut src = vec![video::black(); out.len()];
+        let mut src = self.video.take_picture();
         for code in (0..8u8).filter(|&c| count[usize::from(c)] > 0) {
             self.source_picture(
                 regs::Mux::from_code(code),
@@ -965,6 +1540,8 @@ impl Toaster {
                 }
             }
         }
+        self.video.give_back(src);
+        self.codes_buf = codes;
         shares
     }
 
@@ -1015,32 +1592,48 @@ impl Toaster {
     }
 
     /// Compose and publish one frame of the Program and Preview outputs.
-    fn produce_outputs(&mut self, field: &FieldPixels<'_>) {
+    fn produce_outputs(&mut self, field: &FieldPixels<'_>, result: &mut JobResult) {
         let (am, bm, pv) = (self.regs().am(), self.regs().bm(), self.regs().pv());
         let (amwipe, bmwipe) = (self.regs().amwipe(), self.regs().bmwipe());
         // A digital effect: the framestore playback is addressed line by
         // line and quad by quad from the Amiga's picture.
-        self.dve = (!self.regs().linp() && !self.regs().lut())
-            .then(|| dve::DveMap::from_field(field, Self::pixel0_column(field)));
-        let n = video::PICTURE_W * video::PICTURE_H;
-        let mut a = self.video.scratch();
+        let timer = perf::start();
+        self.dve_on = !self.regs().linp() && !self.regs().lut();
+        if self.dve_on {
+            self.dve.read_field(field, Self::pixel0_column(field));
+        }
+        timer.stop(perf::DVE_MAP);
+        let mut a = self.video.take_picture();
+        let timer = perf::start();
         let a_inputs = self.bus_picture(am, amwipe, field, &mut a);
-        let mut program = vec![video::black(); n];
+        timer.stop(perf::BUS_A);
+        let mut program = self.video.take_picture();
         let program_inputs = if bm == am && bmwipe == amwipe {
             program.copy_from_slice(&a);
             a_inputs
         } else {
-            let mut b = vec![video::black(); n];
+            let mut b = self.video.take_picture();
+            let timer = perf::start();
             let b_inputs = self.bus_picture(bm, bmwipe, field, &mut b);
-            let key = self.fader_key(field);
+            timer.stop(perf::BUS_B);
+            let timer = perf::start();
+            let key = match self.fader_key(field) {
+                FaderKey::Flat(k) => video::Key::Flat(k),
+                FaderKey::Map => video::Key::Map(&self.key_buf),
+            };
+            timer.stop(perf::KEY);
+            let timer = perf::start();
             video::mix(&a, &b, &key, &mut program);
+            timer.stop(perf::MIX);
             let k = key.mean() / 255.0;
             let mut shares = Inputs::default();
             shares.add(&a_inputs, 1.0 - k);
             shares.add(&b_inputs, k);
+            self.video.give_back(b);
             shares
         };
-        let mut preview = vec![video::black(); n];
+        let timer = perf::start();
+        let mut preview = self.video.take_picture();
         let preview_inputs = if pv == regs::Mux::Seven {
             preview.copy_from_slice(&program);
             program_inputs
@@ -1048,10 +1641,15 @@ impl Toaster {
             self.source_picture(pv, video::Role::Preview, field, &mut preview);
             self.source_inputs(pv, video::Role::Preview)
         };
+        timer.stop(perf::PREVIEW);
         let samples = self.video.frame_samples();
+        let timer = perf::start();
         let mut program_sound = self.mix_sound(&program_inputs, samples);
         let preview_sound = self.mix_sound(&preview_inputs, samples);
-        self.add_flyer_sound(&mut program_sound);
+        timer.stop(perf::SOUND);
+        let timer = perf::start();
+        result.peak = self.add_flyer_sound(&mut program_sound);
+        timer.stop(perf::FLYER_SOUND);
         if self.preview_overlay && self.regs().useron() {
             video::overlay_interface(field, Self::pixel0_column(field), &mut preview);
         }
@@ -1078,89 +1676,106 @@ impl Toaster {
                 self.diag_outputs = state;
             }
         }
+        let timer = perf::start();
         self.video
             .publish(&program, &preview, &program_sound, &preview_sound);
-        self.dve = None;
+        timer.stop(perf::PUBLISH);
+        result.sound = program_sound;
+        self.dve_on = false;
         self.video.give_back(a);
+        self.video.give_back(program);
+        self.video.give_back(preview);
     }
 
     /// Until the switcher first drives the card, its outputs are black and
     /// silent: the power-on mux settings would put inputs nobody chose on
     /// Program and Preview while the machine boots.
-    fn produce_idle_outputs(&mut self) {
-        let black = vec![video::black(); video::PICTURE_W * video::PICTURE_H];
+    fn produce_idle_outputs(&mut self, result: &mut JobResult) {
+        let mut black = self.video.take_picture();
+        black.fill(video::black());
         let silence = vec![(0.0f32, 0.0f32); self.video.frame_samples()];
-        if let Some(link) = &self.flyer {
-            link.take_sound();
-        }
+        self.flyer_sound.clear();
         self.video.publish(&black, &black, &silence, &silence);
+        self.video.give_back(black);
+        result.sound = silence;
     }
 
     /// The Flyer's audio output is the system's: its fields of sound since
     /// the last frame, stretched to this frame, join Program's. The input
     /// files' sound (standing in for what reaches the Flyer's line inputs)
-    /// sets its record meters.
-    fn add_flyer_sound(&self, program: &mut [(f32, f32)]) {
-        let Some(link) = &self.flyer else {
-            return;
-        };
+    /// sets its record meters: that peak is returned for the host to pass
+    /// on.
+    fn add_flyer_sound(&mut self, program: &mut [(f32, f32)]) -> Option<(f32, f32)> {
+        self.flyer.as_ref()?;
         let peak = program.iter().fold((0.0f32, 0.0f32), |p, &(l, r)| {
             (p.0.max(l.abs()), p.1.max(r.abs()))
         });
-        link.set_line_peak(peak);
-        let sound = link.take_sound();
-        if sound.is_empty() {
-            return;
+        let sound = std::mem::take(&mut self.flyer_sound);
+        if !sound.is_empty() {
+            let len = program.len();
+            for (o, (l, r)) in program
+                .iter_mut()
+                .zip(crate::videoslot::resample(&sound, len))
+            {
+                o.0 += l;
+                o.1 += r;
+            }
         }
-        let len = program.len();
-        for (o, (l, r)) in program
-            .iter_mut()
-            .zip(crate::videoslot::resample(&sound, len))
-        {
-            o.0 += l;
-            o.1 += r;
-        }
+        Some(peak)
     }
 
-    /// The fader's mix, per picture pixel (0 = A, 255 = B).
-    fn fader_key(&mut self, field: &FieldPixels<'_>) -> video::Key {
+    /// The fader's mix, per picture pixel (0 = A, 255 = B): one value, or
+    /// a map left in `key_buf`.
+    fn fader_key(&mut self, field: &FieldPixels<'_>) -> FaderKey {
         let cd = self.regs().cd();
         match self.regs().cds() {
             // During a digital effect the quad codes say where the DVE
             // picture (B) shows over the background (A).
-            mode @ (regs::Cds::Quaf | regs::Cds::TransQuad) if self.dve.is_some() => {
-                let map = self.dve.as_ref().expect("checked");
-                video::Key::Map(map.key(mode == regs::Cds::TransQuad, cd))
+            mode @ (regs::Cds::Quaf | regs::Cds::TransQuad) if self.dve_on => {
+                self.dve
+                    .key_into(mode == regs::Cds::TransQuad, cd, &mut self.key_buf);
+                FaderKey::Map
             }
             regs::Cds::Cd | regs::Cds::Quaf | regs::Cds::TransQuad | regs::Cds::RgQuad => {
-                video::Key::Flat(cd)
+                FaderKey::Flat(cd)
             }
             regs::Cds::LumKey => {
                 let lk = self.regs().lk();
-                let mut src = vec![video::black(); video::PICTURE_W * video::PICTURE_H];
+                let mut src = self.video.take_picture();
                 self.source_picture(lk, video::Role::Key, field, &mut src);
-                video::Key::Map(video::luma_key(
+                video::luma_key_into(
                     &src,
                     self.regs().lka(),
                     self.regs().no_key_invert(),
-                ))
+                    &mut self.key_buf,
+                );
+                self.video.give_back(src);
+                FaderKey::Map
             }
-            mode => video::Key::Map(video::amiga_key(
-                field,
-                Self::pixel0_column(field),
-                mode,
-                cd,
-            )),
+            mode => {
+                video::amiga_key_into(
+                    field,
+                    Self::pixel0_column(field),
+                    mode,
+                    cd,
+                    &mut self.key_buf,
+                );
+                FaderKey::Map
+            }
         }
     }
 
-    /// Digitise the IS input into the recording bank (OBR).
+    /// Digitise the IS input into the recording bank (OBR): the picture
+    /// is kept, and encoded when the bank is next read (`settle`).
     fn record_input(&mut self, field: &FieldPixels<'_>) {
         let is = self.regs().is();
         let bank = usize::from(self.regs().obr());
-        let mut pic = vec![video::black(); video::PICTURE_W * video::PICTURE_H];
+        let mut pic = match self.pending_grab[bank].take() {
+            Some(old) => old,
+            None => self.video.take_picture(),
+        };
         self.source_picture(is, video::Role::Is, field, &mut pic);
-        video::Video::grab(&mut self.frame_store, bank, &pic);
+        self.pending_grab[bank] = Some(pic);
         self.video.invalidate(bank);
     }
 
@@ -1232,11 +1847,12 @@ mod tests {
         shares.add(&a, 1.0 - k);
         shares.add(&b, k);
         assert!((shares.0[0] - 0.749).abs() < 0.01 && (shares.0[1] - 0.251).abs() < 0.01);
-        let map = video::Key::Map(vec![0, 255, 255, 255]);
+        let map = video::Key::Map(&[0, 255, 255, 255]);
         assert!((map.mean() - 191.25).abs() < 0.01);
         // An input pinned to nothing is silent: no sound without frames.
-        let card = Toaster::new();
+        let mut card = Toaster::new();
         assert!(card
+            .card()
             .mix_sound(&shares, 1471)
             .iter()
             .all(|&(l, r)| l == 0.0 && r == 0.0));
@@ -1244,16 +1860,18 @@ mod tests {
 
     #[test]
     fn a_routed_flyer_channel_is_input_3_and_its_sound_joins_program() {
-        use crate::flyer::link::{FieldSource, FlyerLink};
         let link = FlyerLink::new();
         let mut card = Toaster::new();
-        card.set_flyer_link(std::sync::Arc::clone(&link));
+        card.set_flyer_link(Arc::clone(&link));
         let white = u32::from_le_bytes([255, 255, 255, 255]);
         link.show(0, FieldSource::Matte(white));
         let line = Line::new(30);
         let mut out = vec![0u32; video::PICTURE_W * video::PICTURE_H];
+        // What the Flyer did reaches the card with the next field.
         let picture = |card: &mut Toaster, n: usize, out: &mut [u32]| {
-            card.source_picture(regs::Mux::Vid(n), video::Role::Fader, &line.field(), out);
+            card.field_complete(&line.field(), BeamPos::default());
+            card.card()
+                .source_picture(regs::Mux::Vid(n), video::Role::Fader, &line.field(), out);
         };
         // Not routed: input 3 is the card's own (here unplugged) input.
         picture(&mut card, 2, &mut out);
@@ -1263,27 +1881,33 @@ mod tests {
         assert!(out.iter().all(|&p| p == white));
         picture(&mut card, 3, &mut out);
         assert!(out.iter().all(|&p| p == video::black()));
-        // The Flyer's two fields of sound fill the frame's.
+        // The Flyer's two fields of sound reach the card with the next
+        // field (the fourth here completes a frame of idle outputs, which
+        // drop what came before) and fill the frame's.
+        card.field_complete(&line.field(), BeamPos::default());
         link.push_sound(&[(0.5, 0.25); 1470]);
-        let mut program = vec![(0.0f32, 0.0f32); 1485];
-        card.add_flyer_sound(&mut program);
-        assert!(program.iter().all(|&(l, r)| l == 0.5 && r == 0.25));
+        card.field_complete(&line.field(), BeamPos::default());
         assert!(link.take_sound().is_empty());
-        assert_eq!(card.status_value()["flyer"]["input3"], true);
+        assert_eq!(card.card().flyer_sound.len(), 1470);
+        let mut program = vec![(0.0f32, 0.0f32); 1485];
+        let peak = card.card().add_flyer_sound(&mut program);
+        assert_eq!(peak, Some((0.0, 0.0)));
+        assert!(program.iter().all(|&(l, r)| l == 0.5 && r == 0.25));
+        assert!(card.card().flyer_sound.is_empty());
+        assert_eq!(card.card().status_value()["flyer"]["input3"], true);
     }
 
     #[test]
     fn the_outputs_are_black_and_silent_until_the_switcher_drives_the_card() {
-        use crate::flyer::link::{FieldSource, FlyerLink};
         let link = FlyerLink::new();
         let mut card = Toaster::new();
-        card.set_flyer_link(std::sync::Arc::clone(&link));
+        card.set_flyer_link(Arc::clone(&link));
         let white = u32::from_le_bytes([255, 255, 255, 255]);
         link.set_routing(true, false);
         link.show(0, FieldSource::Matte(white));
         // Both buses on input 3, which the Flyer shows white.
-        card.elh[ELH_EH0 + 2].r = 0xA200;
-        card.elh[ELH_EH0 + 2].b = 0x0200;
+        card.card().elh[ELH_EH0 + 2].r = 0xA200;
+        card.card().elh[ELH_EH0 + 2].b = 0x0200;
         let program = |card: &Toaster| {
             let outputs = card.video_outputs();
             let (_, _, pixels) = outputs[1].snapshot().expect("a frame");
@@ -1299,7 +1923,7 @@ mod tests {
         };
         link.push_sound(&[(0.5, 0.25); 1470]);
         let sound = frame(&mut card);
-        assert!(!card.active);
+        assert!(!card.card().active);
         assert!(program(&card).iter().all(|&p| p == video::black()));
         assert!(!sound.is_empty() && sound.iter().all(|&(l, r)| l == 0.0 && r == 0.0));
         // The Flyer's sound from before is dropped, not played late.
@@ -1313,9 +1937,9 @@ mod tests {
             i: 0x0F00,
         });
         card.field_complete(&eh0.field(), BeamPos::default());
-        assert!(card.active);
-        card.elh[ELH_EH0 + 2].r = 0xA200;
-        card.elh[ELH_EH0 + 2].b = 0x0200;
+        assert!(card.card().active);
+        card.card().elh[ELH_EH0 + 2].r = 0xA200;
+        card.card().elh[ELH_EH0 + 2].b = 0x0200;
         link.push_sound(&[(0.5, 0.25); 1470]);
         let blank = Line::new(30);
         card.field_complete(&blank.field(), BeamPos::default());
@@ -1329,7 +1953,7 @@ mod tests {
     fn a_latch_effect_picks_each_pixel_source_from_the_amiga_colour() {
         // Picture row 1 is Amiga line AMIGA_LINE0 + 1.
         let mut line = Line::new(video::AMIGA_LINE0 + 1);
-        let x0 = Toaster::pixel0_column(&line.field());
+        let x0 = Card::pixel0_column(&line.field());
         // Picture column c is card pixel PICTURE_X0 + c.
         let at = |c: usize| x0 as usize + video::PICTURE_X0 + c;
         // Transparent (T) pixels latch: DV1 (code 4, r1) from picture
@@ -1346,6 +1970,113 @@ mod tests {
         assert_eq!(row[100], Some(2));
         assert_eq!(row[200], Some(1));
         assert_eq!(row[700], Some(1));
+    }
+
+    /// The fields of a short switcher session: a header line, framestore
+    /// writes, a bank flip and blank fields, each as a one-line canvas.
+    fn session_fields() -> Vec<Line> {
+        let mut fields = Vec::new();
+        let mut eh0 = Line::new(23);
+        eh0.header(Header {
+            r: 0x8000,
+            g: 0x0100,
+            b: 0xF000,
+            i: 0x0F00,
+        });
+        fields.push(eh0);
+        let bytes: Vec<u8> = (0..300).map(|k| 71 + (k % 129) as u8).collect();
+        for (vpos, g) in [(24, 0xC000u16), (25, 0x8000), (26, 0xE000), (27, 0xA000)] {
+            let mut data = Line::new(vpos);
+            data.header(Header {
+                r: 0xF000,
+                g,
+                b: (3u16 & 0xF) << 12,
+                i: 0,
+            });
+            for (k, &byte) in bytes.iter().enumerate() {
+                let nibble = if g & 0x4000 != 0 {
+                    byte >> 4
+                } else {
+                    byte & 0xF
+                };
+                data.card_pixel(12 + k, nibble);
+            }
+            fields.push(data);
+        }
+        for vpos in [30, 31, 40, 41] {
+            fields.push(Line::new(vpos));
+        }
+        fields
+    }
+
+    #[test]
+    fn fields_handed_to_the_compose_thread_give_the_outputs_of_fields_taken_at_once() {
+        let fields = session_fields();
+        // One card takes each field in before the next; the other is
+        // handed them all with the thread free to run behind.
+        let mut direct = Toaster::new();
+        let mut piped = Toaster::new();
+        let mut direct_sound = Vec::new();
+        let mut piped_sound = Vec::new();
+        for (k, line) in fields.iter().enumerate() {
+            let at = BeamPos {
+                frame: k as u64,
+                ..BeamPos::default()
+            };
+            direct.field_complete(&line.field(), at);
+            direct.take_audio(&mut direct_sound);
+            piped.submit(FieldInput::Owned(OwnedField::copy_of(&line.field())), at);
+            piped.take_audio(&mut piped_sound);
+        }
+        // Only frames whose fields are known finished have been taken.
+        assert!(piped_sound.len() < direct_sound.len());
+        piped.drain();
+        piped.take_audio(&mut piped_sound);
+        assert_eq!(direct_sound, piped_sound);
+        assert_eq!(direct.stats(), piped.stats());
+        assert_eq!(direct.card().elh, piped.card().elh);
+        assert_eq!(
+            direct.card().frame_store.data,
+            piped.card().frame_store.data
+        );
+        let program = |card: &Toaster| card.video_outputs()[1].snapshot().expect("a frame");
+        assert_eq!(program(&direct), program(&piped));
+        // The written line is in both.
+        assert_eq!(direct.frame_store_byte(0, false, 7, 12), 71);
+        assert_eq!(piped.frame_store_byte(0, false, 7, 12), 71);
+    }
+
+    #[test]
+    fn a_digitised_picture_is_encoded_when_the_bank_is_read() {
+        let mut toaster = Toaster::new();
+        let line = Line::new(30);
+        let mut card = toaster.card();
+        // IS = input 1 (unplugged: black), OBR clear: bank 0 records.
+        card.elh[ELH_EH0 + 1].r = 0x4000;
+        card.elh[ELH_EH0].r = 0x8000;
+        card.record_input(&line.field());
+        card.record_input(&line.field());
+        assert_eq!(card.stats.grabs_encoded, 0);
+        // Reading the bank encodes the latest picture, once.
+        let byte = card.frame_store_byte(0, false, 1, 12);
+        assert_eq!(card.stats.grabs_encoded, 1);
+        let mut n = [0u8; 752];
+        let mut c = [0u8; 752];
+        composite::encode_line(&[video::black(); 752], 0, &mut n, &mut c);
+        assert_eq!(byte, n[0]);
+        assert_eq!(card.frame_store_byte(0, true, 480, 700), c[688]);
+        assert_eq!(card.stats.grabs_encoded, 1);
+        // The other bank was not touched.
+        assert_eq!(card.frame_store_byte(1, false, 1, 12), 0);
+        // A write to the bank lands over the digitised picture, as it would
+        // have had the picture been encoded at once: the written line is
+        // the Amiga's, the others the picture's.
+        card.record_input(&line.field());
+        drop(card);
+        write_line(&mut toaster, false, 1, &[9, 8, 7]);
+        assert_eq!(toaster.frame_store_byte(0, false, 1, 12), 9);
+        assert_eq!(toaster.frame_store_byte(0, false, 3, 15), n[3]);
+        assert_eq!(toaster.stats().grabs_encoded, 2);
     }
 
     impl Line {
@@ -1396,7 +2127,7 @@ mod tests {
 
         /// Put nibble `v` on card pixel `p`.
         fn card_pixel(&mut self, p: usize, v: u8) {
-            let col = (Toaster::pixel0_column(&self.field()) + p as i64) as usize;
+            let col = (Card::pixel0_column(&self.field()) + p as i64) as usize;
             self.pixels[col] = Self::wire(v);
         }
 
@@ -1479,6 +2210,7 @@ mod tests {
         let bytes: Vec<u8> = (0..756).map(|k| 71 + (k % 129) as u8).collect();
         write_line_pass(&mut card, false, 100, &bytes, true, 0);
         write_line_pass(&mut card, false, 100, &bytes, false, 16);
+        let card = card.card();
         let stored = card.frame_store.line(0, false, 100);
         for k in [0usize, 4, 15, 16, 300, 731, 739] {
             assert_eq!(stored[12 + k], bytes[k], "sample {}", 12 + k);
@@ -1490,7 +2222,7 @@ mod tests {
         let mut card = Toaster::new();
         let ramp: Vec<u8> = (71..=200).collect();
         write_line(&mut card, false, 504, &ramp);
-        assert!(card.active);
+        assert!(card.card().active);
         assert_eq!(card.frame_store_byte(0, false, 504, 12), 71);
         assert_eq!(card.frame_store_byte(0, true, 504, 13), 72);
 
@@ -1515,14 +2247,14 @@ mod tests {
         let expected: Vec<u8> = (0..10).map(|i| 71 + 4 * i).collect();
         let got: Vec<u8> = [58, 75, 93, 111, 129, 147, 166, 183, 201, 216]
             .into_iter()
-            .map(|h| card.port_byte(&read.field(), at(h)).unwrap())
+            .map(|h| card.card().port_byte(&read.field(), at(h)).unwrap())
             .collect();
         assert_eq!(got, expected);
         // Five clocks later (the CIA access's E-clock slip) still reads
         // the same labels.
         let late: Vec<u8> = [63, 80, 98, 116, 134, 152, 171, 188, 206, 221]
             .into_iter()
-            .map(|h| card.port_byte(&read.field(), at(h)).unwrap())
+            .map(|h| card.card().port_byte(&read.field(), at(h)).unwrap())
             .collect();
         assert_eq!(late, expected);
         // Pixel 1 of each quad, from the complemented copy.
@@ -1530,7 +2262,7 @@ mod tests {
         read.header(read_request(504, 1, true));
         read.labels(3);
         assert_eq!(
-            card.port_byte(
+            card.card().port_byte(
                 &read.field(),
                 BeamPos {
                     vpos: 25,
@@ -1556,7 +2288,7 @@ mod tests {
         read.header(read_request(100, 0, false));
         read.labels(3);
         assert_eq!(
-            card.port_byte(
+            card.card().port_byte(
                 &read.field(),
                 BeamPos {
                     vpos: 24,

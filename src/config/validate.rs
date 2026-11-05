@@ -362,6 +362,23 @@ impl TryFrom<RawConfig> for Config {
                     }
                 },
             },
+            live_lead_ms: match raw.audio.live_lead_ms {
+                None => defaults.audio.live_lead_ms,
+                Some(v)
+                    if (crate::audio::MIN_LIVE_LEAD_MS..=crate::audio::MAX_LIVE_LEAD_MS)
+                        .contains(&v) =>
+                {
+                    v
+                }
+                Some(v) => {
+                    errors.push(anyhow!(
+                        "[audio] live_lead_ms must be {}-{}, got {v}",
+                        crate::audio::MIN_LIVE_LEAD_MS,
+                        crate::audio::MAX_LIVE_LEAD_MS
+                    ));
+                    defaults.audio.live_lead_ms
+                }
+            },
         };
         let (floppy, floppy_connected, floppy_playlists) =
             parse_floppy(raw.floppy, defaults.floppy_connected)?;

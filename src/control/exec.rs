@@ -3753,8 +3753,8 @@ pub fn exec_core(emu: &mut Emulator, ctx: &mut SessionCtx, op: &CoreOp) -> Resul
         }
         CoreOp::ToasterStatus => {
             let card = emu
-                .bus()
-                .video_slot()
+                .bus_mut()
+                .video_slot_mut()
                 .ok_or_else(|| CtlError::unsupported(NO_CARD))?;
             Ok(json!({"card": card.name(), "state": card.control_status()}))
         }

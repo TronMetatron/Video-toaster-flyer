@@ -605,7 +605,15 @@ painted by the same `render_from_input` the display uses:
   promoted the capture, `Bus::notify_video_slot_field_complete` renders the
   finished field once more on the main thread and passes it to
   `VideoSlotDevice::field_complete`. A card that does not need it opts out
-  with `wants_completed_fields`, which skips the extra render.
+  with `wants_completed_fields`, which skips the extra render. A card that
+  answers `takes_render_input` is handed the frame's `RenderInput` bundle
+  instead (`field_render_input`) and paints the field itself, on a thread
+  of its own (the Toaster, below): the bus refills a bundle the card gave
+  back (`take_spent_render_inputs`, `RenderInput::refill_from_bus`) rather
+  than allocating one per field, and the card lets go of the bundle's
+  shared chip-RAM snapshot as soon as it has painted
+  (`release_shared_buffers`), so the capture side gets the allocation back
+  at the next wrap as it does from the display's renderer.
 - **The field in progress.** A card that reacts within the same field gets
   a `LiveField` on every guest read of `$BFE101`. Its `pixels()` call
   renders the beam's own line, and `line(v)` any line above the beam, from
@@ -736,7 +744,76 @@ workers wait and the card publishes black, silent frames
 (`produce_idle_outputs`): the power-on mux settings select inputs nobody
 chose, and nothing need be decoded while the machine boots. The outputs are published per frame into `videoslot::CardOutput`s,
 which the window layer shows as monitor windows (`card_monitors.rs`) and
-which record themselves (ZMBV AVI, via `recorder.rs`) when asked. A video
+which record themselves (ZMBV AVI, via `recorder.rs`) when asked.
+
+##### The compose thread
+
+Painting the card's view of a field (`render_wide`, about 7 ms on a
+2.3 GHz Xeon), reading its headers, decoding framestore banks, keying,
+mixing and publishing took 15-30 ms of the emulation thread per frame,
+more with a digital effect (another 6 ms a field of composite encoding
+for as long as the switcher leaves the digitiser live afterwards), which
+is a large part of what made a transition cost more than a cut; the rest
+is the switcher's own chip-bus traffic while an effect runs, which the
+machine pays as the real one did. `Toaster` is now a handle: the card proper
+is a `Card` behind a mutex, shared with a `toaster-compose` thread, and a
+finished field reaches it as a job (`Job`: the frame's `RenderInput`, the
+beam at the wrap, how many lines the live scan already took, and what the
+Flyer did during the field). The thread paints the field, takes its lines
+in (`Card::take_field`: the headers, framestore writes and `CERB` lines
+from `first_unscanned` on), and on the second field of a frame composes
+and publishes the outputs. The emulation thread's part of a field is the
+hand-over (`Toaster::submit`, well under a millisecond).
+
+The guest must not be able to tell. The rules that keep the machine
+deterministic whatever the host's speed:
+
+- *Order.* Jobs run in order on one thread, so the card's registers and
+  framestore go through the same sequence of states as they did when every
+  field was taken at once.
+- *Joins.* Anything read on the emulation thread -- a parallel-port read
+  (`scan_to_beam`, `port_byte`), the control protocol's status, the
+  tests' look inside -- goes through `Toaster::card()`, which first waits
+  for every job handed over so far (`Pipe::drain`). The switcher reads
+  the port only for read-back and calibration, so the wait is rare.
+- *Depth.* `Toaster::submit` waits for a job only when the thread is
+  `PIPELINE_DEPTH` (two) fields behind, which is the slack the thread has
+  before the machine pauses for it (`compose_wait` in the
+  `COPPERLINE_DIAG_TOASTER=perf` log).
+- *Sound.* A frame's sound is produced on the thread but taken by the bus
+  (`take_audio`, right after each field's hand-over) only from jobs known
+  finished at that point: with the depth of two, a frame's sound reaches
+  Paula's mixer two fields after its own on every run, early or late, so a
+  `--audio-wav` capture is the same byte for byte. The ring in Paula
+  (`VideoSlotAudioRing`) absorbs the fixed offset as it absorbs the frame
+  rate mismatch.
+- *The Flyer.* The thread never reads the Flyer's link at its own pace.
+  What each channel showed since the last field (`FlyerLink::take_shown`,
+  compressed to what the next weave needs by `push_shown`), the routing and
+  the sound since the last field are taken on the emulation thread at the
+  hand-over and travel with the job; the thread weaves them in order
+  (`weave_shown`). The peak of Program's sound (the Flyer's record meters,
+  which the guest reads) goes back to the link when the job that produced
+  it is joined, not when it finished.
+
+Without a thread (`wasm`, a spawn that failed) jobs run on the calling
+thread through the same code, and `field_complete` (the painted-field
+entry, which the tests use) hands a copy of the field over and waits for
+it, so a card driven that way behaves as it always did.
+
+Three more things cut what the thread does per frame. The framestore
+banks' decoded pictures are kept across frames and dropped only when the
+bank is written (`Video::invalidate`), so a digital effect flying a still
+framestore decodes it once, not every frame. A picture the card digitises
+(`CERB` lines outside a write: a grab, or the live input every field after
+a digital effect) is kept as the picture and encoded into the bank only
+when something reads it -- the port, a bank decode, a write to the bank
+(`Card::settle`): the bank holds the same bytes either way, and a live
+input that nothing reads back costs a picture copy per field instead of a
+composite encode. And the per-pixel passes reuse their buffers
+(`Video::take_picture`), weigh the three guns of a mix two at a time in
+16-bit lanes (`video::blend`, exact against the per-gun formula) and apply
+a digital effect's map a quad at a time (`DveMap::apply`). A video
 file's sound is decoded by a second ffmpeg (stereo s16le at the mixer's
 44.1 kHz, 1001/30000 s per frame) and travels with each picture; Program's
 sound is the sum of the inputs by how much of each it shows (A·(1−k̄) +

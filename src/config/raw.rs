@@ -1685,6 +1685,9 @@ pub(crate) struct RawAudio {
     /// `--audio-stems` runs that don't pass `--audio-stems-mode` explicitly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stem_granularity: Option<String>,
+    /// Milliseconds of sound kept ahead of the host's output device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) live_lead_ms: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]

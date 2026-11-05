@@ -238,6 +238,34 @@ pub trait VideoSlotDevice: Send {
     /// next field).
     fn field_complete(&mut self, _field: &FieldPixels<'_>, _at: BeamPos) {}
 
+    /// Whether the device paints completed fields itself from the frame's
+    /// render input ([`Self::field_render_input`]) instead of taking them
+    /// painted ([`Self::field_complete`]): a card that does its work on a
+    /// thread of its own takes the input, and the bus skips the paint.
+    fn takes_render_input(&self) -> bool {
+        false
+    }
+
+    /// A field just finished, as the bundle the display renders it from
+    /// (`bitplane::render_wide` with [`SLOT_FIRST_CCK`] and
+    /// [`SLOT_LINE_CCK`] paints the card's view of it). `at` is the beam at
+    /// the wrap. The device gives the bundle back through
+    /// [`Self::take_spent_render_inputs`] once it is done with it.
+    fn field_render_input(
+        &mut self,
+        _input: Box<crate::video::bitplane::RenderInput>,
+        _at: BeamPos,
+    ) {
+    }
+
+    /// Render inputs the device is done with, moved into `pool` for the
+    /// bus to refill.
+    fn take_spent_render_inputs(
+        &mut self,
+        _pool: &mut Vec<Box<crate::video::bitplane::RenderInput>>,
+    ) {
+    }
+
     /// Drive the parallel data pins for one guest read of `$BFE101`.
     /// `Some(byte)` replaces what the guest reads (before the parallel-port
     /// peripheral and joystick adapter are consulted); `None` leaves the
@@ -271,7 +299,7 @@ pub trait VideoSlotDevice: Send {
     /// What the card is doing, for the control protocol's
     /// `toaster.status`: the sources on its outputs, its inputs, its host
     /// folders. Null for a card with nothing to report.
-    fn control_status(&self) -> serde_json::Value {
+    fn control_status(&mut self) -> serde_json::Value {
         serde_json::Value::Null
     }
 

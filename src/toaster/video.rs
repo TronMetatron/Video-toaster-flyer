@@ -50,15 +50,18 @@ pub struct Video {
     preview: Arc<CardOutput>,
     /// The host folder the connectors live in.
     media_root: Option<PathBuf>,
-    /// Program's sound not yet taken by the bus.
-    audio_out: Vec<(f32, f32)>,
     /// Fractional mixer samples carried between frames.
     audio_carry: f64,
-    /// Pictures decoded from the two framestore banks this frame (lazily).
+    /// Pictures decoded from the two framestore banks, kept until the
+    /// bank is written ([`Self::invalidate`]): the picture part, and the
+    /// lines below it a digital effect can reach.
     decoded: [Option<Vec<u32>>; 2],
+    /// How many bank decodes there have been (tests).
+    decodes: u64,
     /// The two fields of a frame: outputs publish on the second.
     odd_field: bool,
-    scratch: Vec<u32>,
+    /// Picture-sized buffers between uses ([`Self::take_picture`]).
+    pool: Vec<Vec<u32>>,
     /// The last Program frame, for the IS mux's feedback position.
     last_program: Vec<u32>,
     /// Digitising the input this field (live DVE).
@@ -100,11 +103,11 @@ impl Video {
             program: CardOutput::new("Program", ASPECT, output_dir.clone()),
             preview: CardOutput::new("Preview", ASPECT, output_dir),
             media_root: root,
-            audio_out: Vec::new(),
             audio_carry: 0.0,
             decoded: [None, None],
+            decodes: 0,
             odd_field: false,
-            scratch: Vec::new(),
+            pool: Vec::new(),
             last_program: Vec::new(),
             live: false,
             noise: 0x1234_5678,
@@ -192,7 +195,6 @@ impl Video {
     /// Start a field: `true` when it completes a frame.
     pub fn begin_field(&mut self) -> bool {
         self.odd_field = !self.odd_field;
-        self.decoded = [None, None];
         if !self.odd_field {
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             for input in &mut self.inputs {
@@ -203,36 +205,42 @@ impl Video {
         false
     }
 
-    /// Decode framestore bank `bank` to a picture, once per field.
-    pub fn framestore_picture(&mut self, store: &super::FrameStore, bank: usize) -> &[u32] {
+    /// Decode framestore bank `bank` to a picture: `PICTURE_H` rows, or
+    /// with `below` every row to the end of the bank (a digital effect
+    /// reaches the lines below the picture, where the switcher keeps its
+    /// border colour). Decoded once, and kept until the bank is written.
+    pub fn framestore_picture(
+        &mut self,
+        store: &super::FrameStore,
+        bank: usize,
+        below: bool,
+    ) -> &[u32] {
+        let rows = if below {
+            super::LINES - PICTURE_LINE0
+        } else {
+            PICTURE_H
+        };
         let slot = &mut self.decoded[bank & 1];
-        if slot.is_none() {
-            let mut pic = vec![black(); PICTURE_W * PICTURE_H];
-            for y in 0..PICTURE_H {
+        let have = slot.as_ref().map_or(0, |p| p.len() / PICTURE_W);
+        if have < rows {
+            let mut pic = slot.take().unwrap_or_default();
+            pic.resize(rows * PICTURE_W, black());
+            for y in have..rows {
                 let fl = PICTURE_LINE0 + y;
                 let n = &store.line(bank, false, fl)[PICTURE_X0..PICTURE_X0 + PICTURE_W];
                 let c = &store.line(bank, true, fl)[PICTURE_X0..PICTURE_X0 + PICTURE_W];
                 composite::decode_line(n, c, y, &mut pic[y * PICTURE_W..(y + 1) * PICTURE_W]);
             }
+            self.decodes += 1;
             *slot = Some(pic);
         }
-        slot.as_deref().unwrap_or(&[])
+        let pic = slot.as_deref().unwrap_or(&[]);
+        &pic[..(rows * PICTURE_W).min(pic.len())]
     }
 
-    /// Framestore lines below the picture (`PICTURE_LINE0 + PICTURE_H` to
-    /// the end of the bank), decoded like the picture. A digital effect
-    /// reaches them: the switcher keeps its border colour there.
-    pub fn framestore_below(store: &super::FrameStore, bank: usize) -> Vec<u32> {
-        let rows = super::LINES - PICTURE_LINE0 - PICTURE_H;
-        let mut pic = vec![black(); PICTURE_W * rows];
-        for (i, out) in pic.chunks_exact_mut(PICTURE_W).enumerate() {
-            let y = PICTURE_H + i;
-            let fl = PICTURE_LINE0 + y;
-            let n = &store.line(bank, false, fl)[PICTURE_X0..PICTURE_X0 + PICTURE_W];
-            let c = &store.line(bank, true, fl)[PICTURE_X0..PICTURE_X0 + PICTURE_W];
-            composite::decode_line(n, c, y, out);
-        }
-        pic
+    /// Bank decodes so far (tests).
+    pub fn decodes(&self) -> u64 {
+        self.decodes
     }
 
     /// Digitise a picture into framestore bank `bank` (a grab).
@@ -248,9 +256,7 @@ impl Video {
         }
     }
 
-    /// Publish a finished Program and Preview frame.
     /// Publish a frame of each output, with the sound that goes with it.
-    /// Program's sound also goes to the host's speakers ([`Self::take_audio`]).
     pub fn publish(
         &mut self,
         program: &[u32],
@@ -272,20 +278,8 @@ impl Video {
             FRAME_SECONDS,
             Some(preview_sound),
         );
-        // Bounded: if nothing drains it (no bus), keep the last second.
-        self.audio_out.extend_from_slice(program_sound);
-        let cap = crate::audio::MIX_SAMPLE_RATE as usize;
-        if self.audio_out.len() > cap {
-            let excess = self.audio_out.len() - cap;
-            self.audio_out.drain(..excess);
-        }
         self.last_program.clear();
         self.last_program.extend_from_slice(program);
-    }
-
-    /// Program's sound since the last call.
-    pub fn take_audio(&mut self, out: &mut Vec<(f32, f32)>) {
-        out.append(&mut self.audio_out);
     }
 
     /// This frame's length in mixer samples: the emulated Amiga frame's
@@ -335,6 +329,22 @@ impl Video {
         self.decoded[bank & 1] = None;
     }
 
+    /// A picture-sized buffer (`PICTURE_W * PICTURE_H`), from the pool or
+    /// new. Its contents are whatever they were: every use writes every
+    /// pixel.
+    pub fn take_picture(&mut self) -> Vec<u32> {
+        let mut p = self.pool.pop().unwrap_or_default();
+        p.resize(PICTURE_W * PICTURE_H, black());
+        p
+    }
+
+    /// Return a buffer from [`Self::take_picture`].
+    pub fn give_back(&mut self, p: Vec<u32>) {
+        if self.pool.len() < 12 {
+            self.pool.push(p);
+        }
+    }
+
     /// Snow: the matte generator's noise.
     pub fn snow(&mut self, out: &mut [u32]) {
         let mut x = self.noise;
@@ -346,17 +356,6 @@ impl Video {
             *px = u32::from_le_bytes([v, v, v, 0xFF]);
         }
         self.noise = x;
-    }
-
-    pub fn scratch(&mut self) -> Vec<u32> {
-        let mut s = std::mem::take(&mut self.scratch);
-        s.clear();
-        s.resize(PICTURE_W * PICTURE_H, black());
-        s
-    }
-
-    pub fn give_back(&mut self, s: Vec<u32>) {
-        self.scratch = s;
     }
 }
 
@@ -371,47 +370,57 @@ pub enum Role {
 
 /// The fader's mix: one value for the picture, or one per pixel
 /// (0 = the A bus, 255 = the B bus).
-pub enum Key {
+pub enum Key<'a> {
     Flat(u8),
-    Map(Vec<u8>),
+    Map(&'a [u8]),
 }
 
-impl Key {
+impl Key<'_> {
     /// The average mix, 0-255: how much of B the picture shows.
     pub fn mean(&self) -> f32 {
         match self {
             Key::Flat(k) => f32::from(*k),
-            Key::Map(m) if m.is_empty() => 0.0,
+            Key::Map([]) => 0.0,
             Key::Map(m) => m.iter().map(|&k| u64::from(k)).sum::<u64>() as f32 / m.len() as f32,
         }
     }
 }
 
-/// Program = A·(1−k) + B·k.
-pub fn mix(a: &[u32], b: &[u32], key: &Key, out: &mut [u32]) {
-    let blend = |pa: u32, pb: u32, k: u8| -> u32 {
-        match k {
-            0 => pa,
-            255 => pb,
-            _ => {
-                let k = u32::from(k);
-                let [ar, ag, ab, _] = pa.to_le_bytes();
-                let [br, bg, bb, _] = pb.to_le_bytes();
-                let m = |x: u8, y: u8| {
-                    ((u32::from(x) * (255 - k) + u32::from(y) * k + 127) / 255) as u8
-                };
-                u32::from_le_bytes([m(ar, br), m(ag, bg), m(ab, bb), 0xFF])
-            }
+/// One pixel of Program = A·(1−k) + B·k, each gun rounded to nearest:
+/// `(a·(255−k) + b·k + 127) / 255`. The three guns are weighed two at a
+/// time in 16-bit lanes; `(t + (t >> 8)) >> 8` with `t = x + 128` is that
+/// division exactly for every `x` a lane can hold.
+#[inline]
+pub fn blend(pa: u32, pb: u32, k: u8) -> u32 {
+    match k {
+        0 => pa,
+        255 => pb,
+        _ => {
+            let (k, nk) = (u32::from(k), 255 - u32::from(k));
+            let lanes = |x: u32| {
+                let t = x + 0x0080_0080;
+                ((t + ((t >> 8) & 0x00FF_00FF)) >> 8) & 0x00FF_00FF
+            };
+            // Red and blue in the low halves of two lanes, green in one.
+            let rb = lanes((pa & 0x00FF_00FF) * nk + (pb & 0x00FF_00FF) * k);
+            let g = lanes(((pa >> 8) & 0xFF) * nk + ((pb >> 8) & 0xFF) * k);
+            rb | (g << 8) | 0xFF00_0000
         }
-    };
+    }
+}
+
+/// Program = A·(1−k) + B·k.
+pub fn mix(a: &[u32], b: &[u32], key: &Key<'_>, out: &mut [u32]) {
     match key {
+        Key::Flat(0) => out.copy_from_slice(&a[..out.len()]),
+        Key::Flat(255) => out.copy_from_slice(&b[..out.len()]),
         Key::Flat(k) => {
             for ((o, &pa), &pb) in out.iter_mut().zip(a).zip(b) {
                 *o = blend(pa, pb, *k);
             }
         }
         Key::Map(map) => {
-            for (((o, &pa), &pb), &k) in out.iter_mut().zip(a).zip(b).zip(map) {
+            for (((o, &pa), &pb), &k) in out.iter_mut().zip(a).zip(b).zip(map.iter()) {
                 *o = blend(pa, pb, k);
             }
         }
@@ -434,19 +443,18 @@ pub fn to_mono(pic: &mut [u32]) {
 /// A luma key on `src`: with `key_black`, what is darker than the clip
 /// shows the A bus (the background) and the rest the B bus (the fill);
 /// keying on white, the other way round. A soft edge of a few levels.
-pub fn luma_key(src: &[u32], clip: u8, key_black: bool) -> Vec<u8> {
+pub fn luma_key_into(src: &[u32], clip: u8, key_black: bool, out: &mut Vec<u8>) {
     const SOFT: f32 = 12.0;
     let clip = f32::from(clip);
-    src.iter()
-        .map(|&px| {
-            let d = if key_black {
-                luma(px) - clip
-            } else {
-                clip - luma(px)
-            };
-            ((d / SOFT + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8
-        })
-        .collect()
+    out.clear();
+    out.extend(src.iter().map(|&px| {
+        let d = if key_black {
+            luma(px) - clip
+        } else {
+            clip - luma(px)
+        };
+        ((d / SOFT + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8
+    }));
 }
 
 /// The Amiga pixels over picture row `y`: the line whose header addresses
@@ -499,7 +507,15 @@ pub fn amiga_picture(field: &FieldPixels<'_>, x0: i64, out: &mut [u32]) {
 /// in the muxes' numbering (`LatchLUT`, animfxhandler.a); other pixels
 /// keep the source last set on the line. `None` before the first.
 pub fn latch_codes(field: &FieldPixels<'_>, x0: i64) -> Vec<Option<u8>> {
-    let mut codes = vec![None; PICTURE_W * PICTURE_H];
+    let mut codes = Vec::new();
+    latch_codes_into(field, x0, &mut codes);
+    codes
+}
+
+/// [`latch_codes`] into a buffer kept between frames.
+pub fn latch_codes_into(field: &FieldPixels<'_>, x0: i64, codes: &mut Vec<Option<u8>>) {
+    codes.clear();
+    codes.resize(PICTURE_W * PICTURE_H, None);
     for (y, line) in codes.chunks_exact_mut(PICTURE_W).enumerate() {
         let Some(row) = amiga_row(field, x0, y) else {
             continue;
@@ -515,13 +531,13 @@ pub fn latch_codes(field: &FieldPixels<'_>, x0: i64) -> Vec<Option<u8>> {
             *slot = held;
         }
     }
-    codes
 }
 
 /// A per-pixel fader mix from the Amiga's control bits (the AGA low
 /// nibbles), for the modes that take one.
-pub fn amiga_key(field: &FieldPixels<'_>, x0: i64, mode: Cds, cd: u8) -> Vec<u8> {
-    let mut key = vec![0u8; PICTURE_W * PICTURE_H];
+pub fn amiga_key_into(field: &FieldPixels<'_>, x0: i64, mode: Cds, cd: u8, key: &mut Vec<u8>) {
+    key.clear();
+    key.resize(PICTURE_W * PICTURE_H, 0);
     for (y, line) in key.chunks_exact_mut(PICTURE_W).enumerate() {
         let Some(row) = amiga_row(field, x0, y) else {
             continue;
@@ -554,7 +570,6 @@ pub fn amiga_key(field: &FieldPixels<'_>, x0: i64, mode: Cds, cd: u8) -> Vec<u8>
             *slot = k.min(255) as u8;
         }
     }
-    key
 }
 
 /// USERON: the switcher's interface over the Preview output, where its
@@ -606,4 +621,70 @@ pub fn matte_colour(ma: u8, mb: u8, mp: u8) -> u32 {
     let b = y - 1.106 * i + 1.703 * q;
     let c8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     rgb(c8(r), c8(g), c8(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mix as a plain formula, per gun.
+    fn blend_reference(pa: u32, pb: u32, k: u8) -> u32 {
+        match k {
+            0 => pa,
+            255 => pb,
+            _ => {
+                let k = u32::from(k);
+                let [ar, ag, ab, _] = pa.to_le_bytes();
+                let [br, bg, bb, _] = pb.to_le_bytes();
+                let m = |x: u8, y: u8| {
+                    ((u32::from(x) * (255 - k) + u32::from(y) * k + 127) / 255) as u8
+                };
+                u32::from_le_bytes([m(ar, br), m(ag, bg), m(ab, bb), 0xFF])
+            }
+        }
+    }
+
+    #[test]
+    fn the_packed_blend_rounds_every_gun_like_the_formula() {
+        for k in 0..=255u8 {
+            for x in (0..=255u32).step_by(3) {
+                for y in (0..=255u32).step_by(5) {
+                    // Each gun gets a different pair, so a carry between
+                    // lanes would show.
+                    let pa = u32::from_le_bytes([x as u8, (255 - x) as u8, (x * 7 % 256) as u8, 0]);
+                    let pb = u32::from_le_bytes([y as u8, (y * 3 % 256) as u8, (255 - y) as u8, 0]);
+                    let want = blend_reference(pa, pb, k);
+                    assert_eq!(blend(pa, pb, k), want, "k={k} a={pa:08X} b={pb:08X}");
+                }
+            }
+        }
+        // Every value of one gun against every key, exactly.
+        for k in 1..=254u8 {
+            for x in 0..=255u32 {
+                let pa = u32::from_le_bytes([x as u8, 0, x as u8, 0xFF]);
+                let pb = u32::from_le_bytes([255 - x as u8, 0, 0, 0xFF]);
+                assert_eq!(blend(pa, pb, k), blend_reference(pa, pb, k));
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_key_at_either_end_is_a_copy() {
+        let a: Vec<u32> = (0..8u32).map(|i| (i * 0x0102_0304) | 0xFF00_0000).collect();
+        let b: Vec<u32> = (0..8u32).map(|i| (i * 0x0403_0201) | 0xFF00_0000).collect();
+        let mut out = vec![0; 8];
+        mix(&a, &b, &Key::Flat(0), &mut out);
+        assert_eq!(out, a);
+        mix(&a, &b, &Key::Flat(255), &mut out);
+        assert_eq!(out, b);
+        mix(
+            &a,
+            &b,
+            &Key::Map(&[0, 255, 0, 255, 0, 255, 0, 255]),
+            &mut out,
+        );
+        for i in 0..8 {
+            assert_eq!(out[i], if i % 2 == 0 { a[i] } else { b[i] });
+        }
+    }
 }

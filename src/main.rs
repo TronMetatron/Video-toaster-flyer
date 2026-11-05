@@ -1136,6 +1136,7 @@ fn main() -> Result<()> {
     let audio: Box<dyn AudioSink> = if let Some(ref wav_path) = cli.audio_wav {
         Box::new(WavSink::new(wav_path)?)
     } else if live_audio {
+        copperline::audio::set_live_lead_ms(cfg.audio.live_lead_ms);
         Box::new(CpalSink::new(
             realtime_priority,
             cfg.audio.output_device.as_deref(),

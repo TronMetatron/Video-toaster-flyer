@@ -792,6 +792,10 @@ pub struct Bus {
     video_slot_fb: Vec<u32>,
     #[serde(skip)]
     video_slot_scratch: Vec<u32>,
+    /// Render inputs for a card that paints its own fields, refilled from
+    /// the frame each time round.
+    #[serde(skip)]
+    video_slot_inputs: Vec<Box<crate::video::bitplane::RenderInput>>,
     /// `[chipset] genlock`: a stand-alone genlock is fitted.
     #[serde(default)]
     genlock_configured: bool,
@@ -3779,6 +3783,7 @@ impl Bus {
             video_slot_live: Default::default(),
             video_slot_fb: Vec::new(),
             video_slot_scratch: Vec::new(),
+            video_slot_inputs: Vec::new(),
             genlock_configured: false,
             rtc: Rtc::default(),
             rtc_present: true,
@@ -6757,7 +6762,24 @@ impl Bus {
         let Some(mut device) = self.video_slot.take() else {
             return;
         };
-        if device.wants_completed_fields() && self.last_frame_render_base.is_some() {
+        if device.takes_render_input() && self.last_frame_render_base.is_some() {
+            // The card paints the field itself (on its own thread): hand
+            // it the frame's render input, in a bundle it used before
+            // where there is one, so the vectors are not reallocated.
+            device.take_spent_render_inputs(&mut self.video_slot_inputs);
+            self.video_slot_inputs.truncate(4);
+            let input = match self.video_slot_inputs.pop() {
+                Some(mut input) => {
+                    input.refill_from_bus(self);
+                    input
+                }
+                None => Box::new(crate::video::bitplane::RenderInput::from_bus(self)),
+            };
+            // The counter already moved on to the new field.
+            let mut at = self.video_slot_beam();
+            at.frame = at.frame.saturating_sub(1);
+            device.field_render_input(input, at);
+        } else if device.wants_completed_fields() && self.last_frame_render_base.is_some() {
             let mut fb = std::mem::take(&mut self.video_slot_fb);
             let mut scratch = std::mem::take(&mut self.video_slot_scratch);
             let mut input = crate::video::bitplane::RenderInput::from_bus(self);
