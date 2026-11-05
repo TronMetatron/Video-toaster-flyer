@@ -11,7 +11,9 @@ Support: [Patreon](https://www.patreon.com/cw/Copperline)
 > `main` branch of this repository is Copperline with an emulated NewTek
 > Video Toaster 4000 in the video slot (the real 4.2 switcher, CG, effects,
 > framestores and keys run on it) and a high-level emulation of the Video
-> Toaster Flyer. See [docs/toaster](docs/toaster/README.md) for the
+> Toaster Flyer, with `flyer-convert`, a window in the Toaster's style
+> that turns video, stills and picture sequences into Flyer clips. See
+> [docs/toaster](docs/toaster/README.md) for the
 > working specs, `docs/internals/video.md` (Toaster section) for how it is
 > built, and `docs/guide/configuration.md` (`[video_slot]`) for setting it
 > up. NewTek's software is not included.

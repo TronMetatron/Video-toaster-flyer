@@ -6,13 +6,21 @@
 //! A Flyer clip holds NTSC composite video (the Toaster framestore's 4fsc
 //! samples, 752 per line) coded field by field with VTASC, and 16-bit
 //! audio at 44.1 kHz x 1000/1001, all in colour frames of four fields
-//! (`flyerclip`, from NewTek's Flyer sources). Importing decodes the source
-//! with ffmpeg to 752 x 480 at 29.97 frames a second (4:3, letterboxed or
-//! pillarboxed like a Toaster input), encodes each frame's two fields as
-//! composite samples (fields I/II from one frame, III/IV, with the
-//! subcarrier inverted, from the next) and codes them. Exporting decodes
-//! the fields, separates luma and chroma per field, weaves each pair back
-//! into a frame and has ffmpeg write the file.
+//! (`flyerclip`, from NewTek's Flyer sources). Importing has ffmpeg square
+//! the source's pixels (anamorphic video keeps its shape), fit it to 4:3
+//! (letterboxed or pillarboxed like a Toaster input, cropped, or
+//! stretched) and scale it to 752 x 480, then encodes the fields as
+//! composite samples and codes them. By default each field is its own
+//! moment, 59.94 a second: interlaced sources are split into their
+//! fields, progressive ones sampled at the field rate (film gets 3:2
+//! pulldown), and fields I-IV take the even, odd, even and odd lines of
+//! four pictures in turn, III and IV with the subcarrier inverted (the
+//! framestore's complemented copy). [`Motion::Frames`] takes both fields
+//! of a frame from one picture instead. Stills are held for a set time and
+//! numbered pictures play at a set rate. A crouton icon (`<clip>.I`) can
+//! be written beside the clip. Exporting decodes the fields, separates
+//! luma and chroma per field, weaves each pair back into a frame and has
+//! ffmpeg write the file.
 
 use crate::toaster::composite;
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,15 +29,191 @@ use flyerclip::{Clip, ClipWriter, FrameVideo, Grade};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Samples per line, and the picture's lines.
 const W: usize = 752;
 const H: usize = 480;
-/// Video frames per second, and the Flyer's audio rate as ffmpeg takes it.
+/// Video frames and fields per second, and the Flyer's audio rate as
+/// ffmpeg takes them.
 const FPS: &str = "30000/1001";
+const FIELD_RATE: &str = "60000/1001";
 const AUDIO_RATE: u32 = 44056;
 /// Audio samples per channel per field, and fields per colour frame.
 const PER_FIELD: usize = flyerclip::audio::SAMPLES_PER_FIELD;
+
+/// How motion is sampled into the clip's fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Motion {
+    /// Every field its own moment, 59.94 a second, as a camera records
+    /// (interlaced sources are field-separated, film gets 3:2 pulldown).
+    #[default]
+    Fields,
+    /// Both fields of a frame from one picture, 29.97 frames a second.
+    Frames,
+}
+
+/// How a picture that is not 4:3 fills the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fit {
+    /// The whole picture, with black bars (a Toaster input's look).
+    #[default]
+    Letterbox,
+    /// The frame filled, the picture's edges cropped.
+    Fill,
+    /// The picture squeezed or stretched to 4:3.
+    Stretch,
+}
+
+/// What a source is, as far as ffmpeg's input goes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Input {
+    /// A video file (anything ffmpeg reads), with its sound.
+    Video(PathBuf),
+    /// A still picture, held for [`ImportOptions::still_seconds`].
+    Still(PathBuf),
+    /// Numbered pictures: an ffmpeg pattern (`dir/shot%04d.png`), the
+    /// first number and how many there are.
+    Sequence {
+        pattern: PathBuf,
+        start: u32,
+        count: u32,
+    },
+}
+
+/// File extensions taken as still pictures.
+pub const STILL_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "bmp", "tif", "tiff", "gif", "tga", "webp", "iff", "ilbm",
+];
+/// File extensions taken as video.
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "avi", "mkv", "webm", "mpg", "mpeg", "mts", "m2ts", "ts", "wmv", "flv",
+    "dv", "mxf", "3gp", "ogv", "vob", "anim",
+];
+
+fn ext_of(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+impl Input {
+    /// A file as a source: a still picture by its extension, else video.
+    pub fn of_file(path: &Path) -> Self {
+        if STILL_EXTENSIONS.contains(&ext_of(path).as_str()) {
+            Input::Still(path.to_path_buf())
+        } else {
+            Input::Video(path.to_path_buf())
+        }
+    }
+
+    /// The file or pattern the source is read from.
+    pub fn path(&self) -> &Path {
+        match self {
+            Input::Video(p) | Input::Still(p) => p,
+            Input::Sequence { pattern, .. } => pattern,
+        }
+    }
+
+    /// A name for the clip made from it.
+    pub fn stem(&self) -> String {
+        let p = match self {
+            Input::Sequence { pattern, .. } => pattern
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| pattern.clone()),
+            other => other.path().to_path_buf(),
+        };
+        p.file_stem()
+            .or_else(|| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Clip")
+            .to_string()
+    }
+
+    fn args(&self, options: &ImportOptions, cmd: &mut Command) {
+        match self {
+            Input::Video(p) => {
+                if let Some(t) = options.start_seconds.filter(|t| *t > 0.0) {
+                    cmd.args(["-ss", &format!("{t}")]);
+                }
+                cmd.arg("-i").arg(p);
+            }
+            Input::Still(p) => {
+                cmd.args(["-loop", "1", "-framerate", FIELD_RATE, "-i"])
+                    .arg(p);
+            }
+            Input::Sequence { pattern, start, .. } => {
+                cmd.args([
+                    "-framerate",
+                    &format!("{}", options.sequence_fps),
+                    "-start_number",
+                    &start.to_string(),
+                    "-i",
+                ])
+                .arg(pattern);
+            }
+        }
+    }
+
+    /// How long the clip made from it runs, in seconds, when that is
+    /// known without ffmpeg (a still or a sequence).
+    pub fn known_seconds(&self, options: &ImportOptions) -> Option<f64> {
+        match self {
+            Input::Video(_) => None,
+            Input::Still(_) => Some(options.still_seconds),
+            Input::Sequence { count, .. } => Some(f64::from(*count) / options.sequence_fps),
+        }
+    }
+}
+
+/// Numbered pictures in `dir`: the longest run sharing a name pattern,
+/// as an [`Input::Sequence`] (at least two pictures).
+pub fn find_sequence(dir: &Path) -> Option<Input> {
+    use std::collections::BTreeMap;
+    let mut runs: BTreeMap<(String, usize, String), Vec<u32>> = BTreeMap::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let ext = ext_of(&path);
+        if !STILL_EXTENSIONS.contains(&ext.as_str()) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let digits = stem.chars().rev().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            continue;
+        }
+        let (prefix, number) = stem.split_at(stem.len() - digits);
+        let Ok(n) = number.parse::<u32>() else {
+            continue;
+        };
+        let ext = path.extension()?.to_str()?.to_string();
+        runs.entry((prefix.to_string(), digits, ext))
+            .or_default()
+            .push(n);
+    }
+    let ((prefix, digits, ext), mut numbers) = runs.into_iter().max_by_key(|(_, v)| v.len())?;
+    if numbers.len() < 2 {
+        return None;
+    }
+    numbers.sort_unstable();
+    // ffmpeg reads from the first number until one is missing.
+    let start = numbers[0];
+    let count = numbers
+        .iter()
+        .enumerate()
+        .take_while(|(i, n)| **n == start + *i as u32)
+        .count() as u32;
+    Some(Input::Sequence {
+        pattern: dir.join(format!("{prefix}%0{digits}d.{ext}")),
+        start,
+        count,
+    })
+}
 
 /// How to import.
 #[derive(Clone, Debug)]
@@ -38,8 +222,25 @@ pub struct ImportOptions {
     pub grade: Grade,
     /// Keep the sound (stereo); off writes a silent, video-only clip.
     pub audio: bool,
+    /// The sound's two channels mixed to one, on both.
+    pub mono: bool,
+    /// Gain of the left and right channel, in dB.
+    pub gain_db: [f32; 2],
+    /// Start this far into the source.
+    pub start_seconds: Option<f64>,
     /// Stop after this many seconds of the source.
     pub max_seconds: Option<f64>,
+    pub motion: Motion,
+    pub fit: Fit,
+    /// How long a still picture runs.
+    pub still_seconds: f64,
+    /// Pictures a second of an image sequence.
+    pub sequence_fps: f64,
+    /// Also write the crouton icon (`<clip>.I`) the Toaster's Grazer
+    /// shows for it.
+    pub icon: bool,
+    /// Set from another thread to stop: the clip is not written.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for ImportOptions {
@@ -47,7 +248,74 @@ impl Default for ImportOptions {
         Self {
             grade: Grade::Std,
             audio: true,
+            mono: false,
+            gain_db: [0.0; 2],
+            start_seconds: None,
             max_seconds: None,
+            motion: Motion::Fields,
+            fit: Fit::Letterbox,
+            still_seconds: 5.0,
+            sequence_fps: 30000.0 / 1001.0,
+            icon: true,
+            cancel: None,
+        }
+    }
+}
+
+impl ImportOptions {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    /// The video filter: square the pixels, separate fields, fit 4:3,
+    /// then the Flyer's 752 samples by 480 lines at its rate.
+    fn video_filter(&self) -> String {
+        let deint = match self.motion {
+            Motion::Fields => "bwdif=mode=send_field:parity=auto:deint=interlaced",
+            Motion::Frames => "bwdif=mode=send_frame:parity=auto:deint=interlaced",
+        };
+        let fit = match self.fit {
+            Fit::Letterbox => {
+                "scale=640:480:force_original_aspect_ratio=decrease,\
+                 pad=640:480:(ow-iw)/2:(oh-ih)/2:black"
+            }
+            Fit::Fill => "scale=640:480:force_original_aspect_ratio=increase,crop=640:480",
+            Fit::Stretch => "scale=640:480",
+        };
+        let rate = match self.motion {
+            Motion::Fields => FIELD_RATE,
+            Motion::Frames => FPS,
+        };
+        format!(
+            "{deint},scale='trunc(iw*sar/2)*2':ih:flags=lanczos,setsar=1,{fit},\
+             scale={W}:{H}:flags=lanczos,fps={rate},format=rgba"
+        )
+    }
+
+    /// The sound filter: gain per channel, or both channels mixed.
+    fn audio_filter(&self) -> String {
+        let g = |db: f32| 10f32.powf(db / 20.0);
+        let (l, r) = (g(self.gain_db[0]), g(self.gain_db[1]));
+        if self.mono {
+            format!(
+                "pan=stereo|c0={:.4}*c0+{:.4}*c1|c1={:.4}*c0+{:.4}*c1",
+                l / 2.0,
+                l / 2.0,
+                r / 2.0,
+                r / 2.0
+            )
+        } else {
+            format!("pan=stereo|c0={l:.4}*c0|c1={r:.4}*c1")
+        }
+    }
+
+    /// Output-side limits: the run time.
+    fn duration(&self, input: &Input) -> Option<f64> {
+        match (input.known_seconds(self), self.max_seconds) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 }
@@ -64,6 +332,13 @@ pub struct Report {
     pub degraded_fields: usize,
     /// Fields cut at the size budget (their bottom lines are garbage).
     pub truncated_fields: usize,
+}
+
+/// Where a conversion has got to: colour frames written, and the
+/// latest picture (752 x 480 RGBA) every so often.
+pub struct Progress<'a> {
+    pub frames: usize,
+    pub picture: Option<&'a [u32]>,
 }
 
 /// ffmpeg: `COPPERLINE_FFMPEG`, then `search` (e.g. the Toaster files
@@ -89,14 +364,19 @@ fn command(ffmpeg: &Path) -> Command {
 
 /// The source's sound as interleaved stereo at the Flyer's rate; empty
 /// when it has none.
-fn read_audio(ffmpeg: &Path, input: &Path, max_seconds: Option<f64>) -> Result<Vec<i16>> {
+fn read_audio(ffmpeg: &Path, input: &Input, options: &ImportOptions) -> Result<Vec<i16>> {
+    if !matches!(input, Input::Video(_)) {
+        return Ok(Vec::new());
+    }
     let mut cmd = command(ffmpeg);
-    cmd.arg("-i").arg(input);
-    if let Some(t) = max_seconds {
+    input.args(options, &mut cmd);
+    if let Some(t) = options.duration(input) {
         cmd.args(["-t", &format!("{t}")]);
     }
     cmd.args([
         "-vn",
+        "-af",
+        &options.audio_filter(),
         "-ac",
         "2",
         "-ar",
@@ -116,37 +396,54 @@ fn read_audio(ffmpeg: &Path, input: &Path, max_seconds: Option<f64>) -> Result<V
         .collect())
 }
 
+/// One line of picture `p` (black past its end) as composite samples.
+fn encode_field(picture: &[u32], parity: usize, complemented_field: bool) -> Vec<Vec<u8>> {
+    let mut normal = vec![0u8; W];
+    let mut complemented = vec![0u8; W];
+    let black = vec![u32::from_le_bytes([0, 0, 0, 0xFF]); W];
+    (0..TOASTER_LINES)
+        .map(|y| {
+            let line = 2 * y + parity;
+            let row = if line < H {
+                &picture[line * W..(line + 1) * W]
+            } else {
+                &black[..]
+            };
+            composite::encode_line(row, line, &mut normal, &mut complemented);
+            if complemented_field {
+                complemented.clone()
+            } else {
+                normal.clone()
+            }
+        })
+        .collect()
+}
+
 /// The four fields of a colour frame from two pictures (`b` the later):
 /// I/II the even and odd lines of `a`, III/IV those of `b` with the
 /// subcarrier inverted (the framestore's complemented copy).
 fn colour_frame(a: &[u32], b: &[u32]) -> FrameVideo {
-    let mut normal = vec![0u8; W];
-    let mut complemented = vec![0u8; W];
-    let black = vec![u32::from_le_bytes([0, 0, 0, 0xFF]); W];
-    let mut fields: FrameVideo = Default::default();
-    for (f, field) in fields.iter_mut().enumerate() {
-        let picture = if f < 2 { a } else { b };
-        *field = (0..TOASTER_LINES)
-            .map(|y| {
-                let line = 2 * y + (f & 1);
-                let row = if line < H {
-                    &picture[line * W..(line + 1) * W]
-                } else {
-                    &black[..]
-                };
-                composite::encode_line(row, line, &mut normal, &mut complemented);
-                if f < 2 {
-                    normal.clone()
-                } else {
-                    complemented.clone()
-                }
-            })
-            .collect();
-    }
-    fields
+    [
+        encode_field(a, 0, false),
+        encode_field(a, 1, false),
+        encode_field(b, 0, true),
+        encode_field(b, 1, true),
+    ]
 }
 
-/// Convert a video file (anything ffmpeg reads) into a Flyer clip.
+/// The four fields of a colour frame from four pictures a field apart:
+/// each field the lines of its own moment.
+fn colour_frame_of_fields(p: [&[u32]; 4]) -> FrameVideo {
+    [
+        encode_field(p[0], 0, false),
+        encode_field(p[1], 1, false),
+        encode_field(p[2], 0, true),
+        encode_field(p[3], 1, true),
+    ]
+}
+
+/// Convert a video file (anything ffmpeg reads) into a Flyer clip: a
+/// still picture by its extension, else video.
 pub fn import(
     ffmpeg: &Path,
     input: &Path,
@@ -154,24 +451,48 @@ pub fn import(
     options: &ImportOptions,
     mut progress: impl FnMut(usize),
 ) -> Result<Report> {
+    import_input(
+        ffmpeg,
+        &Input::of_file(input),
+        output,
+        options,
+        |p: Progress<'_>| progress(p.frames),
+    )
+}
+
+/// Convert a source into a Flyer clip at `output` (and its crouton icon
+/// beside it when [`ImportOptions::icon`] is set).
+pub fn import_input(
+    ffmpeg: &Path,
+    input: &Input,
+    output: &Path,
+    options: &ImportOptions,
+    mut progress: impl FnMut(Progress<'_>),
+) -> Result<Report> {
     let audio = if options.audio {
-        read_audio(ffmpeg, input, options.max_seconds)?
+        read_audio(ffmpeg, input, options)?
     } else {
         Vec::new()
     };
     let channels: u8 = if audio.is_empty() { 0 } else { 2 };
+    if options.cancelled() {
+        bail!("stopped");
+    }
 
-    let filter = format!(
-        "scale=640:480:force_original_aspect_ratio=decrease,\
-         pad=640:480:(ow-iw)/2:(oh-ih)/2:black,scale={W}:{H},fps={FPS}"
-    );
     let mut cmd = command(ffmpeg);
-    cmd.arg("-i").arg(input);
-    if let Some(t) = options.max_seconds {
+    input.args(options, &mut cmd);
+    if let Some(t) = options.duration(input) {
         cmd.args(["-t", &format!("{t}")]);
     }
     cmd.args([
-        "-an", "-vf", &filter, "-pix_fmt", "rgba", "-f", "rawvideo", "-",
+        "-an",
+        "-vf",
+        &options.video_filter(),
+        "-pix_fmt",
+        "rgba",
+        "-f",
+        "rawvideo",
+        "-",
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -194,13 +515,36 @@ pub fn import(
         )
     };
     let per_frame = 4 * PER_FIELD * usize::from(channels);
-    while let Some(a) = read_picture(&mut stdout, &mut buf) {
-        // An odd last picture fills its colour frame on its own.
-        let (b, last) = match read_picture(&mut stdout, &mut buf) {
-            Some(b) => (b, false),
-            None => (a.clone(), true),
+    // Pictures per colour frame.
+    let take = match options.motion {
+        Motion::Fields => 4,
+        Motion::Frames => 2,
+    };
+    let mut icon_picture: Option<Vec<u32>> = None;
+    let mut stopped = false;
+    'frames: loop {
+        let mut pictures: Vec<Vec<u32>> = Vec::with_capacity(take);
+        while pictures.len() < take {
+            match read_picture(&mut stdout, &mut buf) {
+                Some(p) => pictures.push(p),
+                None => break,
+            }
+        }
+        if pictures.is_empty() {
+            break;
+        }
+        let last = pictures.len() < take;
+        // A short last colour frame repeats its last picture.
+        while pictures.len() < take {
+            let p = pictures[pictures.len() - 1].clone();
+            pictures.push(p);
+        }
+        let video = match options.motion {
+            Motion::Fields => {
+                colour_frame_of_fields([&pictures[0], &pictures[1], &pictures[2], &pictures[3]])
+            }
+            Motion::Frames => colour_frame(&pictures[0], &pictures[1]),
         };
-        let video = colour_frame(&a, &b);
         let start = report.frames * per_frame;
         let sound = (channels > 0).then(|| {
             let end = (start + per_frame).min(audio.len());
@@ -215,12 +559,29 @@ pub fn import(
             }
         }
         report.frames += 1;
-        progress(report.frames);
+        // The icon shows the picture a second in (15 colour frames), or
+        // the first for a shorter clip.
+        if report.frames == 1 || report.frames == 16 {
+            icon_picture = Some(pictures[0].clone());
+        }
+        progress(Progress {
+            frames: report.frames,
+            picture: (report.frames % 4 == 1).then_some(pictures[0].as_slice()),
+        });
+        if options.cancelled() {
+            stopped = true;
+            break 'frames;
+        }
         if last {
             break;
         }
     }
     drop(stdout);
+    if stopped {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("stopped");
+    }
     let status = child.wait()?;
     if report.frames == 0 {
         let mut err = String::new();
@@ -229,7 +590,7 @@ pub fn import(
         }
         bail!(
             "ffmpeg read no video from {} ({status}): {}",
-            input.display(),
+            input.path().display(),
             err.trim()
         );
     }
@@ -238,10 +599,279 @@ pub fn import(
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(output, &bytes).with_context(|| format!("writing {}", output.display()))?;
+    if options.icon {
+        if let Some(picture) = &icon_picture {
+            let icon = crouton_icon(picture);
+            let path = icon_path(output);
+            if let Err(e) = std::fs::write(&path, icon) {
+                log::warn!("writing {}: {e}", path.display());
+            }
+        }
+    }
     report.fields = (report.frames * 4) as u32;
     report.seconds = report.fields as f64 / 60.0 * 1.001;
     report.bytes = bytes.len() as u64;
     Ok(report)
+}
+
+/// The crouton icon file beside a clip: `<clip>.I`.
+pub fn icon_path(clip: &Path) -> PathBuf {
+    let mut name = clip.file_name().unwrap_or_default().to_os_string();
+    name.push(".I");
+    clip.with_file_name(name)
+}
+
+/// A clip's crouton icon as the Toaster's Grazer reads it: an 80 x 50,
+/// 64-colour ILBM with the crouton's bevel around a 70 x 40 picture
+/// (and the crouton data after it), as the switcher's own icon making
+/// leaves one. The bevel, its colours and the crouton data come from an
+/// icon the switcher made; the picture and colours 8-63 are `picture`'s
+/// (752 x 480 RGBA, 4:3).
+pub fn crouton_icon(picture: &[u32]) -> Vec<u8> {
+    const TEMPLATE: &[u8] = include_bytes!("../assets/toaster/clip-icon.I");
+    const IW: usize = 80;
+    const PLANES: usize = 6;
+    const ROW: usize = IW / 8;
+    const PX: usize = 5;
+    const PY: usize = 4;
+    const PW: usize = 70;
+    const PH: usize = 40;
+    const FIRST: usize = 8;
+    let mut icon = TEMPLATE.to_vec();
+    let find = |id: &[u8]| icon.windows(4).position(|w| w == id).map(|p| p + 8);
+    let (Some(cmap), Some(body)) = (find(b"CMAP"), find(b"BODY")) else {
+        return icon;
+    };
+    // The picture, box-filtered down to the icon's 70 x 40.
+    let mut small = vec![[0u8; 3]; PW * PH];
+    for (i, px) in small.iter_mut().enumerate() {
+        let (x, y) = (i % PW, i / PW);
+        let (x0, x1) = (x * W / PW, ((x + 1) * W / PW).max(x * W / PW + 1));
+        let (y0, y1) = (y * H / PH, ((y + 1) * H / PH).max(y * H / PH + 1));
+        let mut sum = [0u32; 3];
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let c = picture.get(yy * W + xx).copied().unwrap_or(0).to_le_bytes();
+                for k in 0..3 {
+                    sum[k] += u32::from(c[k]);
+                }
+            }
+        }
+        let n = ((x1 - x0) * (y1 - y0)) as u32;
+        *px = sum.map(|v| (v / n) as u8);
+    }
+    let palette = median_cut(&small, 64 - FIRST);
+    for (k, c) in palette.iter().enumerate() {
+        let at = cmap + (FIRST + k) * 3;
+        icon[at..at + 3].copy_from_slice(c);
+    }
+    // Black stays the bevel's colour 0 too.
+    let nearest = |c: [u8; 3]| -> usize {
+        let d = |p: [u8; 3]| {
+            (0..3)
+                .map(|k| (i32::from(c[k]) - i32::from(p[k])).pow(2))
+                .sum::<i32>()
+        };
+        let mut best = (d([0, 0, 0]), 0);
+        for (k, p) in palette.iter().enumerate() {
+            let e = d(*p);
+            if e < best.0 {
+                best = (e, FIRST + k);
+            }
+        }
+        best.1
+    };
+    for y in 0..PH {
+        for x in 0..PW {
+            let index = nearest(small[y * PW + x]);
+            let (ix, iy) = (PX + x, PY + y);
+            for plane in 0..PLANES {
+                let at = body + (iy * PLANES + plane) * ROW + ix / 8;
+                let bit = 0x80u8 >> (ix % 8);
+                if index >> plane & 1 != 0 {
+                    icon[at] |= bit;
+                } else {
+                    icon[at] &= !bit;
+                }
+            }
+        }
+    }
+    icon
+}
+
+/// Up to `n` colours standing for `pixels` (median cut).
+fn median_cut(pixels: &[[u8; 3]], n: usize) -> Vec<[u8; 3]> {
+    let mut boxes: Vec<Vec<[u8; 3]>> = vec![pixels.to_vec()];
+    while boxes.len() < n {
+        // Split the box with the widest channel range.
+        let widest = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() > 1)
+            .map(|(i, b)| {
+                let range = (0..3)
+                    .map(|k| {
+                        let (lo, hi) = b
+                            .iter()
+                            .fold((255u8, 0u8), |(lo, hi), p| (lo.min(p[k]), hi.max(p[k])));
+                        (hi - lo, k)
+                    })
+                    .max()
+                    .unwrap_or((0, 0));
+                (range, i)
+            })
+            .max();
+        let Some(((range, k), i)) = widest else {
+            break;
+        };
+        if range == 0 {
+            break;
+        }
+        let mut b = boxes.swap_remove(i);
+        b.sort_unstable_by_key(|p| p[k]);
+        let half = b.split_off(b.len() / 2);
+        boxes.push(b);
+        boxes.push(half);
+    }
+    boxes
+        .iter()
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let mut sum = [0u32; 3];
+            for p in b {
+                for k in 0..3 {
+                    sum[k] += u32::from(p[k]);
+                }
+            }
+            sum.map(|v| (v / b.len() as u32) as u8)
+        })
+        .collect()
+}
+
+/// What ffmpeg says of a source: its run time, picture size and rate,
+/// and whether it has sound.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Probe {
+    pub seconds: Option<f64>,
+    pub size: Option<(u32, u32)>,
+    pub fps: Option<f64>,
+    pub audio: bool,
+    pub interlaced: bool,
+}
+
+/// Ask ffmpeg about `input` (`ffmpeg -i`, read from its report).
+pub fn probe(ffmpeg: &Path, input: &Path) -> Result<Probe> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-nostdin", "-hide_banner", "-i"]).arg(input);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .context("running ffmpeg")?;
+    Ok(parse_probe(&String::from_utf8_lossy(&out.stderr)))
+}
+
+fn parse_probe(text: &str) -> Probe {
+    let mut p = Probe::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Duration: ") {
+            let t = rest.split(',').next().unwrap_or("");
+            let parts: Vec<f64> = t.split(':').filter_map(|v| v.parse().ok()).collect();
+            if parts.len() == 3 {
+                p.seconds = Some(parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]);
+            }
+        } else if line.starts_with("Stream #") && line.contains("Video:") && p.size.is_none() {
+            for word in line.split([',', ' ']) {
+                if let Some((w, h)) = word.split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                        if w > 0 && h > 0 && p.size.is_none() {
+                            p.size = Some((w, h));
+                        }
+                    }
+                }
+            }
+            let words: Vec<&str> = line.split([',', ' ']).filter(|w| !w.is_empty()).collect();
+            for pair in words.windows(2) {
+                if pair[1] == "fps" {
+                    p.fps = pair[0].parse().ok();
+                }
+            }
+            p.interlaced = line.contains("top first")
+                || line.contains("bottom first")
+                || line.contains("interlaced");
+        } else if line.starts_with("Stream #") && line.contains("Audio:") {
+            p.audio = true;
+        }
+    }
+    p
+}
+
+/// One picture of `input` at `seconds`, as the clip would carry it
+/// (fitted, 752 x 480 RGBA): a preview.
+pub fn preview(
+    ffmpeg: &Path,
+    input: &Input,
+    seconds: f64,
+    options: &ImportOptions,
+) -> Result<Vec<u32>> {
+    let mut opts = options.clone();
+    opts.motion = Motion::Frames;
+    let mut cmd = command(ffmpeg);
+    match input {
+        Input::Video(p) => {
+            cmd.args(["-ss", &format!("{:.3}", seconds.max(0.0))])
+                .arg("-i")
+                .arg(p);
+        }
+        Input::Still(p) => {
+            cmd.arg("-i").arg(p);
+        }
+        Input::Sequence {
+            pattern,
+            start,
+            count,
+        } => {
+            let n = start + ((seconds * opts.sequence_fps) as u32).min(count.saturating_sub(1));
+            cmd.args(["-start_number", &n.to_string(), "-i"])
+                .arg(pattern);
+        }
+    }
+    cmd.args([
+        "-frames:v",
+        "1",
+        "-an",
+        "-vf",
+        &opts.video_filter().replace(&format!(",fps={FPS}"), ""),
+        "-pix_fmt",
+        "rgba",
+        "-f",
+        "rawvideo",
+        "-",
+    ])
+    .stdin(Stdio::null())
+    .stderr(Stdio::null());
+    let out = cmd.output().context("running ffmpeg")?;
+    if out.stdout.len() < W * H * 4 {
+        bail!("no picture");
+    }
+    Ok(out.stdout[..W * H * 4]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], 0xFF]))
+        .collect())
+}
+
+/// Blocks a field takes at most for `grade`, with `channels` of sound:
+/// a clip's size runs up to this.
+pub fn bytes_per_second(grade: Grade, channels: u8) -> f64 {
+    let blocks = f64::from(grade.field_limit())
+        + f64::from(channels) * flyerclip::audio::BLOCKS_PER_FIELD as f64;
+    blocks * flyerclip::BLOCK as f64 * 60_000.0 / 1001.0
 }
 
 /// One field's 242 lines as RGBA rows of the picture they belong to.
@@ -422,6 +1052,74 @@ pub fn describe(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffmpegs_report_gives_the_run_time_size_rate_and_sound() {
+        let text = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.mp4':
+  Duration: 00:01:02.50, start: 0.000000, bitrate: 2000 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, top first), 1920x1080 [SAR 1:1 DAR 16:9], 1800 kb/s, 29.97 fps, 29.97 tbr, 30k tbn (default)
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 192 kb/s (default)";
+        let p = parse_probe(text);
+        assert_eq!(p.seconds, Some(62.5));
+        assert_eq!(p.size, Some((1920, 1080)));
+        assert_eq!(p.fps, Some(29.97));
+        assert!(p.audio);
+        assert!(p.interlaced);
+    }
+
+    #[test]
+    fn numbered_pictures_in_a_folder_are_a_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in [7, 8, 9, 10, 12] {
+            std::fs::write(dir.path().join(format!("shot_{n:04}.png")), b"").unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("logo.png"), b"").unwrap();
+        let Some(Input::Sequence {
+            pattern,
+            start,
+            count,
+        }) = find_sequence(dir.path())
+        else {
+            panic!("no sequence");
+        };
+        assert_eq!(pattern, dir.path().join("shot_%04d.png"));
+        assert_eq!((start, count), (7, 4));
+        assert!(find_sequence(&dir.path().join("none")).is_none());
+    }
+
+    #[test]
+    fn the_crouton_icon_carries_the_picture_inside_the_bevel() {
+        let red = u32::from_le_bytes([220, 20, 20, 0xFF]);
+        let blue = u32::from_le_bytes([20, 20, 220, 0xFF]);
+        let picture: Vec<u32> = (0..W * H)
+            .map(|i| if i % W < W / 2 { red } else { blue })
+            .collect();
+        let icon = crouton_icon(&picture);
+        assert_eq!(&icon[..4], b"FORM");
+        let cmap = icon.windows(4).position(|w| w == b"CMAP").unwrap() + 8;
+        let body = icon.windows(4).position(|w| w == b"BODY").unwrap() + 8;
+        let index = |x: usize, y: usize| {
+            (0..6).fold(0usize, |v, p| {
+                let b = icon[body + (y * 6 + p) * 10 + x / 8] >> (7 - x % 8) & 1;
+                v | usize::from(b) << p
+            })
+        };
+        let colour = |i: usize| {
+            [
+                icon[cmap + 3 * i],
+                icon[cmap + 3 * i + 1],
+                icon[cmap + 3 * i + 2],
+            ]
+        };
+        assert_eq!(colour(index(10, 20)), [220, 20, 20]);
+        assert_eq!(colour(index(70, 20)), [20, 20, 220]);
+        // The bevel is the template's.
+        let template = include_bytes!("../assets/toaster/clip-icon.I");
+        assert_eq!(icon.len(), template.len());
+        assert_eq!(index(0, 0), 1);
+        assert_eq!(&icon[cmap..cmap + 24], &template[cmap..cmap + 24]);
+    }
 
     #[test]
     fn a_colour_frame_round_trips_through_vtasc() {

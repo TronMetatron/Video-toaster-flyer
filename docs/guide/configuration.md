@@ -899,6 +899,7 @@ media = "D:/Toster/Amiga Toaster Files"   # the card's host folder
 # preview_overlay = false # the switcher interface over Preview (default false)
 # volume = "ToasterFiles"  # also mount media in the Amiga as ToasterFiles:
 # flyer = false           # also fit a Video Flyer (needs card = "toaster")
+# converter = true        # with a Flyer, open the clip converter window too
 ```
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
@@ -988,6 +989,33 @@ a clip. Dropping a file on the program does the right one. `--hq5`/`--hq6`
 give each field a larger budget, `--no-audio` drops the sound and `--seconds
 N` stops early. ffmpeg does the decoding and encoding.
 
+How a source becomes a clip: ffmpeg squares its pixels first (anamorphic
+video keeps its shape), fits it to 4:3 (letterboxed or pillarboxed, like a
+Toaster input, unless the converter below says crop or stretch) and scales
+it to the Flyer's 752 samples by 480 lines. Each field is its own moment,
+59.94 a second, as a camera records: an interlaced source is split into its
+fields, a progressive one sampled at the field rate (24 frame film comes out
+with 3:2 pulldown, 60 frame video keeps every frame), and the four fields
+of each colour frame take the lines of four pictures in turn. The sound is
+resampled to the Flyer's 44.056 kHz.
+
+**The clip converter.** `flyer-convert` (built with Copperline) is the same
+conversion in a window of its own, drawn in the Toaster's style. With a
+Flyer fitted, a windowed Copperline starts it beside the machine, pointed
+at `media` (`converter = false` stops that); it runs on its own, can stay
+open after the machine quits, and a second copy started while one runs
+just exits. Drop video files, still pictures, folders or a folder of
+numbered pictures (one sequence) on it, or use Add Files / Add Folder;
+choose the Flyer drive, quality (Standard, HQ5, HQ6), motion (fields at
+59.94 or frames at 29.97), the fit, how long stills last and how fast a
+sequence plays, the sound (stereo, mono or none) and its gain per channel,
+and Convert. Each clip lands on the drive with its crouton icon
+(`<clip>.I`, a frame a second in), so the Grazer shows it with a picture
+straight away; a `.clip` file dropped on it is copied over as it is. The
+preview shows the selected source as the clip will carry it, fitted, and
+follows the conversion while it runs. Its settings are kept in
+`flyer-convert.json` beside the program.
+
 **Video Flyer.** `flyer = true` (with `card = "toaster"`) also fits a
 NewTek Video Toaster Flyer, the Zorro II card that records and plays clips
 into the Toaster's inputs 3 and 4. The Toaster software finds it as
@@ -1004,15 +1032,18 @@ quits). `COPPERLINE_DIAG_FLYER=1` logs every command it is sent.
 The Flyer's SCSI drives are folders in `media`'s `Flyer` folder: `FA0` (bus
 A, unit 0; created when missing), and `FB0`, `FC0`, ... when those folders
 exist. Files are the clips' bytes as the Flyer stores them (what
-`flyerclip import` writes, or a clip copied off a real Flyer drive); a
+`flyerclip import` and the converter write, or a clip copied off a real
+Flyer drive); a
 `.flyervol` file whose first line is a name renames the volume, which is
 otherwise `FlyerA0`, `FlyerB0`, ... With the Toaster's `FA0` DOS driver
 mounted (copy `NewTek/Programs/System_Support/Devs/DOSDrivers/FA0` into
 `DEVS:DOSDrivers`), the drive is the `FlyerA0:` volume, which lists, reads
 and copies like any other. Clips are read-only (they cannot be overwritten,
 extended or deleted from the Amiga, and nothing records into the drives
-yet); other files, such as the crouton icons below, are written straight
-into the folder.
+yet, though Process Clip below makes new ones from them); other files, such
+as the crouton icons below, are written straight into the folder. Clips put
+into the folder while the machine runs show up the next time the Grazer
+lists the drive.
 
 A typical start-up, as in the Toaster's own installation: `S:Toaster-Auto`
 (or `S:User-Startup`) runs `NewTek:Programs/System_Support/c/FlyerInit`
@@ -1049,8 +1080,17 @@ frame at a time, with the sound of each frame heard as it goes. While the
 position stands still the frame's sound repeats as a short loop, as on
 the real Flyer, until the next move or until the controls close (the
 Editor's own quieting after a pause does not happen yet). The shuttle
-moves at the speeds the switcher asks for rather than racing to the end. Not emulated yet: recording into the Flyer, cut lists,
-SMPTE time code and the TBC module.
+moves at the speeds the switcher asks for rather than racing to the end.
+
+Process Clip (the cutting room) works: mark the pieces of a clip with
+their in and out points and names, choose picture, sound or both, and
+Perform makes each piece a clip of its own on the drive, copied from the
+original's coded frames (whole colour frames, so a piece starts on the
+colour frame holding its in point), with its icon. Without Destructive the
+original stays. A destructive cut takes the original off the drive as the
+Flyer would, but its file is moved into a `Trash` folder beside the drive
+folders rather than deleted, so it can be put back. Not emulated yet:
+recording into the Flyer, SMPTE time code and the TBC module.
 
 Flyer clips are decoded ahead of time on worker threads (two to four), so
 playback does not hold up the emulated machine; the picture is the same
