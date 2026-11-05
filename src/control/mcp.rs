@@ -707,7 +707,8 @@ impl McpServer {
     /// `flyer_import` / `flyer_export` / `flyer_list`: the clip converter,
     /// on this computer.
     fn flyer_tool(&mut self, name: &str, args: &Value) -> ToolResult {
-        // The Flyer folder: the running Toaster's, else the default.
+        // The Flyer's drives: the running Toaster's folder, else the
+        // default. Drive FA0 is `Flyer/FA0`, FB0 `Flyer/FB0` and so on.
         let media_root = self
             .session
             .as_mut()
@@ -720,12 +721,19 @@ impl McpServer {
             })
             .unwrap_or_else(crate::paths::toaster_files_dir);
         let flyer_dir = media_root.join("Flyer");
+        let fa0 = flyer_dir.join("FA0");
         let path_arg = |key: &str| args.get(key).and_then(Value::as_str).map(PathBuf::from);
         if name == "flyer_list" {
             let mut clips = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&flyer_dir) {
-                let mut paths: Vec<PathBuf> =
-                    entries.filter_map(Result::ok).map(|e| e.path()).collect();
+            let mut drives: Vec<PathBuf> = std::fs::read_dir(&flyer_dir)
+                .map(|e| e.filter_map(Result::ok).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            drives.retain(|d| d.is_dir());
+            drives.sort();
+            for drive in drives {
+                let mut paths: Vec<PathBuf> = std::fs::read_dir(&drive)
+                    .map(|e| e.filter_map(Result::ok).map(|e| e.path()).collect())
+                    .unwrap_or_default();
                 paths.sort();
                 for p in paths.into_iter().filter(|p| p.is_file()) {
                     if let Ok(text) = crate::flyer_convert::describe(&p) {
@@ -755,7 +763,7 @@ impl McpServer {
                     .chars()
                     .take(31)
                     .collect();
-                crate::flyer_convert::unused_path(&flyer_dir.join(format!("{stem}.clip")))
+                crate::flyer_convert::unused_path(&fa0.join(format!("{stem}.clip")))
             });
             let mut options = crate::flyer_convert::ImportOptions::default();
             match args.get("grade").and_then(Value::as_str) {
@@ -1301,8 +1309,8 @@ pub fn bridge_tools() -> Vec<Value> {
             "name": "flyer_import",
             "description": "Convert a video file (MP4, MOV, AVI... anything ffmpeg reads) into a \
                             NewTek Video Flyer clip: VTASC-coded NTSC composite fields plus \
-                            stereo 16-bit audio, in the Toaster files folder's Flyer folder \
-                            unless `clip` names the file (a default name never replaces a file). `grade` std (default), hq5 or hq6 \
+                            stereo 16-bit audio, on the Flyer's drive FA0 (the Flyer/FA0 \
+                            folder of the Toaster files folder) unless `clip` names the file (a default name never replaces a file). `grade` std (default), hq5 or hq6 \
                             sets the per-field size budget; `audio` false drops the sound; \
                             `seconds` stops early. Runs on this computer (needs ffmpeg), no \
                             emulator needed.",
@@ -1327,8 +1335,8 @@ pub fn bridge_tools() -> Vec<Value> {
         }),
         json!({
             "name": "flyer_list",
-            "description": "List the Flyer clips in the Toaster files folder's Flyer folder with \
-                            their length, audio and grade.",
+            "description": "List the clips on the Flyer's drives (Flyer/FA0, Flyer/FB0... in the \
+                            Toaster files folder) with their length, audio and grade.",
             "inputSchema": object(json!({}), vec![]),
         }),
         json!({

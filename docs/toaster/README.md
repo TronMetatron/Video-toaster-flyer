@@ -20,6 +20,8 @@ notes were written on.
   them over Program.
 - `flyer-spec.md`: the Flyer board, its command mailbox and the plan for
   high-level emulation.
+- `tutorial-map.md`: the functions, panels and tabs a NewTek tutorial
+  covers, what each needs, and how far the emulation supports it.
 
 The Flyer clip format is in `crates/flyerclip/FORMAT.md`. The emulation
 itself is described in `docs/internals/video.md` (Toaster section) and

@@ -20,7 +20,7 @@
 //! FlyerFileSystem copies them (`crates/flyerclip/FORMAT.md` §2).
 
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Bytes per block.
@@ -234,6 +234,11 @@ impl HostDrive {
         self.objects.get(index).filter(|o| o.present)
     }
 
+    /// The host file or folder of an object.
+    pub fn host_path(&self, index: usize) -> PathBuf {
+        self.folder.join(&self.objects[index].rel)
+    }
+
     /// The header block number of an object.
     pub fn header_block(&self, index: usize) -> u32 {
         if index == 0 {
@@ -357,6 +362,117 @@ impl HostDrive {
         let mut b = [0u8; BLOCK];
         let got = self.read_file(index, 0, &mut b).ok()?;
         (got == BLOCK).then_some(b)
+    }
+
+    /// Whether a file is a clip (its first block a CLIP header). Clips
+    /// are kept read-only: the Amiga can make and change other files.
+    pub fn is_clip(&self, index: usize) -> bool {
+        self.first_block(index)
+            .is_some_and(|b| flyerclip::header::ClipHeader::parse(&b).is_ok())
+    }
+
+    /// Create file `name` in directory `dir`, or empty it if it is there;
+    /// its index.
+    pub fn create_file(&mut self, dir: usize, name: &str) -> std::io::Result<usize> {
+        if !valid_name(name) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let path = match self.child(dir, name) {
+            Some(i) if self.objects[i].kind != TYPE_FILE => {
+                return Err(std::io::ErrorKind::InvalidInput.into())
+            }
+            Some(i) => self.host_path(i),
+            None => self.host_path(dir).join(name),
+        };
+        std::fs::File::create(&path)?;
+        self.scan();
+        self.child(dir, name)
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+    }
+
+    /// Create directory `name` in `dir`; its index.
+    pub fn create_dir(&mut self, dir: usize, name: &str) -> std::io::Result<usize> {
+        if !valid_name(name) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        if self.child(dir, name).is_some() {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        std::fs::create_dir(self.host_path(dir).join(name))?;
+        self.scan();
+        self.child(dir, name)
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+    }
+
+    /// Delete a file, or an empty directory.
+    pub fn delete(&mut self, index: usize) -> std::io::Result<()> {
+        let path = self.host_path(index);
+        match self.objects[index].kind {
+            TYPE_FILE => std::fs::remove_file(path)?,
+            TYPE_DIR => std::fs::remove_dir(path)?,
+            _ => return Err(std::io::ErrorKind::InvalidInput.into()),
+        }
+        self.scan();
+        Ok(())
+    }
+
+    /// Move an object to `name` in directory `dir`.
+    pub fn rename(&mut self, index: usize, dir: usize, name: &str) -> std::io::Result<()> {
+        if !valid_name(name) || index == 0 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        if self.child(dir, name).is_some_and(|c| c != index) {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        std::fs::rename(self.host_path(index), self.host_path(dir).join(name))?;
+        self.scan();
+        Ok(())
+    }
+
+    /// Set a file's length. It must stay inside the blocks set aside for
+    /// it, as a Flyer file stays one contiguous run (`StorageFull`).
+    pub fn set_len(&mut self, index: usize, len: u64) -> std::io::Result<()> {
+        if blocks_for(len) > self.objects[index].reserved {
+            return Err(std::io::ErrorKind::StorageFull.into());
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.host_path(index))?
+            .set_len(len)?;
+        self.objects[index].bytes = len;
+        Ok(())
+    }
+
+    /// Write bytes into a file at `offset`, growing it as needed.
+    pub fn write_file(&mut self, index: usize, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        let end = offset + data.len() as u64;
+        if end > self.objects[index].bytes {
+            self.set_len(index, end)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.host_path(index))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)
+    }
+
+    /// Write whole blocks from `lba` into file `index`'s data, as far as
+    /// its length goes (its last block's tail is not part of the file).
+    pub fn write_blocks(&mut self, index: usize, lba: u32, data: &[u8]) -> std::io::Result<()> {
+        let obj = &self.objects[index];
+        let Some(first) = lba.checked_sub(obj.start) else {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        let offset = u64::from(first) * BLOCK as u64;
+        if offset >= obj.bytes {
+            return Ok(());
+        }
+        let n = (data.len() as u64).min(obj.bytes - offset) as usize;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.host_path(index))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&data[..n])
     }
 
     /// Data blocks in use, and the largest free run.

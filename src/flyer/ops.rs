@@ -21,10 +21,13 @@
 //! for GETCLOCK and CACHETEST it does so with interrupts off.
 
 use super::fs::Filesystem;
+use super::link::FlyerLink;
 use super::mailbox::{self, err, op, Slot, STAT_NEW};
+use super::play::{self, Player, Request};
 use crate::zorro_device::HostBeam;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// The beam line at which the field clock steps. The Flyer's clock runs
 /// from its own top-of-field interrupt; seen from the Amiga, the switcher's
@@ -152,13 +155,36 @@ pub struct Calibration {
     pub pedestal: [u16; 2],
 }
 
+/// The audio codec's input settings (CODECCTRL), kept for the record
+/// panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Codec {
+    /// Input source per side: 0 the RCA line in, 1 AUX1, 2 LINE2.
+    pub source: [u8; 2],
+    /// Input gain per side, 1-16 (0 mutes).
+    pub gain: [u8; 2],
+    /// AUX1 and AUX2 mix-in (`$80` mutes).
+    pub mix: [u8; 2],
+}
+
+impl Default for Codec {
+    /// Line 1 at gain index 8 (+12 dB), the firmware's `DFLTRECGAIN`.
+    fn default() -> Self {
+        Self {
+            source: [0; 2],
+            gain: [9; 2],
+            mix: [0x80; 2],
+        }
+    }
+}
+
 /// What a command did when it was started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Finished with this error code: mark the slot done.
     Done(u8),
     /// Still running; the slot stays in progress (CACHETEST waiting for
-    /// the Amiga to clear `cont`).
+    /// the Amiga to clear `cont`, a clip playing).
     Held,
 }
 
@@ -208,8 +234,18 @@ pub struct Firmware {
     serial_bus: Vec<u8>,
     /// The drives and the firmware's filesystem state.
     pub fs: Filesystem,
+    /// The sequencer, the clip player and the DSP.
+    pub player: Player,
+    pub codec: Codec,
     /// Opcodes already reported as not modelled.
     reported: u128,
+    /// The ribbon to the Toaster (its inputs 3 and 4, the sound), when
+    /// one is fitted. Not saved: a loaded state keeps the live one.
+    #[serde(skip)]
+    link: Option<Arc<FlyerLink>>,
+    /// Field clocks stepped since the last [`Self::run_fields`].
+    #[serde(skip)]
+    fields_due: Vec<u32>,
 }
 
 impl Default for Firmware {
@@ -247,7 +283,11 @@ impl Firmware {
             vid_params: [0; 10],
             serial_bus: vec![0; 256],
             fs: Filesystem::default(),
+            player: Player::default(),
+            codec: Codec::default(),
             reported: 0,
+            link: None,
+            fields_due: Vec::new(),
         }
     }
 
@@ -258,15 +298,41 @@ impl Firmware {
         self
     }
 
+    /// Connect the ribbon to the Toaster.
+    pub fn with_link(mut self, link: Option<Arc<FlyerLink>>) -> Self {
+        self.link = link;
+        self
+    }
+
+    pub fn link(&self) -> Option<&Arc<FlyerLink>> {
+        self.link.as_ref()
+    }
+
+    /// Take over the ribbon of the card this one replaces (a loaded
+    /// state), and tell the Toaster this card's routing.
+    pub fn adopt_link(&mut self, link: Option<Arc<FlyerLink>>) {
+        self.link = link;
+        self.publish_routing();
+    }
+
     /// The Amiga was reset: so is the card (its 68000 restarts in the boot
     /// ROM). The EEPROM keeps its contents; the SRAM is not touched.
     pub fn reset(&mut self) {
         let eeprom = std::mem::take(&mut self.eeprom);
         let field_clock = self.field_clock;
         let folder = self.fs.folder().map(PathBuf::from);
-        *self = Self::new().with_drives(folder);
+        let link = self.link.take();
+        *self = Self::new().with_drives(folder).with_link(link);
         self.eeprom = eeprom;
         self.field_clock = field_clock;
+        self.publish_routing();
+    }
+
+    /// Tell the Toaster which of its inputs the Flyer has.
+    fn publish_routing(&self) {
+        if let Some(link) = &self.link {
+            link.set_routing(self.routing.flyer_on_input3, self.routing.flyer_on_input4);
+        }
     }
 
     /// The Amiga wrote `len` bytes at window offset `off`; serve whatever
@@ -289,6 +355,12 @@ impl Firmware {
             }
             if touch.cont && self.cache_test == Some(slot) && slot.cont(sram) == 0 {
                 self.finish_cache_test(sram, slot);
+            }
+            if touch.cont && slot.status(sram) == mailbox::STAT_INPROG {
+                // A clip's abort, pause or resume.
+                let cont = slot.cont(sram);
+                self.player
+                    .cont_written(slot, cont, sram, self.link.as_deref());
             }
         }
     }
@@ -372,6 +444,8 @@ impl Firmware {
         };
         // InitFileSys and DriveSurvey.
         self.fs.boot(sram);
+        self.player = Player::default();
+        self.publish_routing();
     }
 
     /// QUIT's `ColdBoot`: back into the boot ROM.
@@ -381,6 +455,7 @@ impl Firmware {
         self.mode = VideoMode::None;
         self.cache_test = None;
         self.leds = 0x04;
+        self.player = Player::default();
     }
 
     fn ee(&self, addr: u8) -> u16 {
@@ -447,6 +522,7 @@ impl Firmware {
                 self.routing.flyer_on_input3 = slot.arg8(sram, 4) != 0;
                 self.routing.flyer_on_input4 = slot.arg8(sram, 5) != 0;
                 self.routing.camcorder_on_preview = slot.arg8(sram, 6) != 0;
+                self.publish_routing();
                 Done(err::OKAY)
             }
             op::INPUTSEL => {
@@ -497,7 +573,45 @@ impl Firmware {
                 slot.set_arg16(sram, 6, self.ee(addr));
                 Done(err::OKAY)
             }
-            op::RESETFLYER => Done(err::OKAY),
+            op::RESETFLYER => {
+                self.player.reset(sram, self.link.as_deref());
+                Done(err::OKAY)
+            }
+            op::FLYPLAY => self.fly_play(sram, slot),
+            op::NEWSEQ => {
+                self.player.new_sequence();
+                Done(err::OKAY)
+            }
+            op::ADDSEQCLIP => Done(self.add_sequence_clip(sram, slot)),
+            op::ENDSEQ => {
+                // Nothing to arrange; the progress fraction (0.32) is full.
+                slot.set_arg32(sram, 28, u32::MAX);
+                Done(err::OKAY)
+            }
+            op::PLAYSEQ => Done(if self.mode == VideoMode::Play {
+                let base = slot.arg32(sram, 4);
+                self.player
+                    .play_sequence(base, self.field_clock, sram, self.link.as_deref())
+            } else {
+                err::WRONGMODE
+            }),
+            op::CHGAUDIO => {
+                let r = Request::read(sram, play::action_of(sram, slot));
+                self.player.change_audio(&r);
+                Done(err::OKAY)
+            }
+            op::AUDEKEY => {
+                self.player.add_envelope_key(
+                    slot.arg32(sram, 4),
+                    slot.arg32(sram, 8),
+                    [slot.arg16(sram, 14), slot.arg16(sram, 16)],
+                    [slot.arg16(sram, 18), slot.arg16(sram, 20)],
+                );
+                Done(err::OKAY)
+            }
+            op::CODECCTRL => Done(self.codec_ctrl(sram, slot)),
+            // No SMPTE reader is fitted: the time code reads as zeros.
+            op::GETSMPTE => Done(err::OKAY),
             op::SETCLOCKGEN => {
                 let (clock, freq) = (slot.arg8(sram, 4), slot.arg32(sram, 6));
                 Done(self.set_clock_freq(clock, freq))
@@ -524,6 +638,127 @@ impl Firmware {
         }
     }
 
+    /// The clip a ClipAction names: `None` for no name, else its host file
+    /// and what it holds, or the error the firmware's `GetNamedClipInfo`
+    /// gives.
+    fn named_clip(&mut self, sram: &[u8], action: usize) -> Result<Option<play::ClipInfo>, u8> {
+        let volume = mailbox::rd32(sram, action + play::ca::VOLUME) as usize;
+        let drive = mailbox::rd8(sram, volume + 5);
+        let path = super::fs::read_cstr(sram, mailbox::rd32(sram, volume) as usize);
+        if super::drive::strip_device(&path).is_empty() {
+            return Ok(None);
+        }
+        let host = self.fs.clip_file(drive, &path)?;
+        self.player
+            .clip_info(&host)
+            .map(Some)
+            .ok_or(super::fs::ERR_BADVIDHDR)
+    }
+
+    /// FLYPLAY (`Play1Clip_cmd`): play one clip. The command stays in
+    /// progress until the clip is done or aborted.
+    fn fly_play(&mut self, sram: &mut [u8], slot: Slot) -> Outcome {
+        let action = play::action_of(sram, slot);
+        // "Not timely anymore, but at least let'em know we started."
+        slot.set_cont(sram, 2);
+        let r = Request::read(sram, action);
+        let volume = mailbox::rd32(sram, action + play::ca::VOLUME) as usize;
+        if (r.flags & play::caf::VIDEO != 0 && usize::from(r.channel) >= play::VIDEO_CHANNELS)
+            || mailbox::rd8(sram, volume + 5) >= super::fs::DRIVES
+        {
+            return Outcome::Done(err::BADPARAM);
+        }
+        if self.mode != VideoMode::Play {
+            return Outcome::Done(err::WRONGMODE);
+        }
+        let clip = match self.named_clip(sram, action) {
+            Ok(Some(clip)) => clip,
+            Ok(None) => return Outcome::Done(err::BADPARAM),
+            Err(e) => return Outcome::Done(e),
+        };
+        log::info!(
+            "flyer: play {} on {} from field {} for {} (go {})",
+            clip.path.display(),
+            if r.flags & play::caf::VIDEO != 0 {
+                ["A", "B"][usize::from(r.channel) % 2]
+            } else {
+                "audio"
+            },
+            r.vid_start,
+            r.vid_count,
+            r.go_clock
+        );
+        let link = self.link.clone();
+        match self
+            .player
+            .play_clip(slot, r, clip, self.field_clock, sram, link.as_deref())
+        {
+            Ok(()) => Outcome::Held,
+            Err(e) => Outcome::Done(e),
+        }
+    }
+
+    /// ADDSEQCLIP (`AddSequenceClip`): one clip of the sequence.
+    fn add_sequence_clip(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        let action = play::action_of(sram, slot);
+        let r = Request::read(sram, action);
+        if self.diag() {
+            log::info!("flyer: ADDSEQCLIP {r:?}");
+        }
+        match self.named_clip(sram, action) {
+            Ok(clip) => self.player.add_sequence_clip(r, clip),
+            Err(e) => e,
+        }
+    }
+
+    /// CODECCTRL (`CODEC_cmd`, `Audio.c`): set the codec's inputs, or read
+    /// its overrange bits or 8-bit peak meters. The meters show the
+    /// Toaster's sound, the nearest thing to a line input there is.
+    fn codec_ctrl(&mut self, sram: &mut [u8], slot: Slot) -> u8 {
+        const SENSE: u8 = 1 << 0;
+        const SETGAIN: u8 = 1 << 1;
+        const SETSRC: u8 = 1 << 2;
+        const SETMIX: u8 = 1 << 3;
+        const SENSE8: u8 = 1 << 4;
+        let ctrl = slot.arg32(sram, 4) as usize;
+        let oper = slot.arg8(sram, 8);
+        let rd = |off: usize| mailbox::rd8(sram, ctrl + off);
+        if oper & SETGAIN != 0 {
+            self.codec.gain = [rd(6), rd(7)];
+        }
+        if oper & SETSRC != 0 {
+            self.codec.source = [rd(4), rd(5)];
+        }
+        if oper & SETMIX != 0 {
+            self.codec.mix = [rd(8), rd(10)];
+        }
+        let peak = self.link.as_ref().map_or((0.0, 0.0), |l| l.line_peak());
+        if oper & SENSE != 0 {
+            // Two bits of overrange per side: 3 is clipping.
+            let over = |p: f32| if p >= 0.99 { 3 } else { 0 };
+            mailbox::wr8(sram, ctrl + 2, over(peak.0));
+            mailbox::wr8(sram, ctrl + 3, over(peak.1));
+        } else if oper & SENSE8 != 0 {
+            let level = |p: f32| (p.clamp(0.0, 1.0) * 255.0).round() as u8;
+            mailbox::wr8(sram, ctrl + 2, level(peak.0));
+            mailbox::wr8(sram, ctrl + 3, level(peak.1));
+        }
+        err::OKAY
+    }
+
+    /// Play the fields whose clock stepped since the last call: video to
+    /// the Toaster, a field of sound, commands that finished.
+    pub fn run_fields(&mut self, sram: &mut [u8]) {
+        if self.cpu != Cpu::Running {
+            self.fields_due.clear();
+            return;
+        }
+        let link = self.link.clone();
+        for clock in std::mem::take(&mut self.fields_due) {
+            self.player.field(clock, sram, link.as_deref());
+        }
+    }
+
     /// Log the first use of an opcode the HLE does not model yet.
     fn report_unmodelled(&mut self, opcode: u16) {
         let bit = 1u128 << (opcode & 0x7F);
@@ -540,6 +775,21 @@ impl Firmware {
     /// firmware's SCSI selection does), to one that is it goes to the
     /// filesystem.
     fn drive_command(&mut self, sram: &mut [u8], slot: Slot, opcode: u16) -> u8 {
+        // Not modelled, and a success that did nothing would mislead: the
+        // editor's destructive Cut Clip deletes the source's icons after a
+        // cut that "worked", and the drive tools read empty SCSI answers
+        // as a drive. These fail the way a board without the feature would.
+        match opcode {
+            op::NEWCUTLIST | op::ADDSUBCLIP | op::MAKESUBCLIPS | op::READTEST => {
+                self.report_unmodelled(opcode);
+                return err::CMDFAILED;
+            }
+            op::SCSIDIRECT | op::SCSICALL => {
+                self.report_unmodelled(opcode);
+                return err::SELTIMEOUT;
+            }
+            _ => {}
+        }
         let Some(drive) = Filesystem::target(opcode, sram, slot) else {
             self.report_unmodelled(opcode);
             return err::OKAY;
@@ -851,6 +1101,14 @@ impl Firmware {
     /// an interlaced picture; without interlace there is no alignment.
     fn step_field_clock(&mut self, long_frame: Option<bool>) {
         self.field_clock = self.field_clock.wrapping_add(1);
+        self.align_colour_frame(long_frame);
+        // At most a few fields wait: a longer gap has nothing worth playing.
+        if self.fields_due.len() < 4 {
+            self.fields_due.push(self.field_clock);
+        }
+    }
+
+    fn align_colour_frame(&mut self, long_frame: Option<bool>) {
         let Some(long_frame) = long_frame else {
             self.last_field_long = None;
             return;
@@ -1127,6 +1385,23 @@ mod tests {
         assert_eq!(slot.opcode_word(&sram), op::NULL | STAT_DONE);
         assert_eq!(slot.error(&sram), err::OKAY);
         assert_eq!(Slot(0).opcode_word(&sram), op::FIRMWARE | STAT_DONE);
+    }
+
+    #[test]
+    fn cut_lists_and_raw_scsi_fail_rather_than_pretend() {
+        let (mut fw, mut sram) = running();
+        let slot = Slot(3);
+        for (opcode, expected) in [
+            (op::ADDSUBCLIP, err::CMDFAILED),
+            (op::NEWCUTLIST, err::CMDFAILED),
+            (op::MAKESUBCLIPS, err::CMDFAILED),
+            (op::READTEST, err::CMDFAILED),
+            (op::SCSIDIRECT, err::SELTIMEOUT),
+            (op::SCSICALL, err::SELTIMEOUT),
+        ] {
+            assert_eq!(send(&mut fw, &mut sram, slot, opcode, &[]), expected);
+            free(&mut fw, &mut sram, slot);
+        }
     }
 
     #[test]

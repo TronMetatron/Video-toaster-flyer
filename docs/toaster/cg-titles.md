@@ -152,7 +152,8 @@ So after `LDCG` (load), **one more SELECTK** enters the CG. None of the ARexx co
 
 * Inside the CG each entry runs `DoStartupMacro` immediately before `DoCG` (CG/cg.a:929-931).
 * The macro comes from `CG_Support/CG-Config` `#Startup` = `REXX:CG/StartUp.rexx` (cg-config:23-24). The config is read relative to Toaster:Programs.
-* In this install `REXX:` = `S:` (S:Startup-Sequence:32), so the file `S:CG/StartUp.rexx` does not exist and the macro silently fails.
+* With `REXX:` = `S:` only (S:Startup-Sequence:32) the file `S:CG/StartUp.rexx` does not exist and the macro silently fails. NewTek's installer assigns `REXX:` to `Toaster:Arexx` (Programs/Utilities/UN-assign undoes it); `Assign REXX: Toaster:Arexx ADD` in S:User-Startup makes it run `Toaster:Arexx/CG/Startup.Rexx`, which loads Benjamin-Book 35 and 40 (checked: the CG comes up on Benjamin-Book 40). `SaveState.Rexx` (Alt-F3) rewrites that file with the fonts loaded at the time.
+* The macro calls CG functions from a process of its own, so it hangs if `ToasterARexx.port` or `PROJECT_REXX_PORT` is on the library list (2.1).
 * The macro is sent RXCOMM|NOIO to the **`AREXX`** port, which launches it asynchronously (installed CG $22b34c; source cgrexx.c:1837-1883). The CG is therefore already in its loop when the macro runs.
 * **Hook (optional, needs a new file in the guest):** create `S:CG/StartUp.rexx` that writes a flag such as `ToasterFiles:.copperline/cg-ready`. Then the host knows when it is safe to send CG commands.
   * The CG-Config Alt-F1…F10 macros point at `REXX:CG/...` too and are equally absent. The scripts themselves are in `Toaster:Arexx/CG`.
@@ -174,7 +175,7 @@ So after `LDCG` (load), **one more SELECTK** enters the CG. None of the ARexx co
   * The switcher's handler ignores the function name and parses ARG1 as a 4-character command. Unknown commands get **RC 10, error 0** (OLDRX ProcessARexxMessage/`HandlerBad`), which stops ARexx's search instead of letting it continue.
   * A CG argument that happens to be a switcher word (for example `MAKELINE('TAKE')`) would even run that switcher command.
   * While the CG is up, the switcher task is blocked in `SendCGMessage`, so a call routed to it **hangs** until the CG exits.
-  * The Copperline `wrap()` adds `ToasterARexx.port` and `PROJECT_REXX_PORT` to the *global* library list in every job (Copperline/src/control/toaster_link.rs:86-87). The `cg` program adds `CG_AREXX` afterwards at the same priority (line 206), so CG calls reach the switcher first.
+  * The Copperline `wrap()` (src/control/toaster_link.rs) puts `ToasterARexx.port` and `PROJECT_REXX_PORT` on the *global* library list at priority -1 for each job and takes them off when the job ends; `S:Toaster-Project.rexx` likewise takes `PROJECT_REXX_PORT` off after loading the start-up project. (Earlier both stayed on the list at priority 0 after the first job, so every CG macro, the start-up macro included, hung.)
   * The reverse is also bad. If `CG_AREXX` ends up first while the CG is off screen, every `Switcher()` call hangs, because the CG port exists but nobody reads it.
   * NewTek's own StartToaster `remlib`s both Toaster hosts when it finishes (Programs/StartToaster, quit:), so the shipped CG scripts never met this.
   * **Rule for CG jobs:** `remlib('ToasterARexx.port')` and `remlib('PROJECT_REXX_PORT')`, then `addlib('CG_AREXX',0)`, then the work, then `remlib('CG_AREXX')`, then re-add the other two. Run jobs one at a time.

@@ -926,7 +926,8 @@ mixed by how much of each input Program shows (a dissolve crossfades the
 sound, a wipe by area, framestores and mattes are silent). Recordings carry
 the same sound. The real card handles picture only; this stands in for the
 audio-follow-video mixer beside it.
-- `Flyer`: clips for the Video Flyer (see `flyer` below).
+- `Flyer`: the Video Flyer's drives, `Flyer/FA0` and so on (see `flyer`
+  below).
 
 With `monitors` on, the card's two outputs open as windows of their own,
 each on a picture monitor: **Preview** and **Program**. Closing one only
@@ -951,15 +952,26 @@ folder's `.copperline` subfolder and the script runs them inside the Amiga
 (see [MCP server](#mcp-server) in the control-protocol reference: tools
 `toaster_switcher`, `toaster_project`, `toaster_rexx`, next to
 `toaster_status`, `toaster_capture`, `toaster_record` and
-`toaster_input`).
+`toaster_input`). A job puts the switcher's and the editor's ARexx hosts
+on ARexx's shared list of function hosts only while it runs: left there
+(an `addlib` with no `remlib`, in any script), they take the calls of the
+CG's own macros and hang them.
+
+**Assigns.** The Toaster software expects what NewTek's installer adds to
+`S:User-Startup`: `Assign Toaster:` on the `NewTek` folder, `Assign REXX:
+Toaster:Arexx ADD` (the CG runs its start-up macro, which loads the fonts
+it starts with, and its Alt-F keys from `REXX:CG`), `Assign HIIP:
+Toaster:Programs/Hiip_Support` (the image loaders and savers) and, for
+ToasterPaint and older CG pages, `Assign ToasterFonts: Toaster:PSFonts`.
 
 **Flyer clips.** The `flyerclip` program (built with Copperline) converts
 between video files and NewTek Video Flyer clips, the Flyer's own format:
 VTASC-coded NTSC composite fields and 16-bit stereo sound
 (`crates/flyerclip`, transcribed from NewTek's Flyer sources; the format is
 written up in `crates/flyerclip/FORMAT.md`). `flyerclip import movie.mp4`
-writes `movie.clip` into the media folder's `Flyer` folder; `flyerclip
-export movie.clip` writes `movie.mp4` beside it; `flyerclip info` describes
+writes `movie.clip` onto the Flyer's first drive, the media folder's
+`Flyer/FA0` folder; `flyerclip export movie.clip` writes `movie.mp4`
+beside it; `flyerclip info` describes
 a clip. Dropping a file on the program does the right one. `--hq5`/`--hq6`
 give each field a larger budget, `--no-audio` drops the sound and `--seconds
 N` stops early. ffmpeg does the decoding and encoding.
@@ -980,14 +992,44 @@ quits). `COPPERLINE_DIAG_FLYER=1` logs every command it is sent.
 The Flyer's SCSI drives are folders in `media`'s `Flyer` folder: `FA0` (bus
 A, unit 0; created when missing), and `FB0`, `FC0`, ... when those folders
 exist. Files are the clips' bytes as the Flyer stores them (what
-`flyerclip import` writes into `Flyer`: move them into `Flyer/FA0`, or a
-clip copied off a real Flyer drive); a `.flyervol` file whose first line
-is a name renames the volume, which is otherwise `FlyerA0`, `FlyerB0`,
-... With the Toaster's `FA0` DOS driver mounted (copy
-`NewTek/Programs/System_Support/Devs/DOSDrivers/FA0` into
+`flyerclip import` writes, or a clip copied off a real Flyer drive); a
+`.flyervol` file whose first line is a name renames the volume, which is
+otherwise `FlyerA0`, `FlyerB0`, ... With the Toaster's `FA0` DOS driver
+mounted (copy `NewTek/Programs/System_Support/Devs/DOSDrivers/FA0` into
 `DEVS:DOSDrivers`), the drive is the `FlyerA0:` volume, which lists, reads
-and copies like any other. The drives are write-protected for now, and
-clips do not play into the Toaster's inputs yet.
+and copies like any other. Clips are read-only (they cannot be overwritten,
+extended or deleted from the Amiga, and nothing records into the drives
+yet); other files, such as the crouton icons below, are written straight
+into the folder.
+
+A typical start-up, as in the Toaster's own installation: `S:Toaster-Auto`
+(or `S:User-Startup`) runs `NewTek:Programs/System_Support/c/FlyerInit`
+before `rx Toaster:Programs/StartToaster`, so the Flyer is set up when the
+switcher starts.
+
+**Playing clips.** Clips go into a project like any crouton: from the
+Grazer (the `FlyerA0:` drive), or with the Editor's ARexx
+`CROUTONLOAD('FlyerA0:movie.clip')`. A clip's crouton shows a picture from
+the clip once it has an icon: the Editor's `MAKEICON('FlyerA0:movie.clip',
+field)` (or the Flyer controls) has the switcher read that field off the
+drive and write `movie.clip.I` beside the clip, as on a real Flyer. Playing
+the project (or `PROJECTPLAY`) hands the clips to the Flyer as a sequence;
+the Flyer plays them at the right fields on its channels A and B, which
+take over the Toaster's inputs 3 and 4 while it plays (the switcher routes
+them with the Flyer's `ToasterMux`), so the project's transitions run
+between the clips as on the real system. A clip crouton run on its own
+(`CROUTONRUN`, or from the switcher) plays the same way; `CROUTONSTOP`
+stops it. In/out points, audio volume, pan, attack and decay and audio
+envelopes come from the croutons' settings, as the Editor sends them.
+
+The Flyer's sound is the system's sound: its eight-channel mixer's output
+(735 samples a field, about 44.056 kHz, locked to the video) goes to the
+emulator's sound output and into the Program recording, whatever the
+switcher shows. The input folders' sound keeps following Program as
+described above (it stands in for what would reach the Flyer's line
+inputs); an input the Flyer has taken over is silent there. Not emulated
+yet: recording into the Flyer, jog and shuttle, cut lists, SMPTE time code
+and the TBC module.
 
 `preview_overlay` lets the switcher draw its interface over the Preview
 output when its own preference asks for it, as a one-monitor Toaster setup
@@ -2949,6 +2991,13 @@ model as the UAE family.
 the default -128 means mounted but never booted from): hard-disk boot
 partitions typically sit at priority 0 and DF0: at 5, so a bootable
 Workbench directory with `bootpri = 6` boots ahead of both.
+
+To the guest each volume is an FFS hard disk (disk type `DOS\1`, as the
+UAE family reports its directory volumes), with the host disk's size and
+free space. Some software checks the type before it will use a volume:
+the Video Toaster's file browser (its load and save requesters) lists
+only volumes of a DOS type it knows, and C:Info calls any other an
+unreadable disk.
 
 Kickstart 1.3 and newer get the full feature set, booting included: a
 `bootpri` above the competition boots the machine from the host
