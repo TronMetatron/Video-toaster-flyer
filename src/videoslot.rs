@@ -34,7 +34,7 @@
 
 /// Beam position of an event, plus the deterministic power-on colour-clock
 /// timestamp.
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BeamPos {
@@ -343,8 +343,9 @@ pub fn resample(src: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
 /// One video output of a card: the latest frame it produced, and an
 /// optional recording of every frame.
 ///
-/// The card publishes on the emulation thread; the host reads the frame
-/// when it repaints and starts or stops recordings. Recording happens on
+/// The card publishes from whichever thread composes it; the host reads
+/// the frame when it repaints (a monitor window's painter waits for the
+/// next one) and starts or stops recordings. Recording happens on
 /// publish, so a recording has every frame whatever the host's paint rate.
 pub struct CardOutput {
     name: &'static str,
@@ -353,6 +354,8 @@ pub struct CardOutput {
     /// Where [`CardOutput::start_recording_auto`] puts recordings.
     record_dir: Option<std::path::PathBuf>,
     state: Mutex<OutputState>,
+    /// Signalled on every publish.
+    published: Condvar,
 }
 
 #[derive(Default)]
@@ -377,6 +380,7 @@ impl CardOutput {
             aspect,
             record_dir,
             state: Mutex::new(OutputState::default()),
+            published: Condvar::new(),
         })
     }
 
@@ -443,12 +447,36 @@ impl CardOutput {
                 }
             }
         }
+        drop(st);
+        self.published.notify_all();
     }
 
     /// The latest frame, if it is newer than `seen`: copied into `out`,
     /// with its size and serial.
     pub fn frame_since(&self, seen: u64, out: &mut Vec<u32>) -> Option<(usize, usize, u64)> {
+        Self::take_since(&self.state(), seen, out)
+    }
+
+    /// [`Self::frame_since`], waiting up to `timeout` for a frame newer
+    /// than `seen` to be published.
+    pub fn wait_frame_since(
+        &self,
+        seen: u64,
+        timeout: std::time::Duration,
+        out: &mut Vec<u32>,
+    ) -> Option<(usize, usize, u64)> {
         let st = self.state();
+        if let Some(frame) = Self::take_since(&st, seen, out) {
+            return Some(frame);
+        }
+        let (st, _) = self
+            .published
+            .wait_timeout(st, timeout)
+            .unwrap_or_else(|e| e.into_inner());
+        Self::take_since(&st, seen, out)
+    }
+
+    fn take_since(st: &OutputState, seen: u64, out: &mut Vec<u32>) -> Option<(usize, usize, u64)> {
         if st.serial == seen || st.pixels.is_empty() {
             return None;
         }
