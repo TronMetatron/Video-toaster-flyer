@@ -1058,8 +1058,13 @@ does. It is off by default because the interface has a window of its own.
 Headless screenshots (`--screenshot-after`) also save each output on its
 monitor beside the capture (`shot-preview.png`, `shot-program.png`).
 `COPPERLINE_DIAG_TOASTER=1` logs what the card decodes and the bus state it
-outputs; `=fields` also dumps one field's line headers in forty. How the
-card works is described in [](../internals/video) and in `src/toaster/`.
+outputs; `=fields` also dumps one field's line headers in forty; `=perf`
+logs, once an emulated second, the host time each stage of the card's work
+took (`toaster perf:` lines: painting the field, scanning its headers,
+each source, the key, the mix, publishing, the Flyer's decodes and waits),
+most of it on the card's own compose thread, with `submit` and
+`compose_wait` the emulation thread's share. How the card works is
+described in [](../internals/video) and in `src/toaster/`.
 
 ## `[display]`
 
@@ -1678,6 +1683,7 @@ channel_mode = "stereo"     # "stereo" (default) or "mono"
 stereo_separation = 100     # 0-100; 100 = hardware panning, 0 = mono
 audio_filter = "auto"       # Paula filter: "auto" (guest-driven), "on", or "off"
 # stem_granularity = "master,source"  # default --audio-stems-mode; see below
+# live_lead_ms = 150        # sound kept ahead of the output device, 50-1000; see below
 ```
 
 The drive sounds are generated from scratch: motor hum with spin-up/down
@@ -1765,6 +1771,24 @@ Windows select each device directly.
 (headless-only; see [](headless.md)), so `--audio-stems-mode` need not be
 repeated on every invocation; the CLI flag still wins when both are given.
 It has no effect without `--audio-stems DIR` on the command line.
+
+(audio-live-lead)=
+### Live output lead
+
+`live_lead_ms` is how much sound the live output keeps queued ahead of the
+host's audio device, 50 to 1000 milliseconds (default 150). The real-time
+pacer runs the machine that far ahead of the wall clock, playback starts
+once that much is queued, and the sound stops when the queue runs dry
+until it holds that much again, so the lead is how long the machine may
+run slower than real time before the sound breaks up. A backlog past twice
+the lead (the machine catching up after a stall) is trimmed back to it,
+and the pacer's own catch-up limit grows with the lead. The picture is
+shown as the machine makes it, so it runs ahead of the sound by the lead,
+which is why the default is short: for a machine that runs near the
+host's limit (a Video Toaster with its Flyer playing a project, a
+transition under way) `400` keeps the sound continuous through a second
+or two of lost ground, at the cost of the sound trailing the picture by
+that much. Headless runs and `--audio-wav` captures are not affected.
 
 (recording-config)=
 ## `[recording]`

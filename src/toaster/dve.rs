@@ -31,7 +31,7 @@
 
 use super::composite;
 use super::video::{black, AMIGA_LINE0, PICTURE_H, PICTURE_LINE0, PICTURE_W, PICTURE_X0};
-use super::Toaster;
+use super::Card;
 use crate::videoslot::FieldPixels;
 
 /// Card quads per line.
@@ -87,27 +87,54 @@ pub struct DveMap {
     /// Per picture row, the source row: a picture row, or past the picture
     /// a framestore line below it (`None`: off the framestore).
     rows: Vec<Option<usize>>,
-    /// Per picture pixel, the quad code.
-    codes: Vec<u8>,
+    /// Per picture row, the quad code of each of the line's `QUADS`
+    /// quads (the card pixel's quad is `(x + PICTURE_X0) >> 2`).
+    quads: Vec<u8>,
 }
 
+/// Quads of one picture row, from the picture's first: card pixel 12 is
+/// in quad 3, pixel 763 in quad 190.
+const ROW_QUADS: usize = PICTURE_X0 / 4;
+const ROW_QUADS_END: usize = (PICTURE_X0 + PICTURE_W).div_ceil(4);
+
 impl DveMap {
+    /// A map with nothing in it, to be filled by [`Self::read_field`].
+    pub fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            quads: Vec::new(),
+        }
+    }
+
     /// Read the addressing off a field: the header and quad codes of the
     /// Amiga line under each picture row.
     pub fn from_field(field: &FieldPixels<'_>, x0: i64) -> Self {
+        let mut map = Self::empty();
+        map.read_field(field, x0);
+        map
+    }
+
+    /// [`Self::from_field`] into this map, reusing its memory.
+    pub fn read_field(&mut self, field: &FieldPixels<'_>, x0: i64) {
         let scale = field.canvas_scale as i64;
-        let mut rows = vec![None; PICTURE_H];
-        let mut codes = vec![QUAF_BYTE; PICTURE_W * PICTURE_H];
-        let mut quads = [QUAF_BYTE; QUADS];
+        self.rows.clear();
+        self.rows.resize(PICTURE_H, None);
+        self.quads.clear();
+        self.quads.resize(PICTURE_H * QUADS, QUAF_BYTE);
         let mut last_vpos = None;
         for y in 0..PICTURE_H {
             let fl = y + PICTURE_LINE0;
             let f = fl & 1;
             let vpos = AMIGA_LINE0 + (fl >> 1) as u32;
-            let Some(header) = Toaster::header(field, vpos) else {
+            let Some(header) = Card::header(field, vpos) else {
                 continue;
             };
-            if last_vpos != Some(vpos) {
+            let (before, from_here) = self.quads.split_at_mut(y * QUADS);
+            let quads = &mut from_here[..QUADS];
+            if last_vpos == Some(vpos) {
+                // The same Amiga line as the row above: its quads.
+                quads.copy_from_slice(&before[(y - 1) * QUADS..y * QUADS]);
+            } else {
                 last_vpos = Some(vpos);
                 let row = field.row(vpos).unwrap_or(&[]);
                 for (c, q) in quads.iter_mut().enumerate() {
@@ -116,17 +143,10 @@ impl DveMap {
             }
             let l = usize::from(((header.i >> 12) << 4) | (header.b >> 12));
             // Picture row = framestore line - 1.
-            rows[y] = (2 * l + f)
+            self.rows[y] = (2 * l + f)
                 .checked_sub(PICTURE_LINE0)
                 .filter(|&r| r < SOURCE_ROWS);
-            for (x, code) in codes[y * PICTURE_W..(y + 1) * PICTURE_W]
-                .iter_mut()
-                .enumerate()
-            {
-                *code = quads[(x + PICTURE_X0) >> 2];
-            }
         }
-        Self { rows, codes }
     }
 
     /// Whether any line shows a framestore line below the picture.
@@ -134,17 +154,119 @@ impl DveMap {
         self.rows.iter().flatten().any(|&r| r >= PICTURE_H)
     }
 
+    /// The quad code at picture pixel `(x, y)`.
+    fn code_at(&self, x: usize, y: usize) -> u8 {
+        self.quads[y * QUADS + ((x + PICTURE_X0) >> 2)]
+    }
+
     /// The effect's picture from a linear one: the framestore playback as
     /// addressed. `src` holds the picture rows and may go on with the
     /// lines below it; rows it lacks show black.
     pub fn apply(&self, src: &[u32], out: &mut [u32]) {
+        let black = black();
         for (y, line) in out.chunks_exact_mut(PICTURE_W).enumerate() {
-            let codes = &self.codes[y * PICTURE_W..(y + 1) * PICTURE_W];
-            let src_row = self.rows[y].and_then(|r| src.get(r * PICTURE_W..(r + 1) * PICTURE_W));
-            for (x, (o, &q)) in line.iter_mut().zip(codes).enumerate() {
-                *o = match q {
-                    0..=191 => {
-                        // Card pixel p = x + 12 shows sample 4q + (p & 3).
+            let Some(&row) = self.rows.get(y) else {
+                line.fill(black);
+                continue;
+            };
+            let quads = &self.quads[y * QUADS..(y + 1) * QUADS];
+            let src_row = row.and_then(|r| src.get(r * PICTURE_W..(r + 1) * PICTURE_W));
+            // Quad by quad: card pixel p = x + 12 shows sample 4q + (p & 3),
+            // and the picture's own columns are samples 12 on, so the
+            // quad's four pixels are source pixels 4q - 12 + (0..4) when
+            // those exist.
+            for c in ROW_QUADS..ROW_QUADS_END {
+                let x0 = (c * 4).saturating_sub(PICTURE_X0);
+                let x1 = (c * 4 + 4 - PICTURE_X0).min(PICTURE_W);
+                let pixels = &mut line[x0..x1];
+                let fill = match quads[c] {
+                    q @ 0..=191 => {
+                        let first = 4 * usize::from(q) + (x0 + PICTURE_X0) % 4;
+                        match src_row.and_then(|row| row.get(first.wrapping_sub(PICTURE_X0)..)) {
+                            Some(from) if first >= PICTURE_X0 && from.len() >= pixels.len() => {
+                                pixels.copy_from_slice(&from[..pixels.len()]);
+                                continue;
+                            }
+                            Some(from) if first >= PICTURE_X0 => {
+                                pixels[..from.len()].copy_from_slice(from);
+                                pixels[from.len()..].fill(black);
+                                continue;
+                            }
+                            // Samples left of the picture: the ones the
+                            // picture has, black for the rest.
+                            _ => {
+                                for (j, o) in pixels.iter_mut().enumerate() {
+                                    let sample = first + j;
+                                    *o = src_row
+                                        .and_then(|row| {
+                                            sample
+                                                .checked_sub(PICTURE_X0)
+                                                .and_then(|sx| row.get(sx))
+                                        })
+                                        .copied()
+                                        .unwrap_or(black);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    q @ 0xE8..=0xEF => colour_quad(q),
+                    _ => black,
+                };
+                pixels.fill(fill);
+            }
+        }
+    }
+
+    /// The fader's B weight per pixel for the DVE key modes: under QUAF
+    /// every quad but `$FF` shows the effect; under TRANSQUAD only the
+    /// drop-shadow quads do, a pixel at a time (bit `3 - j` of the code).
+    pub fn key(&self, transquad: bool, cd: u8) -> Vec<u8> {
+        let mut key = Vec::new();
+        self.key_into(transquad, cd, &mut key);
+        key
+    }
+
+    /// [`Self::key`] into a buffer kept between frames.
+    pub fn key_into(&self, transquad: bool, cd: u8, out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(PICTURE_W * PICTURE_H, 0);
+        for (y, line) in out.chunks_exact_mut(PICTURE_W).enumerate() {
+            for (x, k) in line.iter_mut().enumerate() {
+                let q = self.code_at(x, y);
+                let j = (x + PICTURE_X0) & 3;
+                let on = if transquad {
+                    q >= 0xF8 && (q >> (3 - j)) & 1 != 0
+                } else {
+                    q != QUAF_BYTE
+                };
+                *k = if on { cd } else { 0 };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_with(rows: Vec<Option<usize>>, quad_of: impl Fn(usize, usize) -> u8) -> DveMap {
+        let mut quads = vec![QUAF_BYTE; QUADS * PICTURE_H];
+        for y in 0..PICTURE_H {
+            for c in 0..QUADS {
+                quads[y * QUADS + c] = quad_of(y, c);
+            }
+        }
+        DveMap { rows, quads }
+    }
+
+    /// The addressing applied one pixel at a time, as the card does it.
+    fn apply_reference(map: &DveMap, src: &[u32], out: &mut [u32]) {
+        for (y, line) in out.chunks_exact_mut(PICTURE_W).enumerate() {
+            let src_row = map.rows[y].and_then(|r| src.get(r * PICTURE_W..(r + 1) * PICTURE_W));
+            for (x, o) in line.iter_mut().enumerate() {
+                *o = match map.code_at(x, y) {
+                    q @ 0..=191 => {
                         let p = x + PICTURE_X0;
                         let sample = 4 * usize::from(q) + (p & 3);
                         src_row
@@ -154,49 +276,56 @@ impl DveMap {
                             .copied()
                             .unwrap_or_else(black)
                     }
-                    0xE8..=0xEF => colour_quad(q),
+                    q @ 0xE8..=0xEF => colour_quad(q),
                     _ => black(),
                 };
             }
         }
     }
 
-    /// The fader's B weight per pixel for the DVE key modes: under QUAF
-    /// every quad but `$FF` shows the effect; under TRANSQUAD only the
-    /// drop-shadow quads do, a pixel at a time (bit `3 - j` of the code).
-    pub fn key(&self, transquad: bool, cd: u8) -> Vec<u8> {
-        self.codes
-            .iter()
-            .enumerate()
-            .map(|(i, &q)| {
-                let j = (i % PICTURE_W + PICTURE_X0) & 3;
-                let on = if transquad {
-                    q >= 0xF8 && (q >> (3 - j)) & 1 != 0
-                } else {
-                    q != QUAF_BYTE
-                };
-                if on {
-                    cd
-                } else {
-                    0
-                }
+    #[test]
+    fn the_quad_by_quad_apply_matches_the_pixel_by_pixel_one() {
+        // Quads from everywhere: the line's start (samples left of the
+        // picture), its end (past it), colours, shadows, transparency,
+        // and rows from off the framestore.
+        let mut seed = 0x2545_F491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let rows: Vec<Option<usize>> = (0..PICTURE_H)
+            .map(|_| match next() % 8 {
+                0 => None,
+                1 => Some(PICTURE_H + (next() as usize % 40)),
+                _ => Some(next() as usize % PICTURE_H),
             })
-            .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn map_with(rows: Vec<Option<usize>>, quad_of: impl Fn(usize, usize) -> u8) -> DveMap {
-        let mut codes = vec![QUAF_BYTE; PICTURE_W * PICTURE_H];
-        for y in 0..PICTURE_H {
-            for x in 0..PICTURE_W {
-                codes[y * PICTURE_W + x] = quad_of(y, (x + PICTURE_X0) >> 2);
-            }
-        }
-        DveMap { rows, codes }
+            .collect();
+        let codes: Vec<u8> = (0..PICTURE_H * QUADS)
+            .map(|_| match next() % 10 {
+                0 => QUAF_BYTE,
+                1 => 0xE8 + (next() % 8) as u8,
+                2 => 0xF8 + (next() % 7) as u8,
+                3 => 0xC0 + (next() % 40) as u8,
+                4 => (next() % 4) as u8,
+                5 => 188 + (next() % 4) as u8,
+                _ => (next() % 192) as u8,
+            })
+            .collect();
+        let map = map_with(rows, |y, c| codes[y * QUADS + c]);
+        let mut src = ramp();
+        let border = u32::from_le_bytes([200, 10, 10, 0xFF]);
+        src.extend(std::iter::repeat_n(border, PICTURE_W * 20));
+        let mut fast = vec![0; PICTURE_W * PICTURE_H];
+        let mut slow = vec![0; PICTURE_W * PICTURE_H];
+        map.apply(&src, &mut fast);
+        apply_reference(&map, &src, &mut slow);
+        assert_eq!(fast, slow);
+        // And with only the picture rows to read from.
+        map.apply(&src[..PICTURE_W * PICTURE_H], &mut fast);
+        apply_reference(&map, &src[..PICTURE_W * PICTURE_H], &mut slow);
+        assert_eq!(fast, slow);
     }
 
     fn ramp() -> Vec<u32> {

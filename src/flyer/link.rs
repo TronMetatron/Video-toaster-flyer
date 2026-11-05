@@ -22,6 +22,15 @@
 //! normally ready; one that is not is waited for, or decoded on the spot if
 //! no worker has started it, so the picture never depends on how fast the
 //! host is. A channel nobody looks at costs only the read-ahead.
+//!
+//! The Toaster composes its outputs on a thread of its own, a field or two
+//! behind the machine, so what a channel showed is not read off the link
+//! by that thread (it would see whatever the Flyer had shown by then): the
+//! Toaster takes each channel's fields shown since its last frame
+//! ([`FlyerLink::take_shown`]) and the sound since then at a fixed point of
+//! emulated time, on the emulation thread, and hands them to the compose
+//! thread with the field. The weave ([`FlyerLink::weave_shown`]) then
+//! happens there, in order, into the channel's picture.
 
 use super::clip::ClipFile;
 use std::collections::{HashMap, VecDeque};
@@ -46,17 +55,33 @@ pub const BLACK: u32 = u32::from_le_bytes([0, 0, 0, 0xFF]);
 /// One playback channel's output as a picture: its two fields woven.
 struct Channel {
     picture: Vec<u32>,
-    /// Fields shown since the picture was last woven, by line parity.
-    pending: [Option<(Arc<ClipFile>, u32)>; 2],
+    /// What the channel showed since the picture was last woven: see
+    /// [`push_shown`].
+    pending: Vec<FieldSource>,
 }
 
 impl Default for Channel {
     fn default() -> Self {
         Self {
             picture: vec![BLACK; PICTURE_W * PICTURE_H],
-            pending: [None, None],
+            pending: Vec::new(),
         }
     }
+}
+
+/// Note that a channel showed `source`, keeping only what the next weave
+/// needs: a matte wipes the picture, so anything before it is moot, and of
+/// the clip fields after the last matte only the latest of each line
+/// parity reaches the picture.
+pub fn push_shown(shown: &mut Vec<FieldSource>, source: FieldSource) {
+    match &source {
+        FieldSource::Matte(_) => shown.clear(),
+        FieldSource::Clip(_, n) => {
+            let parity = n & 1;
+            shown.retain(|s| !matches!(s, FieldSource::Clip(_, m) if m & 1 == parity));
+        }
+    }
+    shown.push(source);
 }
 
 /// Most of the Flyer's sound kept when nobody takes it: one second.
@@ -104,19 +129,18 @@ impl FlyerLink {
         self.lock().routed = [input3, input4];
     }
 
+    /// The routing: whether inputs 3 and 4 show channels A and B.
+    pub fn routing(&self) -> [bool; 2] {
+        self.lock().routed
+    }
+
     /// Channel `ch` (0 = A, 1 = B) shows `source` this field.
     pub fn show(&self, ch: usize, source: FieldSource) {
         let mut s = self.lock();
         let Some(channel) = s.channels.get_mut(ch) else {
             return;
         };
-        match source {
-            FieldSource::Clip(clip, n) => channel.pending[(n & 1) as usize] = Some((clip, n)),
-            FieldSource::Matte(rgba) => {
-                channel.pending = [None, None];
-                channel.picture.fill(rgba);
-            }
-        }
+        push_shown(&mut channel.pending, source);
     }
 
     /// A channel will show field `n` of `clip` soon: decode it ahead.
@@ -155,33 +179,53 @@ impl FlyerLink {
     }
 
     /// Channel `ch`'s current picture into `out` (752 x 480), weaving in
-    /// the fields it showed since the last call.
+    /// the fields it showed since the last call. [`Self::take_shown`] and
+    /// [`Self::weave_shown`] are the same in two steps.
     pub fn picture(&self, ch: usize, out: &mut [u32]) {
-        let jobs: Vec<(Arc<ClipFile>, u32)> = {
-            let mut s = self.lock();
-            let Some(channel) = s.channels.get_mut(ch) else {
-                out.fill(BLACK);
-                return;
-            };
-            channel
-                .pending
-                .iter_mut()
-                .filter_map(Option::take)
-                .collect()
-        };
-        // Both fields queued first, so a worker can take one while this
-        // thread decodes the other.
-        for (clip, n) in &jobs {
-            self.decoder.prefetch(clip, *n);
+        let shown = self.take_shown(ch);
+        self.weave_shown(ch, &shown, out);
+    }
+
+    /// What channel `ch` showed since the last call, for
+    /// [`Self::weave_shown`].
+    pub fn take_shown(&self, ch: usize) -> Vec<FieldSource> {
+        let mut s = self.lock();
+        match s.channels.get_mut(ch) {
+            Some(channel) => std::mem::take(&mut channel.pending),
+            None => Vec::new(),
         }
-        let fields: Vec<(u32, Arc<Decoded>)> = jobs
+    }
+
+    /// Weave what channel `ch` showed (from [`Self::take_shown`], in the
+    /// order taken) into its picture, and copy the picture into `out`.
+    pub fn weave_shown(&self, ch: usize, shown: &[FieldSource], out: &mut [u32]) {
+        if ch >= 2 {
+            out.fill(BLACK);
+            return;
+        }
+        // Every field queued first, so a worker can take one while this
+        // thread decodes another.
+        for source in shown {
+            if let FieldSource::Clip(clip, n) = source {
+                self.decoder.prefetch(clip, *n);
+            }
+        }
+        let fields: Vec<Option<(u32, Arc<Decoded>)>> = shown
             .iter()
-            .filter_map(|(clip, n)| self.decoder.field(clip, *n).map(|f| (*n, f)))
+            .map(|source| match source {
+                FieldSource::Clip(clip, n) => self.decoder.field(clip, *n).map(|f| (*n, f)),
+                FieldSource::Matte(_) => None,
+            })
             .collect();
         let mut s = self.lock();
         let channel = &mut s.channels[ch];
-        for (n, field) in fields {
-            weave(&field, n, &mut channel.picture);
+        for (source, field) in shown.iter().zip(fields) {
+            match (source, field) {
+                (FieldSource::Matte(rgba), _) => channel.picture.fill(*rgba),
+                (_, Some((n, field))) => weave(&field, n, &mut channel.picture),
+                // A clip field without a picture leaves the lines as they were.
+                (_, None) => {}
+            }
         }
         let len = out.len().min(channel.picture.len());
         out[..len].copy_from_slice(&channel.picture[..len]);
@@ -577,6 +621,52 @@ mod tests {
         assert_eq!(c.entries.len(), CACHE_FIELDS);
         assert!(c.entries.contains_key(&(clip.id(), 63)));
         assert!(!c.entries.contains_key(&(clip.id(), 0)));
+    }
+
+    #[test]
+    fn what_a_channel_showed_keeps_only_what_the_weave_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Clip");
+        super::super::clip::tests::write_test_clip(&path, 2);
+        let clip = Arc::new(ClipFile::open(&path).unwrap());
+        let link = FlyerLink::new();
+        let white = u32::from_le_bytes([255, 255, 255, 255]);
+        // Two fields of each parity: the latest of each stays, in order.
+        for n in [4, 5, 6, 7] {
+            link.show(0, FieldSource::Clip(Arc::clone(&clip), n));
+        }
+        let shown = link.take_shown(0);
+        let fields: Vec<u32> = shown
+            .iter()
+            .filter_map(|s| match s {
+                FieldSource::Clip(_, n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields, vec![6, 7]);
+        // A matte wipes what came before it; a field after it is kept.
+        link.show(0, FieldSource::Clip(Arc::clone(&clip), 4));
+        link.show(0, FieldSource::Matte(white));
+        link.show(0, FieldSource::Clip(Arc::clone(&clip), 5));
+        let shown = link.take_shown(0);
+        assert_eq!(shown.len(), 2);
+        assert!(matches!(shown[0], FieldSource::Matte(c) if c == white));
+        assert!(matches!(shown[1], FieldSource::Clip(_, 5)));
+        // Woven in that order: white with field 5 on the odd lines, and
+        // the same picture whether woven in one step or two.
+        let mut a = vec![0u32; PICTURE_W * PICTURE_H];
+        link.weave_shown(0, &shown, &mut a);
+        assert_eq!(a[100 * PICTURE_W + 300], white);
+        let grey = |p: u32| p.to_le_bytes()[1];
+        assert!(grey(a[101 * PICTURE_W + 300]) < 200);
+        let other = FlyerLink::new();
+        other.show(0, FieldSource::Clip(Arc::clone(&clip), 4));
+        other.show(0, FieldSource::Matte(white));
+        other.show(0, FieldSource::Clip(clip, 5));
+        let mut b = vec![0u32; PICTURE_W * PICTURE_H];
+        other.picture(0, &mut b);
+        assert_eq!(a, b);
+        assert!(link.take_shown(0).is_empty());
     }
 
     #[test]

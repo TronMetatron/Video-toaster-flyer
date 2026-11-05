@@ -2014,6 +2014,10 @@ pub struct AudioConfig {
     /// `None` when unset (a bare `--audio-stems` then requires an explicit
     /// `--audio-stems-mode`, per the CLI's own validation).
     pub stem_granularity: Option<Vec<crate::audio::mux::StemGranularity>>,
+    /// Milliseconds of sound the live output keeps ahead of the host's
+    /// device, 50-1000: how long the machine may fall behind real time
+    /// before the sound stops. The default is `audio::DEFAULT_LIVE_LEAD_MS`.
+    pub live_lead_ms: u32,
 }
 
 impl Default for AudioConfig {
@@ -2028,6 +2032,7 @@ impl Default for AudioConfig {
             stereo_separation: 100,
             filter: AudioFilterMode::Auto,
             stem_granularity: None,
+            live_lead_ms: crate::audio::DEFAULT_LIVE_LEAD_MS,
         }
     }
 }

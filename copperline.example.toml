@@ -916,6 +916,13 @@ floppy_sounds_volume = 100
 # Has no effect without `--audio-stems DIR` on the command line.
 # stem_granularity = "master,source"
 
+# How much sound, in milliseconds, the live output keeps ahead of the
+# host's device (50-1000, default 150): how long the machine may run slower
+# than real time before the sound stops and restarts. A machine near the
+# host's limit (a Video Toaster with the Flyer playing a project) is
+# smoother with 400; the sound then trails the picture by that much.
+# live_lead_ms = 150
+
 
 # Host input preferences.
 # [input]

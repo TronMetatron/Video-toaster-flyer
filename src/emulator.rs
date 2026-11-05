@@ -4630,6 +4630,7 @@ fn build_machine_inner(
     paula.set_mono_output(cfg.audio.channel_mode.is_mono());
     paula.set_stereo_separation(f32::from(cfg.audio.stereo_separation) / 100.0);
     paula.set_led_filter_mode(cfg.audio.filter);
+    crate::audio::set_live_lead_ms(cfg.audio.live_lead_ms);
     if cfg.audio.channel_mode.is_mono() && cfg.audio.stereo_separation != 100 {
         log::warn!("[audio] stereo_separation is ignored while channel_mode is mono");
     }
