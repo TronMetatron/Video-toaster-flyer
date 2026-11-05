@@ -5,6 +5,15 @@ Online demo: [copperline.dev/try](https://copperline.dev/try/) |
 Chat: [Discord](https://discord.gg/HDTjt3tYAC) |
 Support: [Patreon](https://www.patreon.com/cw/Copperline)
 
+> **This fork: Video Toaster 4000 and Video Toaster Flyer.** The
+> `main` branch of this repository is Copperline with an emulated NewTek
+> Video Toaster 4000 in the video slot (the real 4.2 switcher, CG, effects,
+> framestores and keys run on it) and a high-level emulation of the Video
+> Toaster Flyer. See [docs/toaster](docs/toaster/README.md) for the
+> working specs, `docs/internals/video.md` (Toaster section) for how it is
+> built, and `docs/guide/configuration.md` (`[video_slot]`) for setting it
+> up. NewTek's software is not included.
+
 Copperline is a cycle-driven Commodore Amiga emulator (OCS, ECS, and AGA) written in Rust. It models the Amiga custom chipset, 680x0 CPU, memory subsystems, and common expansion hardware on a unified clock timeline.
 
 It boots out of the box with the bundled open-source AROS Kickstart replacement, and supports official Kickstart ROMs (1.x through 3.2, plus the CDTV and CD32 extended ROMs), DiagROM, and standard disk, hardfile, and CD media.
