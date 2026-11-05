@@ -20,7 +20,18 @@
 //! mixed field of sound goes to the Toaster through the [`FlyerLink`].
 //! What the firmware does to keep its SCSI drives fed (A/B heads, drive
 //! arbitration, prerolls) is not needed: clips are read straight from the
-//! host's files.
+//! host's files. Each field the player also tells the link which fields
+//! the channels will show next, so they are decoded before they are due.
+//!
+//! Jog and shuttle (`acts.c` `SearchArgs`, `DoSearch`): SRCHARGS opens a
+//! session on a clip (holding the video channel, as the firmware's channel
+//! semaphore does, so a FLYPLAY for it waits), and each DOSEARCH puts one
+//! colour frame on the channel from the next colour-frame boundary, where
+//! it loops until the next, with its sound: the frame's four fields
+//! through the session's DSP pair, again and again until the next frame
+//! (or once, with `APF_AUTOMUTE`). A DOSEARCH waits for the previous
+//! frame to take before it queues its own, which is what paces the
+//! switcher's shuttle loop to a frame per colour frame.
 //!
 //! The DSP: each channel has a volume (`$FFFF` = full) and a pan (the API's
 //! signed word, `-$8000` left to `$7FFF` right, which the firmware turns
@@ -69,10 +80,11 @@ pub mod caf {
 }
 
 /// Permission flags (`CAPF_`).
-const CAPF_ERRIFBUSY: u8 = 0x04;
+pub const CAPF_ERRIFBUSY: u8 = 0x04;
+const CAPF_AUTOMUTE: u8 = 0x08;
 
 /// More `ERR_` codes (`Errors.h`).
-const ERR_CHANINUSE: u8 = 0x0A;
+pub const ERR_CHANINUSE: u8 = 0x0A;
 const ERR_WRONGDATATYPE: u8 = 0x60;
 
 /// DSP channels, and video channels.
@@ -84,6 +96,9 @@ pub const VIDEO_CHANNELS: usize = 2;
 const PLAY_LEAD: u32 = 20;
 const SEQUENCE_LEAD: u32 = 60;
 
+/// Fields decoded ahead of the field clock on each channel.
+const READ_AHEAD: u32 = 8;
+
 /// Who an event belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Owner {
@@ -91,6 +106,64 @@ pub enum Owner {
     Sequence,
     /// The FLYPLAY in this command slot.
     Play(usize),
+    /// The jog/shuttle session.
+    Search,
+}
+
+/// How a command that may have to wait went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Finished with this error code.
+    Done(u8),
+    /// Not yet: try again next field (the firmware's task is waiting).
+    Wait,
+}
+
+/// A colour frame a DOSEARCH put up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SearchFrame {
+    /// The frame's first field.
+    first: u32,
+    /// The field it takes at (a multiple of four).
+    start: u32,
+    /// Its sound plays (through the session's pair).
+    audio: bool,
+    /// The sound plays once, not looped (`APF_AUTOMUTE`).
+    automute: bool,
+}
+
+/// A jog/shuttle session (`JogMach`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Search {
+    /// SRCHARGS opens less closes (`ji_nestcount`).
+    nest: u32,
+    clip: PathBuf,
+    fields: u32,
+    has_video: bool,
+    audio_chans: u8,
+    /// The video channel, and whether the session holds it (opened with
+    /// video).
+    channel: u8,
+    holds_channel: bool,
+    /// The frames go to the video channel (else to an audio engine only).
+    on_video: bool,
+    /// The DSP pair the session was given.
+    audio: Option<AudioUse>,
+    /// Frames put up, oldest first: the one showing and any still to take.
+    frames: Vec<SearchFrame>,
+    /// The last DOSEARCH's level changes have all happened by this field
+    /// (`WaitJogDSPsettled`).
+    settled: u32,
+    /// The DOSEARCH whose frame is queued but whose level changes wait for
+    /// the previous ones: its slot, and the frame.
+    half_done: Option<(usize, SearchFrame)>,
+}
+
+impl Search {
+    /// The frame showing at `clock`.
+    fn frame_at(&self, clock: u32) -> Option<SearchFrame> {
+        self.frames.iter().rev().find(|f| f.start <= clock).copied()
+    }
 }
 
 /// Audio an event feeds to the DSP.
@@ -232,6 +305,9 @@ pub struct Player {
     /// A channel shows black once its clip is done.
     matte_after: [bool; VIDEO_CHANNELS],
     shown: [Shown; VIDEO_CHANNELS],
+    /// The jog/shuttle session, while one is open.
+    #[serde(default)]
+    search: Option<Search>,
     /// Open clips, by host path.
     #[serde(skip)]
     clips: HashMap<PathBuf, Arc<ClipFile>>,
@@ -694,13 +770,16 @@ impl Player {
         Ok(())
     }
 
-    /// The first DSP pair no live event uses (`AllocAudioChan`).
+    /// The first DSP pair no live event or jog session uses
+    /// (`AllocAudioChan`).
     fn free_pair(&self) -> Option<u8> {
+        let search = self.search.as_ref().and_then(|s| s.audio).map(|a| a.dsp);
         (0..DSP_CHANNELS as u8).step_by(2).find(|&pair| {
-            !self
-                .live
-                .iter()
-                .any(|e| e.audio.is_some_and(|a| a.dsp == pair))
+            search != Some(pair)
+                && !self
+                    .live
+                    .iter()
+                    .any(|e| e.audio.is_some_and(|a| a.dsp == pair))
         })
     }
 
@@ -781,6 +860,7 @@ impl Player {
         self.dsp = Default::default();
         self.sequence_playing = false;
         self.last_play_audio = 0;
+        self.search = None;
     }
 
     /// Drop an owner's events without finishing its command.
@@ -857,8 +937,337 @@ impl Player {
     }
 
     // ---------------------------------------------------------------
+    // Jog and shuttle
+    // ---------------------------------------------------------------
+
+    /// Whether a jog session holds video channel `ch` (a FLYPLAY for it
+    /// waits, as on the firmware's channel semaphore).
+    pub fn channel_held(&self, ch: u8) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|s| s.holds_channel && s.channel == ch)
+    }
+
+    /// Whether a jog session is open.
+    pub fn search_open(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// SRCHARGS 1 (`SearchArgs`, setting up): open a session on `clip`, or
+    /// count another opening of the one already open. With video it waits
+    /// for a clip playing on the channel to finish.
+    pub fn open_search(&mut self, r: &Request, clip: Option<ClipInfo>) -> Step {
+        if let Some(s) = self.search.as_mut() {
+            // "Jog Already Open!": counted, nothing else.
+            s.nest += 1;
+            return Step::Done(err::OKAY);
+        }
+        let Some(clip) = clip else {
+            return Step::Done(mailbox::err::OBJNOTFOUND);
+        };
+        if r.video() && usize::from(r.channel) >= VIDEO_CHANNELS {
+            return Step::Done(err::BADPARAM);
+        }
+        if r.video()
+            && self
+                .live
+                .iter()
+                .any(|e| e.video == Some(r.channel) && matches!(e.owner, Owner::Play(_)))
+        {
+            return Step::Wait;
+        }
+        let mut search = Search {
+            nest: 1,
+            clip: clip.path,
+            fields: clip.fields,
+            has_video: clip.video,
+            audio_chans: clip.audio_chans,
+            channel: r.channel,
+            holds_channel: r.video(),
+            on_video: r.video(),
+            audio: None,
+            frames: Vec::new(),
+            settled: 0,
+            half_done: None,
+        };
+        search.audio = self.search_audio(r, &search);
+        log::info!(
+            "flyer: jog session on {}{}",
+            search.clip.display(),
+            if search.on_video {
+                [", channel A", ", channel B"][usize::from(r.channel) % 2]
+            } else {
+                ""
+            }
+        );
+        self.search = Some(search);
+        Step::Done(err::OKAY)
+    }
+
+    /// The DSP pair for a session's sound, if it asks for sound and one is
+    /// free.
+    fn search_audio(&self, r: &Request, s: &Search) -> Option<AudioUse> {
+        let count = r.audio_count();
+        if count == 0 || s.audio_chans == 0 {
+            return None;
+        }
+        self.free_pair().map(|dsp| AudioUse {
+            dsp,
+            count: s.audio_chans.min(2),
+            right_only: false,
+        })
+    }
+
+    /// Silence the session's pair and let it go (`FreeAudioChan`).
+    fn free_search_audio(&mut self) {
+        let Some(a) = self.search.as_mut().and_then(|s| s.audio.take()) else {
+            return;
+        };
+        for c in 0..2 {
+            self.dsp[usize::from(a.dsp + c) % DSP_CHANNELS] = Dsp::default();
+        }
+        self.dsp_queue.retain(|e| e.owner != Owner::Search);
+    }
+
+    /// SRCHARGS 2 (`FindFieldAudio`): new sound settings for the session,
+    /// once its last level changes have happened.
+    pub fn change_search(&mut self, r: &Request, clock: u32) -> Step {
+        let Some(s) = self.search.as_ref() else {
+            return Step::Done(err::OKAY);
+        };
+        if clock < s.settled {
+            return Step::Wait;
+        }
+        self.free_search_audio();
+        let s = self.search.as_ref().expect("checked");
+        let audio = self.search_audio(r, s);
+        let s = self.search.as_mut().expect("checked");
+        s.audio = audio;
+        s.on_video = r.video();
+        Step::Done(err::OKAY)
+    }
+
+    /// SRCHARGS 0 (`EndFindField`): close the session once its last frame
+    /// has taken: its sound goes quiet, the channel shows black with
+    /// `CAF_USEMATTE` (else it keeps the frame), and is free again.
+    pub fn close_search(&mut self, r: &Request, clock: u32, link: Option<&FlyerLink>) -> Step {
+        let Some(s) = self.search.as_mut() else {
+            return Step::Done(err::OKAY);
+        };
+        if s.nest > 1 {
+            s.nest -= 1;
+            return Step::Done(err::OKAY);
+        }
+        if s.frames.last().is_some_and(|f| f.start > clock) {
+            return Step::Wait;
+        }
+        self.free_search_audio();
+        let s = self.search.take().expect("checked");
+        let ch = usize::from(s.channel) % VIDEO_CHANNELS;
+        if s.on_video && r.video() && r.flags & caf::USEMATTE != 0 {
+            self.show(ch, Shown::Black, link);
+            self.matte_after[ch] = true;
+        }
+        log::info!("flyer: jog session closed");
+        Step::Done(err::OKAY)
+    }
+
+    /// DOSEARCH (`DoSearch`): put up the colour frame holding the field the
+    /// ClipAction at `action` names, with its sound. It waits for the
+    /// previous frame to take, then queues its own for the next colour
+    /// frame, and completes once the previous frame's level changes have
+    /// happened, with `LastFieldDone` set to the field.
+    pub fn do_search(
+        &mut self,
+        slot: Slot,
+        sram: &mut [u8],
+        action: usize,
+        clock: u32,
+        link: Option<&FlyerLink>,
+    ) -> Step {
+        let Some(s) = self.search.as_ref() else {
+            return Step::Done(err::BADPARAM);
+        };
+        // The second half of a DOSEARCH whose frame is already queued.
+        if let Some((held, frame)) = s.half_done {
+            if held == slot.0 {
+                if clock < s.settled {
+                    return Step::Wait;
+                }
+                let r = Request::read(sram, action);
+                self.search.as_mut().expect("checked").half_done = None;
+                return self.finish_search(sram, &r, frame);
+            }
+        }
+        let mut r = Request::read(sram, action);
+        let n = if r.video() { r.vid_start } else { r.aud_start };
+        if n >= s.fields {
+            return Step::Done(err::BADPARAM);
+        }
+        // "Wait for new video to take."
+        if s.frames.last().is_some_and(|f| f.start > clock) {
+            return Step::Wait;
+        }
+        if r.video() && !s.has_video {
+            r.flags &= !caf::VIDEO;
+        }
+        let count = r.audio_count();
+        if count > 0 && s.audio_chans == 0 {
+            r.flags &= !(caf::AUDIOL | caf::AUDIOR);
+        } else if count == 2 && s.audio_chans < 2 {
+            r.flags &= !caf::AUDIOR;
+        }
+        wr8(sram, action + ca::FLAGS, r.flags);
+        let wants_sound = r.audio_count() > 0;
+        if !r.video() && !wants_sound {
+            return Step::Done(err::OKAY);
+        }
+        // The next colour frame, or this one if it is just starting and
+        // nothing of the session's is showing yet.
+        let start = if clock & 3 == 0 && s.frames.is_empty() {
+            clock
+        } else {
+            clock.wrapping_add(4) & !3
+        };
+        let frame = SearchFrame {
+            first: n & !3,
+            start,
+            audio: wants_sound && s.audio.is_some(),
+            automute: r.permiss & CAPF_AUTOMUTE != 0,
+        };
+        let settled = s.settled;
+        let path = s.clip.clone();
+        if let (Some(link), Some(clip)) = (link, self.clip(&path)) {
+            for k in 0..4 {
+                link.prefetch(&clip, frame.first + k);
+            }
+            link.prefetch_sound(&clip, frame.first / 4);
+        }
+        log::debug!(
+            "flyer: search field {n}: colour frame from field {} at clock {start} (now {clock})",
+            frame.first
+        );
+        let s = self.search.as_mut().expect("checked");
+        let showing = s.frame_at(clock);
+        s.frames.clear();
+        s.frames.extend(showing);
+        s.frames.push(frame);
+        if wants_sound && clock < settled {
+            s.half_done = Some((slot.0, frame));
+            return Step::Wait;
+        }
+        self.finish_search(sram, &r, frame)
+    }
+
+    /// The level changes of a DOSEARCH's frame, and its completion.
+    fn finish_search(&mut self, sram: &mut [u8], r: &Request, frame: SearchFrame) -> Step {
+        let s = self.search.as_mut().expect("a session");
+        if let (true, Some(a)) = (r.audio_count() > 0, s.audio) {
+            let chans = if s.audio_chans == 2 { 2 } else { 1 };
+            for c in 0..chans {
+                let chan = a.dsp + 1 + c;
+                insert_dsp(
+                    &mut self.dsp_queue,
+                    DspEvent {
+                        time: frame.start,
+                        chan,
+                        volume: r.sustain[usize::from(c)],
+                        pan: r.pan[usize::from(c)],
+                        rate: r.attack,
+                        owner: Owner::Search,
+                    },
+                );
+                if frame.automute {
+                    insert_dsp(
+                        &mut self.dsp_queue,
+                        DspEvent {
+                            time: frame.start.wrapping_add(4),
+                            chan,
+                            volume: 0,
+                            pan: 0,
+                            rate: 0,
+                            owner: Owner::Search,
+                        },
+                    );
+                }
+            }
+            s.settled = frame.start.wrapping_add(if frame.automute { 4 } else { 0 });
+        }
+        let done = if r.video() { r.vid_start } else { r.aud_start };
+        wr32(sram, r.action + ca::LAST_FIELD_DONE, done);
+        Step::Done(err::OKAY)
+    }
+
+    /// The field a jog session shows on channel `ch` at `clock`: its frame
+    /// looping.
+    fn search_field(&self, ch: usize, clock: u32) -> Option<(PathBuf, u32)> {
+        let s = self.search.as_ref()?;
+        if !s.on_video || usize::from(s.channel) != ch {
+            return None;
+        }
+        let f = s.frame_at(clock)?;
+        Some((s.clip.clone(), f.first + (clock - f.start) % 4))
+    }
+
+    /// The field of sound a jog session plays at `clock`, if any.
+    fn search_sound(&self, clock: u32) -> Option<(PathBuf, u32, AudioUse)> {
+        let s = self.search.as_ref()?;
+        let a = s.audio?;
+        let f = s.frame_at(clock)?;
+        let age = clock - f.start;
+        if !f.audio || (f.automute && age >= 4) {
+            return None;
+        }
+        Some((s.clip.clone(), f.first + age % 4, a))
+    }
+
+    // ---------------------------------------------------------------
     // Every field
     // ---------------------------------------------------------------
+
+    /// What channel `ch` shows at `clock`: a jog frame, the latest video
+    /// event covering it, or `None` (black or held, per the matte).
+    fn video_at(&self, ch: usize, clock: u32) -> Option<Shown> {
+        if let Some((path, n)) = self.search_field(ch, clock) {
+            return Some(Shown::Clip(path, n));
+        }
+        let e = self
+            .live
+            .iter()
+            .filter(|e| e.video == Some(ch as u8) && e.covers(clock))
+            .max_by_key(|e| e.start)?;
+        Some(match &e.clip {
+            Some(path) => Shown::Clip(path.clone(), e.first + (clock - e.start)),
+            None => Shown::Black,
+        })
+    }
+
+    /// Tell the link what the channels will show in the next fields, and
+    /// which sound will be wanted, so it is ready before it is due.
+    fn read_ahead(&mut self, clock: u32, link: &FlyerLink) {
+        for d in 1..=READ_AHEAD {
+            let t = clock.wrapping_add(d);
+            for ch in 0..VIDEO_CHANNELS {
+                if let Some(Shown::Clip(path, n)) = self.video_at(ch, t) {
+                    if let Some(clip) = self.clip(&path) {
+                        link.prefetch(&clip, n);
+                    }
+                }
+            }
+        }
+        let t = clock.wrapping_add(4);
+        let sounds: Vec<(PathBuf, u32)> = self
+            .live
+            .iter()
+            .filter(|e| e.audio.is_some() && e.covers(t))
+            .filter_map(|e| Some((e.clip.clone()?, e.first + (t - e.start))))
+            .collect();
+        for (path, n) in sounds {
+            if let Some(clip) = self.clip(&path) {
+                link.prefetch_sound(&clip, n / 4);
+            }
+        }
+    }
 
     /// Field `clock` begins: show its video, mix its sound, and finish
     /// what is done.
@@ -890,16 +1299,8 @@ impl Player {
         }
         // Video.
         for ch in 0..VIDEO_CHANNELS {
-            let now = self
-                .live
-                .iter()
-                .filter(|e| e.video == Some(ch as u8) && e.covers(clock))
-                .max_by_key(|e| e.start);
-            let what = match now {
-                Some(e) => match &e.clip {
-                    Some(path) => Shown::Clip(path.clone(), e.first + (clock - e.start)),
-                    None => Shown::Black,
-                },
+            let what = match self.video_at(ch, clock) {
+                Some(what) => what,
                 None if self.matte_after[ch] => Shown::Black,
                 None => continue,
             };
@@ -909,6 +1310,7 @@ impl Player {
         let sound = self.mix(clock);
         if let Some(link) = link {
             link.push_sound(&sound);
+            self.read_ahead(clock, link);
         }
         // What ended with this field.
         let next = clock.wrapping_add(1);
@@ -959,12 +1361,26 @@ impl Player {
     /// DSP channels.
     fn mix(&mut self, clock: u32) -> Vec<(f32, f32)> {
         let mut input: [Option<Vec<f32>>; DSP_CHANNELS] = Default::default();
-        let events: Vec<Event> = self
+        let mut events: Vec<Event> = self
             .live
             .iter()
             .filter(|e| e.audio.is_some() && e.covers(clock))
             .cloned()
             .collect();
+        // A jog frame's sound, as an event of one field.
+        if let Some((path, n, a)) = self.search_sound(clock) {
+            events.push(Event {
+                start: clock,
+                fields: 1,
+                clip: Some(path),
+                first: n,
+                video: None,
+                audio: Some(a),
+                matte_after: false,
+                user_id: 0,
+                owner: Owner::Search,
+            });
+        }
         for e in events {
             let (Some(path), Some(a)) = (&e.clip, e.audio) else {
                 continue;
@@ -1391,6 +1807,24 @@ mod tests {
         assert_eq!(ends, [0.25, 0.5, 0.75, 1.0, 1.0]);
         // API pan 0 is the centre.
         assert!((d.pan - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_fields_about_to_play_are_read_ahead() {
+        let mut r = rig();
+        let info = info(&r.path);
+        let mut req = request(caf::VIDEO, 1);
+        req.go_clock = 40;
+        r.player
+            .play_clip(Slot(0), req, info, 10, &mut r.sram, Some(&r.link))
+            .unwrap();
+        r.field(33);
+        let clip = r.player.clip(&r.path).unwrap();
+        // Fields 34 to 41 on the clock: the clip's 0 and 1 from 40.
+        assert!(r.link.has_field(&clip, 0) && r.link.has_field(&clip, 1));
+        assert!(!r.link.has_field(&clip, 2));
+        r.field(34);
+        assert!(r.link.has_field(&clip, 2));
     }
 
     #[test]

@@ -14,11 +14,18 @@
 //! - the Toaster, when it composes a frame, asks for a routed input's
 //!   picture and takes the sound since the last frame.
 //!
-//! Clip fields are decoded only when the Toaster asks for a channel, so a
-//! channel nobody looks at costs nothing.
+//! Decoding a field (VTASC, then the composite samples to colour) is the
+//! costly part, so it is kept off the emulation thread: the Flyer also
+//! tells the link which fields its channels are about to show
+//! ([`FlyerLink::prefetch`]), and a few worker threads decode those ahead
+//! into a small cache of pictures. When the Toaster weaves a field it is
+//! normally ready; one that is not is waited for, or decoded on the spot if
+//! no worker has started it, so the picture never depends on how fast the
+//! host is. A channel nobody looks at costs only the read-ahead.
 
 use super::clip::ClipFile;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Picture size: the Toaster's inputs.
 pub const PICTURE_W: usize = 752;
@@ -39,7 +46,7 @@ pub const BLACK: u32 = u32::from_le_bytes([0, 0, 0, 0xFF]);
 /// One playback channel's output as a picture: its two fields woven.
 struct Channel {
     picture: Vec<u32>,
-    /// Fields shown since the picture was last decoded, by line parity.
+    /// Fields shown since the picture was last woven, by line parity.
     pending: [Option<(Arc<ClipFile>, u32)>; 2],
 }
 
@@ -72,6 +79,7 @@ struct Shared {
 #[derive(Default)]
 pub struct FlyerLink {
     shared: Mutex<Shared>,
+    decoder: Decoder,
 }
 
 impl std::fmt::Debug for FlyerLink {
@@ -111,6 +119,17 @@ impl FlyerLink {
         }
     }
 
+    /// A channel will show field `n` of `clip` soon: decode it ahead.
+    pub fn prefetch(&self, clip: &Arc<ClipFile>, n: u32) {
+        self.decoder.prefetch(clip, n);
+    }
+
+    /// Sound will be wanted from colour frame `f` of `clip` soon: read it
+    /// ahead.
+    pub fn prefetch_sound(&self, clip: &Arc<ClipFile>, f: u32) {
+        self.decoder.prefetch_sound(clip, f);
+    }
+
     /// A field of the Flyer's sound, at its own rate.
     pub fn push_sound(&self, sound: &[(f32, f32)]) {
         let mut s = self.lock();
@@ -135,21 +154,34 @@ impl FlyerLink {
         self.lock().routed[ch].then_some(ch)
     }
 
-    /// Channel `ch`'s current picture into `out` (752 x 480), decoding the
-    /// fields it showed since the last call.
+    /// Channel `ch`'s current picture into `out` (752 x 480), weaving in
+    /// the fields it showed since the last call.
     pub fn picture(&self, ch: usize, out: &mut [u32]) {
-        let mut s = self.lock();
-        let Some(channel) = s.channels.get_mut(ch) else {
-            out.fill(BLACK);
-            return;
+        let jobs: Vec<(Arc<ClipFile>, u32)> = {
+            let mut s = self.lock();
+            let Some(channel) = s.channels.get_mut(ch) else {
+                out.fill(BLACK);
+                return;
+            };
+            channel
+                .pending
+                .iter_mut()
+                .filter_map(Option::take)
+                .collect()
         };
-        let jobs: Vec<(Arc<ClipFile>, u32)> = channel
-            .pending
-            .iter_mut()
-            .filter_map(Option::take)
+        // Both fields queued first, so a worker can take one while this
+        // thread decodes the other.
+        for (clip, n) in &jobs {
+            self.decoder.prefetch(clip, *n);
+        }
+        let fields: Vec<(u32, Arc<Decoded>)> = jobs
+            .iter()
+            .filter_map(|(clip, n)| self.decoder.field(clip, *n).map(|f| (*n, f)))
             .collect();
-        for (n, rows) in decode_all(&jobs) {
-            weave(&rows, n, &mut channel.picture);
+        let mut s = self.lock();
+        let channel = &mut s.channels[ch];
+        for (n, field) in fields {
+            weave(&field, n, &mut channel.picture);
         }
         let len = out.len().min(channel.picture.len());
         out[..len].copy_from_slice(&channel.picture[..len]);
@@ -165,46 +197,296 @@ impl FlyerLink {
     pub fn set_line_peak(&self, peak: (f32, f32)) {
         self.lock().line_peak = peak;
     }
-}
 
-/// Decode the fields in `jobs`: the two of a frame side by side where
-/// threads are available.
-fn decode_all(jobs: &[(Arc<ClipFile>, u32)]) -> Vec<(u32, Vec<Vec<u8>>)> {
-    let one = |(clip, n): &(Arc<ClipFile>, u32)| clip.decode_field(*n).map(|rows| (*n, rows));
-    #[cfg(not(target_arch = "wasm32"))]
-    if jobs.len() > 1 {
-        return std::thread::scope(|scope| {
-            let handles: Vec<_> = jobs[1..]
-                .iter()
-                .map(|job| scope.spawn(move || one(job)))
-                .collect();
-            let mut out: Vec<_> = one(&jobs[0]).into_iter().collect();
-            for h in handles {
-                if let Ok(Some(r)) = h.join() {
-                    out.push(r);
-                }
-            }
-            out
-        });
+    /// Fields the decoder has done, and how many times the Toaster had to
+    /// wait for one a worker had in hand (for tests and diagnostics).
+    pub fn decode_stats(&self) -> (u64, u64) {
+        self.decoder.stats()
     }
-    jobs.iter().filter_map(one).collect()
+
+    /// Whether field `n` of `clip` is decoded, or asked for.
+    #[cfg(test)]
+    pub(crate) fn has_field(&self, clip: &ClipFile, n: u32) -> bool {
+        self.decoder
+            .pool
+            .lock()
+            .entries
+            .contains_key(&(clip.id(), n))
+    }
 }
 
-/// Put a decoded field (`n % 4` of its colour frame) on its lines of the
-/// picture: field I/III on the even lines, II/IV on the odd.
-fn weave(rows: &[Vec<u8>], n: u32, picture: &mut [u32]) {
+/// A decoded field: its lines (`PICTURE_H / 2` at most), RGBA, one after
+/// another.
+type Decoded = Vec<u32>;
+
+/// Lines of a field that reach the picture.
+const FIELD_LINES: usize = PICTURE_H / 2;
+
+/// Decode field `n` of `clip` into colour lines; `None` for a field with
+/// no picture (its lines are left as they were).
+fn decode(clip: &ClipFile, n: u32) -> Option<Decoded> {
+    let rows = clip.decode_field(n)?;
     let f = n % 4;
-    for (y, samples) in rows.iter().enumerate() {
-        let line = 2 * y + (f & 1) as usize;
-        if line >= PICTURE_H {
-            break;
-        }
+    let lines = rows.len().min(FIELD_LINES);
+    let mut out = vec![BLACK; lines * PICTURE_W];
+    for (y, samples) in rows.iter().take(lines).enumerate() {
         let positive = flyerclip::composite::phase_positive(f, y);
         crate::toaster::composite::decode_single(
             samples,
             positive,
-            &mut picture[line * PICTURE_W..(line + 1) * PICTURE_W],
+            &mut out[y * PICTURE_W..(y + 1) * PICTURE_W],
         );
+    }
+    Some(out)
+}
+
+/// Put a decoded field (`n % 4` of its colour frame) on its lines of the
+/// picture: field I/III on the even lines, II/IV on the odd.
+fn weave(field: &[u32], n: u32, picture: &mut [u32]) {
+    let parity = (n & 1) as usize;
+    for (y, row) in field.chunks_exact(PICTURE_W).enumerate() {
+        let line = 2 * y + parity;
+        if line >= PICTURE_H {
+            break;
+        }
+        picture[line * PICTURE_W..(line + 1) * PICTURE_W].copy_from_slice(row);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The decoder threads
+// ---------------------------------------------------------------------------
+
+/// Decoded fields kept: the read-ahead of both channels, a scrub's looping
+/// colour frame, and the fields just shown.
+const CACHE_FIELDS: usize = 48;
+
+/// What a worker does.
+enum Job {
+    Field(Arc<ClipFile>, u32),
+    Sound(Arc<ClipFile>, u32),
+}
+
+/// A field's place in the cache.
+enum Entry {
+    /// Waiting for a worker.
+    Queued,
+    /// Being decoded (by a worker, or by the thread that needed it).
+    Decoding,
+    /// Decoded (`None`: the field has no picture), with when it was last
+    /// wanted.
+    Ready(Option<Arc<Decoded>>, u64),
+}
+
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<(u64, u32), Entry>,
+    queue: VecDeque<Job>,
+    /// Sound frames queued or read recently, so they are not queued twice.
+    sound_seen: VecDeque<(u64, u32)>,
+    tick: u64,
+    workers: usize,
+    stop: bool,
+    decoded: u64,
+    waited: u64,
+}
+
+#[derive(Default)]
+struct Pool {
+    cache: Mutex<Cache>,
+    /// Signalled when a job is queued and when a field is ready.
+    changed: Condvar,
+}
+
+/// The cache of decoded fields and the threads that fill it.
+#[derive(Default)]
+struct Decoder {
+    pool: Arc<Pool>,
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        self.pool.lock().stop = true;
+        self.pool.changed.notify_all();
+    }
+}
+
+impl Pool {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A worker: decode queued fields until the link goes away.
+    fn work(&self) {
+        loop {
+            let job = {
+                let mut c = self.lock();
+                loop {
+                    if c.stop {
+                        return;
+                    }
+                    match c.queue.pop_front() {
+                        // Skip a field the Toaster decoded itself meanwhile.
+                        Some(Job::Field(clip, n)) => {
+                            let key = (clip.id(), n);
+                            if matches!(c.entries.get(&key), Some(Entry::Queued)) {
+                                c.entries.insert(key, Entry::Decoding);
+                                break Job::Field(clip, n);
+                            }
+                        }
+                        Some(job) => break job,
+                        None => {
+                            c = self.changed.wait(c).unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
+                }
+            };
+            match job {
+                Job::Field(clip, n) => {
+                    let field = decode(&clip, n).map(Arc::new);
+                    self.finish(&clip, n, field, false);
+                }
+                Job::Sound(clip, f) => {
+                    clip.frame_audio(f);
+                }
+            }
+        }
+    }
+
+    /// File a decoded field and wake whoever waits for it.
+    fn finish(&self, clip: &ClipFile, n: u32, field: Option<Arc<Decoded>>, wanted: bool) {
+        let mut c = self.lock();
+        c.tick += 1;
+        c.decoded += 1;
+        let tick = c.tick;
+        c.entries.insert(
+            (clip.id(), n),
+            Entry::Ready(field, if wanted { tick } else { 0 }),
+        );
+        evict(&mut c);
+        drop(c);
+        self.changed.notify_all();
+    }
+}
+
+/// Drop the least recently wanted decoded fields beyond the cache size.
+/// Fields decoded ahead and not yet wanted go last: they are about to be.
+fn evict(c: &mut Cache) {
+    let ready = c
+        .entries
+        .values()
+        .filter(|e| matches!(e, Entry::Ready(..)))
+        .count();
+    if ready <= CACHE_FIELDS {
+        return;
+    }
+    let mut old: Vec<((u64, u32), u64)> = c
+        .entries
+        .iter()
+        .filter_map(|(k, e)| match e {
+            Entry::Ready(_, used) => Some((*k, *used)),
+            _ => None,
+        })
+        .collect();
+    // Never wanted yet (0) sorts as newest.
+    old.sort_by_key(|&(_, used)| if used == 0 { u64::MAX } else { used });
+    for (key, _) in old.into_iter().take(ready - CACHE_FIELDS) {
+        c.entries.remove(&key);
+    }
+}
+
+impl Decoder {
+    /// Worker threads: one fewer than the host's cores, two to four.
+    fn workers() -> usize {
+        std::thread::available_parallelism()
+            .map_or(2, |n| n.get().saturating_sub(1))
+            .clamp(2, 4)
+    }
+
+    /// Start the workers on first use.
+    fn ensure_workers(&self, c: &mut Cache) {
+        #[cfg(not(target_arch = "wasm32"))]
+        while c.workers < Self::workers() {
+            let pool = Arc::clone(&self.pool);
+            let started = std::thread::Builder::new()
+                .name(format!("flyer-decode-{}", c.workers + 1))
+                .spawn(move || pool.work());
+            if started.is_err() {
+                break;
+            }
+            c.workers += 1;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = c;
+    }
+
+    fn prefetch(&self, clip: &Arc<ClipFile>, n: u32) {
+        let mut c = self.pool.lock();
+        self.ensure_workers(&mut c);
+        if c.workers == 0 {
+            return;
+        }
+        let key = (clip.id(), n);
+        if c.entries.contains_key(&key) {
+            return;
+        }
+        c.entries.insert(key, Entry::Queued);
+        c.queue.push_back(Job::Field(Arc::clone(clip), n));
+        drop(c);
+        self.pool.changed.notify_all();
+    }
+
+    fn prefetch_sound(&self, clip: &Arc<ClipFile>, f: u32) {
+        let mut c = self.pool.lock();
+        self.ensure_workers(&mut c);
+        if c.workers == 0 {
+            return;
+        }
+        let key = (clip.id(), f);
+        if c.sound_seen.contains(&key) {
+            return;
+        }
+        if c.sound_seen.len() >= 32 {
+            c.sound_seen.pop_front();
+        }
+        c.sound_seen.push_back(key);
+        c.queue.push_back(Job::Sound(Arc::clone(clip), f));
+        drop(c);
+        self.pool.changed.notify_all();
+    }
+
+    /// Field `n` of `clip`, decoded: from the cache, waiting for a worker
+    /// that has it in hand, or decoded here.
+    fn field(&self, clip: &Arc<ClipFile>, n: u32) -> Option<Arc<Decoded>> {
+        let key = (clip.id(), n);
+        let mut c = self.pool.lock();
+        loop {
+            c.tick += 1;
+            let tick = c.tick;
+            match c.entries.get_mut(&key) {
+                Some(Entry::Ready(field, used)) => {
+                    *used = tick;
+                    return field.clone();
+                }
+                Some(Entry::Decoding) => {
+                    c.waited += 1;
+                    c = self.pool.changed.wait(c).unwrap_or_else(|e| e.into_inner());
+                }
+                // Queued but not started, or never asked for: do it here.
+                Some(Entry::Queued) | None => {
+                    c.entries.insert(key, Entry::Decoding);
+                    drop(c);
+                    let field = decode(clip, n).map(Arc::new);
+                    self.pool.finish(clip, n, field.clone(), true);
+                    return field;
+                }
+            }
+        }
+    }
+
+    fn stats(&self) -> (u64, u64) {
+        let c = self.pool.lock();
+        (c.decoded, c.waited)
     }
 }
 
@@ -248,6 +530,53 @@ mod tests {
         assert!(grey(out[101 * PICTURE_W + 300]) < 200);
         link.picture(1, &mut out);
         assert!(out.iter().all(|&p| p == BLACK));
+    }
+
+    #[test]
+    fn fields_read_ahead_give_the_same_picture_as_fields_decoded_when_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Clip");
+        super::super::clip::tests::write_test_clip(&path, 3);
+        let clip = Arc::new(ClipFile::open(&path).unwrap());
+        let ahead = FlyerLink::new();
+        let late = FlyerLink::new();
+        for n in 0..12 {
+            ahead.prefetch(&clip, n);
+        }
+        let mut a = vec![0u32; PICTURE_W * PICTURE_H];
+        let mut b = vec![0u32; PICTURE_W * PICTURE_H];
+        for n in 0..12 {
+            ahead.show(1, FieldSource::Clip(Arc::clone(&clip), n));
+            late.show(1, FieldSource::Clip(Arc::clone(&clip), n));
+            if n % 2 == 1 {
+                ahead.picture(1, &mut a);
+                late.picture(1, &mut b);
+                assert_eq!(a, b, "field {n}");
+            }
+        }
+        // Each field was decoded once, by whichever thread got to it.
+        assert_eq!(ahead.decode_stats().0, 12);
+        assert_eq!(late.decode_stats().0, 12);
+        // A field without a picture leaves the lines as they were.
+        ahead.show(1, FieldSource::Clip(Arc::clone(&clip), 99));
+        ahead.picture(1, &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_cache_keeps_the_newest_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Clip");
+        super::super::clip::tests::write_test_clip(&path, 16);
+        let clip = Arc::new(ClipFile::open(&path).unwrap());
+        let link = FlyerLink::new();
+        for n in 0..64 {
+            assert!(link.decoder.field(&clip, n).is_some());
+        }
+        let c = link.decoder.pool.lock();
+        assert_eq!(c.entries.len(), CACHE_FIELDS);
+        assert!(c.entries.contains_key(&(clip.id(), 63)));
+        assert!(!c.entries.contains_key(&(clip.id(), 0)));
     }
 
     #[test]

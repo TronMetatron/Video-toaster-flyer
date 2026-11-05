@@ -8,25 +8,39 @@
 //! 735 samples. Playback needs one field at a time, so the file is not read
 //! whole: opening it walks the frame headers (one block each) and keeps
 //! them, and a field's video or audio is read from its blocks when it is
-//! played. [`flyerclip`] does the decoding.
+//! played. [`flyerclip`] does the decoding. A colour frame's sound (all its
+//! fields and channels, one run of blocks) is read in one go and kept for
+//! a few frames, so a field of sound is a copy out of memory; the decoder
+//! threads that read pictures ahead (see [`super::link`]) read the sound
+//! ahead the same way.
 
 use flyerclip::header::{ClipHeader, FrameHeader, BLOCK};
 use flyerclip::vtasc::{self, FieldParams};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Samples per channel per field (the DSP's `AY0 = 735`).
 pub const SAMPLES_PER_FIELD: usize = flyerclip::audio::SAMPLES_PER_FIELD;
 
+/// Colour frames of sound kept in memory per clip.
+const AUDIO_FRAMES_KEPT: usize = 24;
+
 /// An open clip.
 pub struct ClipFile {
+    /// Tells this opening of a file from any other (decoded pictures are
+    /// cached by it).
+    id: u64,
     path: PathBuf,
     file: Mutex<File>,
     pub header: ClipHeader,
     /// Each colour frame's block (from the CLIP header) and its header.
     frames: Vec<(u32, FrameHeader)>,
+    /// The sound blocks of recently played colour frames.
+    audio: Mutex<VecDeque<(u32, Arc<Vec<u8>>)>>,
 }
 
 impl std::fmt::Debug for ClipFile {
@@ -68,16 +82,24 @@ impl ClipFile {
             }
             at += next as u64;
         }
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Ok(Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             path: path.to_path_buf(),
             file: Mutex::new(file),
             header,
             frames,
+            audio: Mutex::new(VecDeque::new()),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// This opening's identity.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Fields the clip holds: its header's count, as far as its frames go.
@@ -124,27 +146,63 @@ impl ClipFile {
     /// the clip has none.
     pub fn audio_field(&self, n: u32, chan: u8) -> [i16; SAMPLES_PER_FIELD] {
         let mut out = [0i16; SAMPLES_PER_FIELD];
-        let Some((block, frame)) = self.frames.get((n / 4) as usize) else {
+        let Some((_, frame)) = self.frames.get((n / 4) as usize) else {
             return out;
         };
         if n >= self.field_count() || chan >= frame.audio_chans || frame.audio_length == 0 {
             return out;
         }
+        let Some(blocks) = self.frame_audio(n / 4) else {
+            return out;
+        };
+        // Chunks are counted from the block after the CFRM header, where
+        // the frame's sound starts.
         let offset = flyerclip::audio::chunk_offset(
             frame.aud_ver,
             frame.audio_length,
             frame.audio_chans,
             chan,
             (n % 4) as u8,
-        );
-        let mut raw = [0u8; SAMPLES_PER_FIELD * 2];
-        let at = u64::from(*block + offset) * BLOCK as u64;
-        if let Ok(got) = self.read_at(at, &mut raw) {
-            for (s, b) in out.iter_mut().zip(raw[..got].chunks_exact(2)) {
-                *s = i16::from_be_bytes([b[0], b[1]]);
-            }
+        ) as usize
+            - 1;
+        let raw = blocks
+            .get(offset * BLOCK..)
+            .map_or(&[][..], |r| &r[..r.len().min(SAMPLES_PER_FIELD * 2)]);
+        for (s, b) in out.iter_mut().zip(raw.chunks_exact(2)) {
+            *s = i16::from_be_bytes([b[0], b[1]]);
         }
         out
+    }
+
+    /// The sound blocks of colour frame `f` (every field and channel), read
+    /// once and kept while it is among the last few frames used. `None`
+    /// for a frame with no sound.
+    pub fn frame_audio(&self, f: u32) -> Option<Arc<Vec<u8>>> {
+        let (block, frame) = self.frames.get(f as usize)?;
+        if frame.audio_chans == 0 || frame.audio_length == 0 {
+            return None;
+        }
+        {
+            let kept = self.audio.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, b)) = kept.iter().find(|(k, _)| *k == f) {
+                return Some(Arc::clone(b));
+            }
+        }
+        let len = 4 * usize::from(frame.audio_chans) * usize::from(frame.audio_length) * BLOCK;
+        let mut data = vec![0u8; len];
+        let got = self
+            .read_at(u64::from(*block + 1) * BLOCK as u64, &mut data)
+            .unwrap_or(0);
+        data.truncate(got);
+        let data = Arc::new(data);
+        let mut kept = self.audio.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.iter().any(|(k, _)| *k == f) {
+            if kept.len() >= AUDIO_FRAMES_KEPT {
+                kept.pop_front();
+            }
+            kept.push_back((f, Arc::clone(&data)));
+        }
+        Some(data)
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {

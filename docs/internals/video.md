@@ -730,8 +730,11 @@ samples.
 
 Inputs come from the host folder (`media.rs`): a worker thread per input
 plays the folder's files (stills decoded with the `image` crate, video
-through ffmpeg) into a two-frame channel, one frame taken per emulated
-frame. The outputs are published per frame into `videoslot::CardOutput`s,
+through ffmpeg) into an eight-frame channel, one frame taken per emulated
+frame. Until the switcher's first extended header (`Toaster::active`) the
+workers wait and the card publishes black, silent frames
+(`produce_idle_outputs`): the power-on mux settings select inputs nobody
+chose, and nothing need be decoded while the machine boots. The outputs are published per frame into `videoslot::CardOutput`s,
 which the window layer shows as monitor windows (`card_monitors.rs`) and
 which record themselves (ZMBV AVI, via `recorder.rs`) when asked. A video
 file's sound is decoded by a second ffmpeg (stereo s16le at the mixer's
@@ -810,11 +813,46 @@ the Flyer has (channel A on 3, B on 4); every field the player says what
 each channel shows (a clip field by reference, or a matte) and adds a
 field of sound. The Toaster's `source_picture` takes a routed input from
 the link instead of its folder (`Toaster::input_into`, also for a live
-framestore): fields are decoded there, on demand, with `flyerclip`'s VTASC
-decoder and `composite::decode_single`, the two of a frame on two threads,
-and woven by line parity into the 752 x 480 picture, so a channel no bus
-shows costs nothing. `clip.rs` reads a clip a field at a time (its CFRM
-headers once, then each field's video blocks and 735-sample audio chunks).
+framestore), weaving the fields shown since its last frame by line parity
+into the 752 x 480 picture. Decoding a field (`flyerclip`'s VTASC decoder,
+then `composite::decode_single` to colour) costs a few milliseconds, so it
+is kept off the emulation thread: every field the player also tells the
+link which fields each channel will show over the next eight fields
+(`Player::read_ahead`, from the events and any jog frame), and two to four
+`flyer-decode` worker threads decode those into a cache of 48 decoded
+fields (least recently wanted dropped first). A field the Toaster asks for
+is then normally ready; one a worker has in hand is waited for, and one
+nobody has started is decoded on the spot, so the picture is the same
+whatever the host's speed (headless runs stay reproducible) and a channel
+no bus shows costs only its read-ahead. `clip.rs` reads a clip a field at
+a time (its CFRM headers once, then each field's video blocks); a colour
+frame's sound, all its fields and channels, is one run of blocks, read in
+one go (by the workers ahead of time, from the audio events) and kept for
+the last 24 frames.
+
+Jog and shuttle are SRCHARGS/DOSEARCH (`acts.c` `SearchArgs`, `DoSearch`;
+the library's Begin/Do/EndFindField and FindFieldAudio). SRCHARGS 1 opens a
+session on the named clip (counted, if one is open), taking the video
+channel as the firmware's channel semaphore does: it waits for a FLYPLAY on
+that channel to end, and a FLYPLAY for it waits until the session closes
+(fails with CHANINUSE under `CAPF_ERRIFBUSY`; `cont` 0 ends a waiting one).
+It gets a DSP pair when it asks for sound. Each DOSEARCH names a field (the
+video start, else the audio start) and puts up the colour frame holding
+it: it waits until the previous frame has taken, queues its own for the
+next colour-frame boundary (the field it is on, if that is one and nothing
+of the session's is showing yet), and completes once the previous frame's
+level changes have happened, with `LastFieldDone` = the field. Its flags
+are trimmed to what the clip has and written back. The channel then shows
+the frame's four fields in a loop, and its sound plays through the pair
+at the ClipAction's sustain levels and pans (ramped over the attack),
+looping with the picture, or once with `APF_AUTOMUTE` (volume 0 four
+fields on). That wait is what paces the switcher's shuttle loop
+(DoFindField, render, WaitAction) to one frame per colour frame instead of
+racing to the end of the clip. SRCHARGS 2 re-allocates the sound for new
+flags; SRCHARGS 0 closes once the last frame has taken: the sound goes
+quiet and, with `CAF_USEMATTE`, the channel black. Commands the firmware
+would wait in (`Outcome::Waiting`) stay in progress and are tried again
+after every field (`Firmware::retry_waiting`).
 
 The DSP model mixes its channels at 735 samples a field (44,055.94 Hz,
 locked to video): left `s·v·(1−p)`, right `s·v·p`, with `v` the volume
@@ -828,8 +866,18 @@ recording. The input folders' sound keeps following Program as before (it
 stands in for what would reach the Flyer's line inputs); an input the
 Flyer has is silent there. CODECCTRL stores the codec's input settings
 and its meters read the peak of the Toaster's sound. Not modelled:
-recording (FLYRECORD, still capture), jog/shuttle (SRCHARGS/DOSEARCH),
-cut lists, SMPTE, the TBC module and the camcorder input on Preview.
+recording (FLYRECORD, still capture), cut lists, SMPTE, the TBC module and
+the camcorder input on Preview.
+
+The monitor windows (`video/window/card_monitors.rs`) compose on the
+emulator's own thread, so their cost is the machine's: each window size
+gets a table of every tube pixel's bilinear taps, glass shading and
+coverage in fixed point (`Layer::table`), a new frame is one integer pass
+over it straight into the surface's buffer, split across up to four
+threads above 60,000 tube pixels, and the artwork around the tube is
+painted only when the layer or the power lamp changes. (The float version
+took 7.7 ms a window per frame at 728 x 540 on a 2.8 GHz Xeon, 20 ms at
+1100 x 817.)
 
 ## Interlace (`video/deinterlace.rs`)
 

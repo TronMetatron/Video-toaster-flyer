@@ -66,6 +66,7 @@ pub fn board_spec(slot: usize) -> BoardSpec {
 /// The Flyer card: its shared SRAM and the state of its firmware.
 #[derive(Serialize, Deserialize)]
 pub struct Flyer {
+    #[serde(with = "crate::bytes_serde")]
     sram: Vec<u8>,
     firmware: ops::Firmware,
     /// The Toaster's host folder; the Flyer's drives are its `Flyer`
@@ -161,7 +162,7 @@ impl ZorroDevice for Flyer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flyer::mailbox::{err, op, Slot, STAT_DONE, STAT_INPROG, STAT_NEW};
+    use crate::flyer::mailbox::{err, op, rd32, Slot, STAT_DONE, STAT_INPROG, STAT_NEW};
     use crate::memory::Memory;
     use crate::zorro_device::HostBeam;
 
@@ -351,6 +352,245 @@ mod tests {
             .filter(|f| f.iter().any(|&(l, _)| l != 0.0))
             .count();
         assert_eq!(loud, 11, "field 0 of the test clip is silent");
+    }
+
+    /// A board with Flyer.bin running in play mode, channel A on input 3,
+    /// and a 16-field clip `FlyerA0:Clip` on its drive, with a ClipAction
+    /// for it at `ACTION` (video and stereo sound, channel A, the
+    /// switcher's permissions; full volume, hard left and right).
+    struct Jog {
+        board: Flyer,
+        link: Arc<link::FlyerLink>,
+        mem: Memory,
+        frame: u64,
+        _dir: tempfile::TempDir,
+    }
+
+    const ACTION: u32 = 0x1080;
+
+    impl Jog {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let fa0 = dir.path().join("Flyer/FA0");
+            std::fs::create_dir_all(&fa0).unwrap();
+            clip::tests::write_test_clip(&fa0.join("Clip"), 4);
+            let link = link::FlyerLink::new();
+            let board =
+                Flyer::new(Some(dir.path().to_path_buf())).with_link(Some(Arc::clone(&link)));
+            let mut j = Self {
+                board,
+                link,
+                mem: memory(),
+                frame: 0,
+                _dir: dir,
+            };
+            j.send(Slot(0), op::FIRMWARE, &[]);
+            j.send(Slot(0), op::PLAYMODE, &[]);
+            j.send(Slot(0), op::TOASTMUX, &[(4, 0x0100_0000)]);
+            let (path, volume) = (0x1000u32, 0x1040u32);
+            for (i, b) in b"FlyerA0:Clip\0".iter().enumerate() {
+                j.wr(path + i as u32, 1, u32::from(*b));
+            }
+            j.wr(volume, 4, path);
+            j.wr(ACTION, 4, volume);
+            // RT_IMMED, channel A, VIDEO|AUDIOL|AUDIOR|USEMATTE,
+            // STEALOURVIDEO|KILLOTHERVIDEO.
+            j.wr(ACTION + 8, 4, 0x0100_0F03);
+            j.wr(ACTION + 38, 4, 0xFFFF_FFFF);
+            j.wr(ACTION + 44, 4, 0x8000_7FFF);
+            j
+        }
+
+        fn wr(&mut self, off: u32, size: usize, value: u32) {
+            let mut host = DeviceHost::new(&mut self.mem);
+            self.board.write(off, size, value, &mut host);
+        }
+
+        /// Issue a command and leave its slot as it is (done or not).
+        fn issue(&mut self, slot: Slot, opcode: u16, args: &[(u32, u32)]) {
+            let mut host = DeviceHost::new(&mut self.mem);
+            command(&mut self.board, &mut host, slot, opcode, args);
+        }
+
+        /// Issue a command that completes at once, and free its slot.
+        fn send(&mut self, slot: Slot, opcode: u16, args: &[(u32, u32)]) {
+            self.issue(slot, opcode, args);
+            assert_eq!(slot.status(self.board.sram()), STAT_DONE);
+            assert_eq!(slot.error(self.board.sram()), err::OKAY);
+            self.wr(slot.base() as u32, 2, 0);
+        }
+
+        fn done(&self, slot: Slot) -> bool {
+            slot.status(self.board.sram()) == STAT_DONE
+        }
+
+        /// One field goes by; its sound.
+        fn field(&mut self) -> Vec<(f32, f32)> {
+            for vpos in [0, 200] {
+                let beam = HostBeam {
+                    vpos,
+                    long_frame: true,
+                    frame: self.frame,
+                };
+                let mut host = DeviceHost::new(&mut self.mem).with_beam(beam);
+                self.board.tick(100, &mut host);
+            }
+            self.frame += 1;
+            self.link.take_sound()
+        }
+
+        fn clock(&self) -> u32 {
+            self.board.firmware().field_clock
+        }
+
+        /// SRCHARGS with `flag` (1 open, 0 close).
+        fn search_args(&mut self, flag: u32) {
+            self.issue(Slot(0), op::SRCHARGS, &[(4, ACTION), (8, flag << 24)]);
+        }
+
+        /// DOSEARCH for field `n` in slot 1.
+        fn search(&mut self, n: u32) {
+            self.wr(ACTION + 12, 4, n);
+            self.wr(ACTION + 16, 4, n);
+            self.issue(Slot(1), op::DOSEARCH, &[(4, ACTION)]);
+        }
+
+        fn picture(&self) -> Vec<u32> {
+            let mut out = vec![0u32; link::PICTURE_W * link::PICTURE_H];
+            self.link.picture(0, &mut out);
+            out
+        }
+    }
+
+    /// The left-channel sample `write_test_clip` gives field `n`, at full
+    /// volume hard left.
+    fn left_of(n: u32) -> f32 {
+        100.0 * n as f32 / 32768.0
+    }
+
+    #[test]
+    fn a_search_loops_its_colour_frame_on_the_channel_with_its_sound() {
+        let mut j = Jog::new();
+        // Off a colour frame: the frame takes at the next one.
+        while j.clock() % 4 != 1 {
+            j.field();
+        }
+        j.search_args(1);
+        assert!(j.done(Slot(0)));
+        j.wr(Slot(0).base() as u32, 2, 0);
+        let asked = j.clock();
+        j.search(6);
+        assert!(j.done(Slot(1)), "the first search does not wait");
+        assert_eq!(rd32(j.board.sram(), ACTION as usize + 126), 6);
+        let start = (asked + 4) & !3;
+        let mut heard = Vec::new();
+        while j.clock() < start + 9 {
+            let sound = j.field();
+            if j.clock() >= start {
+                heard.push((j.clock(), sound[300].0));
+            }
+        }
+        // Fields 4-7 again and again, with their sound.
+        for (clock, left) in heard {
+            let n = 4 + (clock - start) % 4;
+            assert!((left - left_of(n)).abs() < 1e-3, "field {clock}: {left}");
+        }
+        let grey = |p: u32| p.to_le_bytes()[1];
+        let pic = j.picture();
+        assert!(grey(pic[100 * link::PICTURE_W + 300]) < 250);
+        assert_ne!(pic[100 * link::PICTURE_W + 300], link::BLACK);
+    }
+
+    #[test]
+    fn a_shuttle_gets_one_frame_per_colour_frame() {
+        let mut j = Jog::new();
+        j.search_args(1);
+        j.wr(Slot(0).base() as u32, 2, 0);
+        // The switcher's loop: search, wait for it, search the next frame.
+        let mut done_at = Vec::new();
+        let mut n = 0;
+        j.search(n);
+        while done_at.len() < 6 {
+            if j.done(Slot(1)) {
+                done_at.push(j.clock());
+                j.wr(Slot(1).base() as u32, 2, 0);
+                n += 4;
+                j.search(n % 16);
+                continue;
+            }
+            j.field();
+        }
+        let steps: Vec<u32> = done_at.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(steps[1..].iter().all(|&d| d == 4), "{done_at:?}");
+    }
+
+    #[test]
+    fn closing_a_search_goes_black_and_a_waiting_play_then_starts() {
+        let mut j = Jog::new();
+        j.search_args(1);
+        j.wr(Slot(0).base() as u32, 2, 0);
+        j.search(8);
+        for _ in 0..6 {
+            j.field();
+        }
+        assert_ne!(j.picture()[1000], link::BLACK);
+        // A clip for channel A waits while the session holds it.
+        j.issue(Slot(2), op::FLYPLAY, &[(4, ACTION)]);
+        for _ in 0..30 {
+            j.field();
+        }
+        assert_eq!(Slot(2).status(j.board.sram()), STAT_INPROG);
+        assert!(!j.board.firmware().player.busy());
+        // EndFindField: black (USEMATTE), the sound quiet.
+        j.search_args(0);
+        assert!(j.done(Slot(0)));
+        assert!(j.picture().iter().all(|&p| p == link::BLACK));
+        // Now the play goes ahead: it is on the channel and plays out.
+        j.field();
+        assert!(j.board.firmware().player.busy());
+        for _ in 0..60 {
+            j.field();
+        }
+        assert!(j.done(Slot(2)));
+        assert_eq!(rd32(j.board.sram(), ACTION as usize + 126), 16);
+    }
+
+    #[test]
+    fn with_automute_a_searched_frame_is_heard_once() {
+        let mut j = Jog::new();
+        // APF_AUTOMUTE as well as the switcher's permissions.
+        j.wr(ACTION + 8, 4, 0x0100_0F0B);
+        j.search_args(1);
+        j.wr(Slot(0).base() as u32, 2, 0);
+        while j.clock() % 4 != 2 {
+            j.field();
+        }
+        let start = (j.clock() + 4) & !3;
+        j.search(9);
+        let mut loud = Vec::new();
+        while j.clock() < start + 12 {
+            let sound = j.field();
+            if j.clock() >= start {
+                loud.push(sound.iter().any(|&(l, _)| l != 0.0));
+            }
+        }
+        assert_eq!(&loud[..4], &[true; 4]);
+        assert!(loud[4..].iter().all(|&l| !l), "{loud:?}");
+        // The picture still loops.
+        assert_ne!(j.picture()[1000], link::BLACK);
+    }
+
+    #[test]
+    fn a_search_without_a_session_or_past_the_clip_is_badparam() {
+        let mut j = Jog::new();
+        j.search(4);
+        assert!(j.done(Slot(1)));
+        assert_eq!(Slot(1).error(j.board.sram()), err::BADPARAM);
+        j.wr(Slot(1).base() as u32, 2, 0);
+        j.search_args(1);
+        j.wr(Slot(0).base() as u32, 2, 0);
+        j.search(16);
+        assert_eq!(Slot(1).error(j.board.sram()), err::BADPARAM);
     }
 
     #[test]

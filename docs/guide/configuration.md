@@ -929,6 +929,10 @@ audio-follow-video mixer beside it.
 - `Flyer`: the Video Flyer's drives, `Flyer/FA0` and so on (see `flyer`
   below).
 
+Until the switcher first drives the card, while the machine boots, both
+outputs are black and silent and the input folders are not read yet; the
+inputs start playing once the switcher is up.
+
 With `monitors` on, the card's two outputs open as windows of their own,
 each on a picture monitor: **Preview** and **Program**. Closing one only
 hides it; **Recording > Show Toaster Monitors** brings both back. In the
@@ -1027,9 +1031,25 @@ The Flyer's sound is the system's sound: its eight-channel mixer's output
 emulator's sound output and into the Program recording, whatever the
 switcher shows. The input folders' sound keeps following Program as
 described above (it stands in for what would reach the Flyer's line
-inputs); an input the Flyer has taken over is silent there. Not emulated
-yet: recording into the Flyer, jog and shuttle, cut lists, SMPTE time code
-and the TBC module.
+inputs); an input the Flyer has taken over is silent there.
+
+Jog and shuttle work as on the real card: opening a clip's controls puts
+the clip on Program (through input 3 or 4), and dragging its in/out
+sliders, jogging with the mouse or the arrow keys (Shift for 30 frames),
+or holding a shuttle arrow moves the picture through the clip a colour
+frame at a time, with the sound of each frame heard as it goes. While the
+position stands still the frame's sound repeats as a short loop, as on
+the real Flyer, until the next move or until the controls close (the
+Editor's own quieting after a pause does not happen yet). The shuttle
+moves at the speeds the switcher asks for rather than racing to the end. Not emulated yet: recording into the Flyer, cut lists,
+SMPTE time code and the TBC module.
+
+Flyer clips are decoded ahead of time on worker threads (two to four), so
+playback does not hold up the emulated machine; the picture is the same
+whatever the host's speed. `[cpu] jit = true` runs the switcher, the
+Editor and Flyer playback correctly but does not make them faster: while a
+project plays, the switcher's time goes on chip-bus and CIA accesses,
+which the JIT runs at the same speed as the precise core.
 
 `preview_overlay` lets the switcher draw its interface over the Preview
 output when its own preference asks for it, as a one-monitor Toaster setup

@@ -119,6 +119,15 @@ impl Video {
         self.media_root.as_deref()
     }
 
+    /// Start reading the inputs' folders (the switcher is driving the
+    /// card).
+    pub fn start_inputs(&self) {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        for input in &self.inputs {
+            input.start();
+        }
+    }
+
     /// Each input's folder, files, pinned file and what it plays now.
     pub fn input_status(&self) -> Vec<serde_json::Value> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -135,6 +144,7 @@ impl Video {
                         "pinned": feed.pinned().as_deref().map(show),
                         "playing": feed.playing().as_deref().map(show),
                         "signal": feed.picture().is_some(),
+                        "started": feed.started(),
                     })
                 })
                 .collect()

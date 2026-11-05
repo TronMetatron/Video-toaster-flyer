@@ -65,14 +65,14 @@ sources (`fly/Edit/Edit/src`, `vt/full/switcher/SRC`, `fly/amiflyer`). Nothing w
 ### 1.4 Cutting room, Cut Clip, Process Clip (`panel.c` CutClipPanel)
 | Item | Status |
 |---|---|
-| Name with .01 auto-increment, comment, in/out sliders, bump arrows, duration, segment timeline, Remove/Previous/Next, icon slider, Video+Audio/Audio/Video, Destination drive | The UI works. **The Program monitor does not follow the sliders** (DOSEARCH is a no-op) |
+| Name with .01 auto-increment, comment, in/out sliders, bump arrows, duration, segment timeline, Remove/Previous/Next, icon slider, Video+Audio/Audio/Video, Destination drive | The UI works, and the Program monitor follows the sliders (SRCHARGS/DOSEARCH) [guess: tested on the jog requester and the clip controls, not this panel] |
 | Perform | **No.** NEWCUTLIST, ADDSUBCLIP and MAKESUBCLIPS all answer OK and make nothing, so the Editor reports success. **Destructive Cut Clip then runs `CrDeleteFile(source)`**: the clip survives (PROTECTED), but its `.i`/`.info` files are deleted. See guard 1 |
 
 ### 1.5 Clip controls (F9): Fine Tune, Quick Tune, Ctrl quick adjust
 | Item | Status |
 |---|---|
-| Video in/out; separate audio in/out (split edits); Alt-click to match; Alt-drag to lock; Shift-drag to slide; Shift+Alt; Ctrl / Ctrl+Shift / Ctrl+Shift+Alt with L/R mouse | OK for the values: they are honoured on play, in 2-frame (colour-frame) steps. Partly: **no picture on Program while dragging** |
-| Shuttle arrows (hold, then move the mouse left/right) | Partly. No picture, and the position races to the clip end, because DOSEARCH completes at once and `Flyer_WaitAction` does not pace the loop [M, `pecomm.a` Hand_Shuttle] |
+| Video in/out; separate audio in/out (split edits); Alt-click to match; Alt-drag to lock; Shift-drag to slide; Shift+Alt; Ctrl / Ctrl+Shift / Ctrl+Shift+Alt with L/R mouse | OK: the values are honoured on play, in 2-frame (colour-frame) steps, and Program shows (and the speakers play) the colour frame at the point being moved. The frame's sound loops until the next move or until the panel closes: the Editor's quiet-after-five-ticks (`panel.c` TilQuiet) never fires in the emulated session [open issue] |
+| Shuttle arrows (hold, then move the mouse left/right) | OK [guess: the pacing is tested through the mailbox, the drag itself was not run]. DOSEARCH waits for the previous colour frame to take, so `Flyer_WaitAction` paces Hand_Shuttle to a frame per colour frame |
 | Play/Stop buttons in the panel | OK (FLYPLAY) |
 | Volume, balance, fade in/out + Auto, channels 1+2/1/2/none, Lock, delay Time, 8 channels (4 stereo pairs) | OK. The tutorial says "95 = as recorded" (the real DSP has headroom). The emulator treats `$FFFF` as unity (linear, spec [L]), so levels may differ a little [guess] |
 | Process clip / Cut clip buttons, Destination | see 1.4 |
@@ -81,7 +81,7 @@ sources (`fly/Edit/Edit/src`, `vt/full/switcher/SRC`, `fly/amiflyer`). Nothing w
 ### 1.6 Tools popup and its panels
 | Item | Status |
 |---|---|
-| Audio on/off (Alt-A), Lock/Unlock (Alt-L), Quick Adjust (Ctrl) | OK (Quick Adjust shows no picture) |
+| Audio on/off (Alt-A), Lock/Unlock (Alt-L), Quick Adjust (Ctrl) | OK (Quick Adjust shows the picture [guess]) |
 | Auto insert (Alt-I); Edit to all audio; Edit to crouton (tap to the beat while it plays) | OK [guess] |
 | Cut clip (Alt-C) | **No.** See guard 1 |
 | Process clip (Alt-P) | **No.** Silent no-op |
@@ -102,7 +102,7 @@ sources (`fly/Edit/Edit/src`, `vt/full/switcher/SRC`, `fly/amiflyer`). Nothing w
   Measure, JobTitle, Haiku, FixProject, Export, UpdateTools, RePlay (loop crouton, [guess]), and SetDefault
   (writes `Switcher_Support/DefaultProject`).
 - **Partly**:
-  - ChangeIcon: the icon is made, but REQ_FLYERJOG shows no picture.
+  - ChangeIcon: OK. REQ_FLYERJOG shows the clip on Program as its sliders move (tested).
   - FlyerProc (slow/fast/strobe): reads fields, then stops on "Write open error 42", so it is effectively No.
 - **No** (they need recording or still writing; each ends in an error requester): IFF2Clip, Univ2Clip, BatchStills,
   FlyerLapse, FlyerStopFrame. They use `Flyer_Support/c/AppendFields` + `SetPlayMode REC`, or `recordadd`.
@@ -159,8 +159,7 @@ sources (`fly/Edit/Edit/src`, `vt/full/switcher/SRC`, `fly/amiflyer`). Nothing w
    - Optional (Toaster side): move IFF2Clip, Univ2Clip, BatchStills, FlyerLapse, FlyerStopFrame and FlyerProc into a
      subfolder (e.g. `Toaster:Arexx/Editor/NeedsRecord`).
    - Move FlyerProc out of `StartUpScripts` too, then run UpdateTools, so they leave RXTools and the Tools menu.
-6. **Shuttle racing.** Short term: keep DOSEARCH "in progress" for the 1/2/4 fields it asks for, so `WaitAction` paces
-   the loop (a small change; [guess] at where the field count is passed). The full fix is item 1 in section 3.
+6. **Shuttle racing.** Fixed: DOSEARCH waits for the previous colour frame to take, as the firmware does.
 7. **Scripts waiting on GPI or a timer** (StopFrame, FlyerStopFrame, TimeLapse). Document: GPI = joystick fire in
    port 2 (Hardware setup GPI on), or stop the script.
 8. **VideoB/Audio tabs.** Create `media/Flyer/FB0` and `FC0`, and copy `System_Support/Devs/DOSDrivers/FB0`, `FC0`
@@ -174,12 +173,8 @@ sources (`fly/Edit/Edit/src`, `vt/full/switcher/SRC`, `fly/amiflyer`). Nothing w
 
 ## 3. Top 5 features the tutorial shows, not yet emulated
 
-1. **Jog, shuttle and scrub** (SRCHARGS/DOSEARCH).
-   - What: loop one colour frame on channel A/B through TOASTMUX; audio scrub is optional; hold the command for the
-     fields asked.
-   - Unlocks: the Program monitor in Fine/Quick Tune, Ctrl quick adjust, shuttle arrows, the cutting room and icon
-     slider, and REQ_FLYERJOG (ChangeIcon, FlyerProc).
-   - Effort: small (reuses `play.rs` and the decoder).
+1. **Jog, shuttle and scrub** (SRCHARGS/DOSEARCH). Done: the colour frame loops on channel A/B with its sound, paced
+   as the firmware paces it.
 2. **Recording** (FLYRECORD with pause/resume/abort, audio-only, APPEND).
    - What: record from the INPUTSEL source (Input 1/2, Program, Preview; camcorder = Input 1) through
      `flyerclip::ClipWriter`. The grade comes from the quality setting and GETSETOPT; the meters follow the source's
