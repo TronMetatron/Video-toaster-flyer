@@ -894,7 +894,7 @@ that supplies its own sync sets this for as long as it is fitted.
 ```toml
 [video_slot]
 card = "toaster"          # "none" (default) or "toaster"
-media = "D:/Toster/Amiga Toaster Files"   # the card's host folder
+media = "C:/Toaster/Amiga Toaster Files"   # the card's host folder
 # monitors = true         # Preview and Program monitor windows (default true)
 # preview_overlay = false # the switcher interface over Preview (default false)
 # volume = "ToasterFiles"  # also mount media in the Amiga as ToasterFiles:
@@ -944,11 +944,38 @@ menu switch the same settings live.
 
 With `monitors` on, the card's two outputs open as windows of their own,
 each on a picture monitor: **Preview** and **Program**. Closing one only
-hides it; **Recording > Show Toaster Monitors** brings both back. In the
-Program window, the **REC** button on the monitor's top edge (or `R`, or
-the power button) starts and stops recording the Program output, picture
-and sound, into `Output` (the lamps light red while it runs); **Recording >
-Record Toaster Program** does the same. **SETUP** beside it opens the
+hides it; **Recording > Show Toaster Monitors** brings both back.
+
+The monitors' front-panel buttons work, as on a studio monitor:
+
+- **POWER** switches the tube on or off. Switched on (and when the
+  windows open), the degaussing coil thumps and hums and the picture comes
+  up as the tube warms; switched off, the picture collapses to a line, then
+  a dot that fades. The sounds are made by Copperline and played on the
+  host's output only: they are not part of the machine's sound, its WAV
+  capture or a recording. A recording carries on with the monitor off.
+- **APERTURE**, **BRIGHT**, **CHROMA**, **PHASE** and **CONTRAST** (up on
+  the top row, down below; hold to repeat) adjust the picture on the
+  monitor only: peaking, black level, saturation, hue and gain. The level
+  shows on the screen for a moment. **RESET** puts them back to their
+  presets, which leave the picture exactly as the card made it (the lamp
+  above RESET is lit at the presets).
+- **VOL** on the Program monitor is the level of the card's sound on the
+  host's speakers (switched off, the Program monitor is silent); recordings
+  keep the sound as made. On the Preview monitor it only shows its level.
+- **BLUE ONLY** drives the blue gun alone, **UNDER SCAN** shows the whole
+  raster inside the glass, and **H-V DELAY** shows the blanking and sync
+  across the middle of the picture. **INPUT B** and **C** select inputs
+  with nothing connected (a dark screen; **A** is the card).
+  **ANALOG/DIGITAL** only lights.
+
+The settings are kept per monitor in the media folder's
+`.copperline/monitors.json`.
+
+In the Program window, the **REC** button on the monitor's top edge (or
+`R`) starts and stops recording the Program output, picture and sound,
+into `Output` (its lamp lights red while it runs); **Recording > Record
+Toaster Program** does the same. **SETUP** beside it opens the
 recording setup over the picture: the format, MP4 (H.264 video with square
 pixels and AAC sound; the default) or the recorder's lossless AVI, the
 MP4's quality (Standard, CRF 18 and 192 kb/s, or High, CRF 12 and 320
@@ -957,19 +984,18 @@ into an AVI beside it first and made from it with ffmpeg when the
 recording stops (the button reads SAVING and the title says so until it
 is done; the AVI is then removed, or kept if ffmpeg is missing or fails).
 The setup is kept in the media folder's `.copperline/recording.json`. The
-monitor artwork can be replaced by a `monitor.png` in the media folder:
+monitor artwork can be replaced by a `monitor-program.png` or
+`monitor-preview.png` in the media folder (or `monitor.png` for both):
 the tube is found as the area around the picture's centre enclosed by a
-near-black gap.
+near-black gap. A replaced artwork has no working front panel.
 
 **Effect sounds.** Some transitions carry sounds (8SVX samples in the
 effect, such as Shatter, Falling Sheep or Camera Iris) that the switcher
 plays through the Amiga's own audio, which Copperline mixes into its sound
 output and the recordings. NewTek's switcher skips them when a Flyer is
 fitted (`animfxhandler.a`: "dont do sound if flyer!"), so with `flyer =
-true` they are silent, as they were on a real Toaster-Flyer. To hear them
-anyway, the switcher's working copy can be patched to drop that test:
-`tools/toaster/toaster-effect-sounds-with-flyer.py switcher.main switcher.main.3.0
-switcher.main.aa` in `Toaster:Programs` (`--undo` puts it back).
+true` they are silent, as they were on a real Toaster-Flyer; without the
+Flyer they play.
 
 `volume` also mounts the media folder in the Amiga as a volume of that
 name (like a `[[filesys]]` entry, never a boot candidate), so the Toaster

@@ -8294,6 +8294,8 @@ mod host_input;
 mod kbdpanel;
 #[cfg(target_os = "macos")]
 mod macos_about;
+mod monitor_panel;
+mod monitor_sounds;
 mod monitors;
 #[cfg(feature = "mt32")]
 mod mt32panel;

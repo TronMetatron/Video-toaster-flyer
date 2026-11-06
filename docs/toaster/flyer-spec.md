@@ -13,13 +13,13 @@ checked against hardware, and the emulator was not run.
 
 | prefix | path |
 |---|---|
-| `F/` | `/home/claude/fly/flyer/flyer/`: Flyer 68000 firmware (SAS/C + asm), `exe/` builds |
-| `A/` | `/home/claude/fly/amiflyer/amiflyer/`: flyer.library (`src/flyerlib.asm` 4.44), flyerscsi.device, FlyerFileSystem, tools |
-| `E/` | `/home/claude/fly/Edit/Edit/`: Project Editor |
-| `S/` | `/home/claude/vt/full/switcher/SRC/`: switcher 4.x |
-| `B/` | `/home/claude/amiga/boot-real/`: the installed system the emulator boots |
-| `C/` | `/home/claude/Copperline/` |
-| `CF` | `/home/claude/flyer-spec/flyer-clip-format.md`: clip container and VTASC (already implemented in `C/crates/flyerclip`) |
+| `F/` | `<ovt-src>/flyer/flyer/`: Flyer 68000 firmware (SAS/C + asm), `exe/` builds |
+| `A/` | `<ovt-src>/amiflyer/amiflyer/`: flyer.library (`src/flyerlib.asm` 4.44), flyerscsi.device, FlyerFileSystem, tools |
+| `E/` | `<ovt-src>/Edit/Edit/`: Project Editor |
+| `S/` | `<vt-src>/full/switcher/SRC/`: switcher 4.x |
+| `B/` | `<installed>/`: the installed system the emulator boots |
+| `C/` | `this repository/` |
+| `CF` | `crates/flyerclip/FORMAT.md`: clip container and VTASC (already implemented in `C/crates/flyerclip`) |
 
 **Installed versions** (B/NewTek/Programs): `flyer.library` 4.42 (26.03.97), with the same
 150-entry vector table as the 4.44 source **[M]**; FlyerFileSystem 1.05 (04.08.95);
@@ -504,7 +504,7 @@ These have to be serviced inside the Amiga CPU's busy loop, with Amiga interrupt
 
 - **DSP code = `DSP.dat`** (`A/src/flyerlib.asm:2757`). All four chip-set chunks are the
   same 2,744-byte image = `F/exe/*/DSP.bin` **[H]** (md5). There is **no ADSP-21xx source in
-  the release**: `/home/claude/fly/DSP_Code` contains only CroutonLib **[H]**.
+  the release**: `<ovt-src>/DSP_Code` contains only CroutonLib **[H]**.
 - Format: 686 program-memory words, 4 bytes each (24-bit word big-endian + filler byte)
   **[M]**. Decoded:
   - vectors: reset -> `JUMP $001C`, IRQ2 -> `$01CD`, SPORT0 TX -> `$0289`,
@@ -813,6 +813,6 @@ LED patterns end at "Completely configured".
 4. Whether record mode monitors the input at the output **[?]**.
 5. `Flyer_DefaultSelect`/`Flyer_Play` arguments: the switcher's `Flyer.a` and
    `CroutonHandler.a` sources are missing; only objects remain
-   (`/home/claude/vt/old/switcher/OBJ/Flyer.o`, `CroutonHandler.o`) **[?]**. HLE below
+   (`<vt-src>/old/switcher/OBJ/Flyer.o`, `CroutonHandler.o`) **[?]**. HLE below
    flyer.library does not depend on them.
 6. The ribbon pinout and the function of the Flyer's own RCA video inputs **[?]**.

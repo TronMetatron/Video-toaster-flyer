@@ -621,33 +621,169 @@ pub fn icon_path(clip: &Path) -> PathBuf {
     clip.with_file_name(name)
 }
 
-/// A clip's crouton icon as the Toaster's Grazer reads it: an 80 x 50,
-/// 64-colour ILBM with the crouton's bevel around a 70 x 40 picture
-/// (and the crouton data after it), as the switcher's own icon making
-/// leaves one. The bevel, its colours and the crouton data come from an
-/// icon the switcher made; the picture and colours 8-63 are `picture`'s
-/// (752 x 480 RGBA, 4:3).
+/// A clip's crouton icon as the Toaster's Grazer reads it
+/// (`edit/src/iconfile.c`): a 64-colour, 80 x 50 ILBM of the crouton (a
+/// raised tile with the picture in a well), a 4-colour ILBM of the same
+/// tile, and a `CrUD` FORM saying the file is a CLIP crouton, each FORM
+/// followed by a ` PUS` FORM giving its length so the file can be read
+/// from the end backwards. The picture is `picture` (752 x 480 RGBA, 4:3)
+/// in colours 8-63; colours 0-7 are the tile's greys and golds.
 pub fn crouton_icon(picture: &[u32]) -> Vec<u8> {
-    const TEMPLATE: &[u8] = include_bytes!("../assets/toaster/clip-icon.I");
     const IW: usize = 80;
-    const PLANES: usize = 6;
-    const ROW: usize = IW / 8;
-    const PX: usize = 5;
-    const PY: usize = 4;
-    const PW: usize = 70;
-    const PH: usize = 40;
-    const FIRST: usize = 8;
-    let mut icon = TEMPLATE.to_vec();
-    let find = |id: &[u8]| icon.windows(4).position(|w| w == id).map(|p| p + 8);
-    let (Some(cmap), Some(body)) = (find(b"CMAP"), find(b"BODY")) else {
-        return icon;
+    const IH: usize = 50;
+    let small = icon_picture(picture);
+    let palette = median_cut(&small, 64 - ICON_FIRST);
+    let mut colour = [[0u8; 3]; 64];
+    colour[..8].copy_from_slice(&TILE_COLOURS);
+    for (k, c) in palette.iter().enumerate() {
+        colour[ICON_FIRST + k] = *c;
+    }
+    let nearest = |c: [u8; 3]| -> u8 {
+        let d = |p: [u8; 3]| {
+            (0..3)
+                .map(|k| (i32::from(c[k]) - i32::from(p[k])).pow(2))
+                .sum::<i32>()
+        };
+        let mut best = (d([0, 0, 0]), 0u8);
+        for (k, p) in palette.iter().enumerate() {
+            let e = d(*p);
+            if e < best.0 {
+                best = (e, (ICON_FIRST + k) as u8);
+            }
+        }
+        best.1
     };
-    // The picture, box-filtered down to the icon's 70 x 40.
-    let mut small = vec![[0u8; 3]; PW * PH];
+    let mut full = vec![0u8; IW * IH];
+    let mut four = vec![0u8; IW * IH];
+    for y in 0..IH {
+        for x in 0..IW {
+            let tile = icon_tile(x, y);
+            four[y * IW + x] = match tile {
+                Tile::Picture | Tile::Well => 0,
+                Tile::Back | Tile::Outline | Tile::Shadow => 1,
+                Tile::Inner => 2,
+                Tile::Light => 3,
+            };
+            full[y * IW + x] = match tile {
+                Tile::Picture => {
+                    let (px, py) = (x - ICON_PICTURE.0, y - ICON_PICTURE.1);
+                    nearest(small[py * ICON_PICTURE.2 + px])
+                }
+                Tile::Well => 0,
+                Tile::Back | Tile::Shadow => 1,
+                Tile::Inner => 2,
+                Tile::Light => 3,
+                Tile::Outline => 4,
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let colour_bytes: Vec<u8> = colour.iter().flatten().copied().collect();
+    let first = ilbm(IW, IH, 6, &colour_bytes, &full);
+    let second_colours = [
+        0, 0, 0, 0x60, 0x60, 0x60, 0x90, 0x90, 0x90, 0xD0, 0xD0, 0xD0,
+    ];
+    let second = ilbm(IW, IH, 2, &second_colours, &four);
+    // TYPE CLIP, the effects library the crouton belongs to, and no tags.
+    let mut crud = b"CrUD".to_vec();
+    crud.extend(iff_chunk(b"TYPE", b"CLIP\0\0\0\0"));
+    let mut libs = 0xFFFF_FCD0u32.to_be_bytes().to_vec();
+    libs.extend(0x0010u16.to_be_bytes());
+    libs.extend(b"effects.library\0\0\0");
+    crud.extend(iff_chunk(b"LIBS", &libs));
+    crud.extend(iff_chunk(b"TAGS", &[0; 4]));
+    for (kind, form) in [(*b"ILBM", first), (*b"ILBM", second), (*b"CrUD", crud)] {
+        out.extend(iff_chunk(b"FORM", &form));
+        let mut pus = b" PUS".to_vec();
+        pus.extend(kind);
+        pus.extend(4u32.to_be_bytes());
+        pus.extend((form.len() as u32).to_be_bytes());
+        out.extend(iff_chunk(b"FORM", &pus));
+    }
+    out
+}
+
+/// The crouton tile's colours 0-7: black, the greys of its bevel and two
+/// golds.
+const TILE_COLOURS: [[u8; 3]; 8] = [
+    [0x00, 0x00, 0x00],
+    [0x50, 0x50, 0x50],
+    [0x90, 0x90, 0x90],
+    [0xD8, 0xD8, 0xD8],
+    [0x2C, 0x2C, 0x2C],
+    [0x40, 0x40, 0x40],
+    [0xBC, 0xAE, 0x6E],
+    [0xF2, 0xE2, 0x70],
+];
+/// The first colour the picture uses.
+const ICON_FIRST: usize = 8;
+/// The picture's place in the icon: x, y, width, height.
+const ICON_PICTURE: (usize, usize, usize, usize) = (5, 4, 70, 40);
+
+/// What a pixel of the crouton tile is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tile {
+    /// Around the tile (and its cut corners).
+    Back,
+    Outline,
+    /// The bevel's lit top and left, and its shaded bottom and right.
+    Light,
+    Shadow,
+    /// The step down into the well.
+    Inner,
+    /// The black well round the picture.
+    Well,
+    Picture,
+}
+
+/// The crouton tile at `(x, y)`: an 80 x 48 raised tile with cut corners
+/// over two rows of background.
+fn icon_tile(x: usize, y: usize) -> Tile {
+    const TW: usize = 80;
+    const TH: usize = 48;
+    let (px, py, pw, ph) = ICON_PICTURE;
+    if (px..px + pw).contains(&x) && (py..py + ph).contains(&y) {
+        return Tile::Picture;
+    }
+    if y >= TH {
+        return Tile::Back;
+    }
+    let (dx, dy) = (x.min(TW - 1 - x), y.min(TH - 1 - y));
+    let d = dx.min(dy);
+    if dx + dy < 3 {
+        return Tile::Back;
+    }
+    if d == 0 || dx + dy == 3 {
+        return Tile::Outline;
+    }
+    let lit = if dy < dx { y < TH / 2 } else { x < TW / 2 };
+    match d {
+        1 | 2 => {
+            if lit {
+                Tile::Light
+            } else {
+                Tile::Shadow
+            }
+        }
+        3 => {
+            if lit {
+                Tile::Inner
+            } else {
+                Tile::Light
+            }
+        }
+        _ => Tile::Well,
+    }
+}
+
+/// `picture` (752 x 480) box-filtered down to the icon's picture.
+fn icon_picture(picture: &[u32]) -> Vec<[u8; 3]> {
+    let (_, _, pw, ph) = ICON_PICTURE;
+    let mut small = vec![[0u8; 3]; pw * ph];
     for (i, px) in small.iter_mut().enumerate() {
-        let (x, y) = (i % PW, i / PW);
-        let (x0, x1) = (x * W / PW, ((x + 1) * W / PW).max(x * W / PW + 1));
-        let (y0, y1) = (y * H / PH, ((y + 1) * H / PH).max(y * H / PH + 1));
+        let (x, y) = (i % pw, i / pw);
+        let (x0, x1) = (x * W / pw, ((x + 1) * W / pw).max(x * W / pw + 1));
+        let (y0, y1) = (y * H / ph, ((y + 1) * H / ph).max(y * H / ph + 1));
         let mut sum = [0u32; 3];
         for yy in y0..y1 {
             for xx in x0..x1 {
@@ -660,43 +796,49 @@ pub fn crouton_icon(picture: &[u32]) -> Vec<u8> {
         let n = ((x1 - x0) * (y1 - y0)) as u32;
         *px = sum.map(|v| (v / n) as u8);
     }
-    let palette = median_cut(&small, 64 - FIRST);
-    for (k, c) in palette.iter().enumerate() {
-        let at = cmap + (FIRST + k) * 3;
-        icon[at..at + 3].copy_from_slice(c);
+    small
+}
+
+/// An IFF chunk: id, big-endian length, data, padded to even.
+fn iff_chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut c = id.to_vec();
+    c.extend((data.len() as u32).to_be_bytes());
+    c.extend(data);
+    if data.len() % 2 == 1 {
+        c.push(0);
     }
-    // Black stays the bevel's colour 0 too.
-    let nearest = |c: [u8; 3]| -> usize {
-        let d = |p: [u8; 3]| {
-            (0..3)
-                .map(|k| (i32::from(c[k]) - i32::from(p[k])).pow(2))
-                .sum::<i32>()
-        };
-        let mut best = (d([0, 0, 0]), 0);
-        for (k, p) in palette.iter().enumerate() {
-            let e = d(*p);
-            if e < best.0 {
-                best = (e, FIRST + k);
-            }
-        }
-        best.1
-    };
-    for y in 0..PH {
-        for x in 0..PW {
-            let index = nearest(small[y * PW + x]);
-            let (ix, iy) = (PX + x, PY + y);
-            for plane in 0..PLANES {
-                let at = body + (iy * PLANES + plane) * ROW + ix / 8;
-                let bit = 0x80u8 >> (ix % 8);
-                if index >> plane & 1 != 0 {
-                    icon[at] |= bit;
-                } else {
-                    icon[at] &= !bit;
+    c
+}
+
+/// An uncompressed ILBM's FORM contents (`ILBM`, BMHD, CMAP, BODY) of
+/// `w` x `h` pixels of `planes` bit planes.
+fn ilbm(w: usize, h: usize, planes: usize, cmap: &[u8], pixels: &[u8]) -> Vec<u8> {
+    let mut bmhd = Vec::new();
+    bmhd.extend((w as u16).to_be_bytes());
+    bmhd.extend((h as u16).to_be_bytes());
+    bmhd.extend([0u8; 4]); // x, y
+    bmhd.extend([planes as u8, 0, 0, 0]); // planes, no mask, no compression
+    bmhd.extend([0u8; 2]); // transparent colour
+    bmhd.extend([1u8, 1]); // aspect
+    bmhd.extend((w as u16).to_be_bytes());
+    bmhd.extend((h as u16).to_be_bytes());
+    let row = w.div_ceil(16) * 2;
+    let mut body = vec![0u8; row * planes * h];
+    for y in 0..h {
+        for x in 0..w {
+            let v = pixels[y * w + x];
+            for p in 0..planes {
+                if v >> p & 1 != 0 {
+                    body[(y * planes + p) * row + x / 8] |= 0x80 >> (x % 8);
                 }
             }
         }
     }
-    icon
+    let mut form = b"ILBM".to_vec();
+    form.extend(iff_chunk(b"BMHD", &bmhd));
+    form.extend(iff_chunk(b"CMAP", cmap));
+    form.extend(iff_chunk(b"BODY", &body));
+    form
 }
 
 /// Up to `n` colours standing for `pixels` (median cut).
@@ -1114,11 +1256,25 @@ mod tests {
         };
         assert_eq!(colour(index(10, 20)), [220, 20, 20]);
         assert_eq!(colour(index(70, 20)), [20, 20, 220]);
-        // The bevel is the template's.
-        let template = include_bytes!("../assets/toaster/clip-icon.I");
-        assert_eq!(icon.len(), template.len());
+        // The tile round it, and the rest of the file the Grazer reads.
         assert_eq!(index(0, 0), 1);
-        assert_eq!(&icon[cmap..cmap + 24], &template[cmap..cmap + 24]);
+        assert_eq!(index(40, 1), 3);
+        assert_eq!(index(40, 46), 1);
+        assert_eq!(&icon[cmap..cmap + 3], &[0, 0, 0]);
+        let crud = icon
+            .windows(8)
+            .position(|w| w == b"TYPE\0\0\0\x08")
+            .unwrap();
+        assert_eq!(&icon[crud + 8..crud + 12], b"CLIP");
+        // Read backwards from the end, as iconfile.c does: the last ` PUS`
+        // gives the CrUD FORM's length.
+        let end = icon.len();
+        assert_eq!(&icon[end - 24..end - 16], b"FORM\0\0\0\x10");
+        assert_eq!(&icon[end - 16..end - 8], b" PUSCrUD");
+        let len = u32::from_be_bytes(icon[end - 4..end].try_into().unwrap()) as usize;
+        let form = end - 24 - len - 8;
+        assert_eq!(&icon[form..form + 4], b"FORM");
+        assert_eq!(&icon[form + 8..form + 12], b"CrUD");
     }
 
     #[test]

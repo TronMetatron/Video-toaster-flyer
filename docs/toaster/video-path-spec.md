@@ -2,7 +2,7 @@
 
 Derived from NewTek's released switcher source (`full/switcher/SRC/*.a`), the
 includes (`old/switcher/INC/*.i`), the CG source (`full/CG/src`), the
-disassembly of `vthand.AA_o` (`/home/claude/re/vthand.txt`), and data tables
+disassembly of `vthand.AA_o` (`a disassembly, not included`), and data tables
 read from the debug-symbol build `EXE/toaster/Switcher.main.AA` (labels given as
 `Name@address`). Builds on `toaster-protocol.md`; nothing there is repeated
 unless it is needed.

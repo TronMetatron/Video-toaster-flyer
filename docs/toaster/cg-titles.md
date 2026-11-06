@@ -4,12 +4,12 @@ Findings from source and binaries only. The emulator was not run, so nothing her
 
 Sources and abbreviations:
 
-* **SW** = `/home/claude/vt/full/switcher/SRC`.
-* **OLDRX** = `/home/claude/vt/old/switcher/Pre2-4-94/src/arexxhandler.a`. The file has CR line endings; line numbers are after `tr '\r' '\n'`.
-* **CG** = `/home/claude/vt/full/CG/src`.
-* **ED** = `/home/claude/fly/Edit/Edit/src`.
-* **DOC** = `/home/claude/amiga/boot-real/NewTek/Programs/Documentation/Arexx`.
-* **AA** = the 4.2 AA switcher with symbols (`/home/claude/amiga/EXE/toaster/Switcher.main.AA`, linked at $100000, symbols in `/home/claude/re/aa_syms.json`; disassemble with `vt/dve-tools/vtdis.py`).
+* **SW** = `<vt-src>/full/switcher/SRC`.
+* **OLDRX** = `<vt-src>/old/switcher/Pre2-4-94/src/arexxhandler.a`. The file has CR line endings; line numbers are after `tr '\r' '\n'`.
+* **CG** = `<vt-src>/full/CG/src`.
+* **ED** = `<ovt-src>/Edit/Edit/src`.
+* **DOC** = `<installed>/NewTek/Programs/Documentation/Arexx`.
+* **AA** = the 4.2 AA switcher with symbols (`<installed>/NewTek/Programs/Switcher.main.AA`, linked at $100000, symbols in `a symbol dump, not included`; disassemble with `vt/dve-tools/vtdis.py`).
 
 The installed `switcher.main` and `switcher.main.aa` were checked with byte patterns for the same code where noted.
 

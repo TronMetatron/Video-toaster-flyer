@@ -2,7 +2,7 @@
 
 Container, VTASC video coding and audio of Flyer clips, taken from NewTek's
 1994-98 sources (released 2004). A reference implementation is in
-`/home/claude/flyerclip` (Rust, no dependencies).
+`crates/flyerclip` (Rust, no dependencies).
 
 **Path prefixes**
 - `A/` = `fly/amiflyer/amiflyer/` (flyer.library and Amiga tools)

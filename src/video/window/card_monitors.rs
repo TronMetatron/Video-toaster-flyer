@@ -3,9 +3,10 @@
 //! Monitor windows for a video-slot card's own outputs: the Video Toaster's
 //! Preview and Program, each on a picture monitor of its own.
 //!
-//! Each output gets a host window showing the monitor artwork
-//! (`assets/toaster/monitor.png`, or `monitor.png` in the Toaster files
-//! folder) with the output's latest frame on the tube: scaled into the
+//! Each output gets a host window showing its monitor's artwork
+//! (`assets/toaster/monitor-program.png` and `monitor-preview.png`, or
+//! `monitor-<output>.png` or `monitor.png` in the Toaster files folder)
+//! with the output's latest frame on the tube: scaled into the
 //! glass, which is found in the artwork by flooding outward from its centre
 //! to the dark gap around the tube, and lit by the glass itself so its
 //! shading and reflection stay on top of the picture.
@@ -20,12 +21,18 @@
 //! it, so none of this is on the emulator's thread: the machine runs at
 //! its own pace whatever the windows' size, and a painter that falls
 //! behind skips to the latest frame. The event loop keeps the windows'
-//! input and tells the painter about resizes and repaint requests. In the
-//! Program window, `R` or the monitor's power button starts and stops a
-//! recording of the output; the power lamp shows red while it runs.
+//! input and tells the painter about resizes and repaint requests.
+//!
+//! The front panels work ([`super::monitor_panel`]): the picture
+//! controls, BLUE ONLY, UNDER SCAN, H-V DELAY, the inputs, VOL (the
+//! Program monitor's speaker, the card's sound) and POWER, with the tube
+//! warming up or collapsing to a dot and the sounds of it
+//! ([`super::monitor_sounds`]). In the Program window, `R` or the REC
+//! button starts and stops a recording of the output, and SETUP opens its
+//! settings.
 
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
@@ -37,18 +44,33 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
+use super::monitor_panel::{self, Beam, Key, Knob, Look, Panel, PowerEdge, Settings};
+use super::monitor_sounds;
 use crate::videoslot::{CardOutput, RecordFormat, RecordSettings};
 
-const DEFAULT_ART: &[u8] = include_bytes!("../../../assets/toaster/monitor.png");
+/// A built-in monitor: its artwork, and where its front panel's buttons
+/// and lamps are. An artwork supplied in place of it has no panel.
+struct BuiltIn {
+    png: &'static [u8],
+    panel: &'static Panel,
+}
 
-/// Where the default artwork's power lamp and button are, in its pixels.
-/// An artwork supplied in place of it has neither.
-const DEFAULT_LAMP: (f32, f32, f32) = (1264.0, 950.0, 6.0);
-const DEFAULT_BUTTON: (u32, u32, u32, u32) = (1251, 983, 1282, 1013);
+/// The Program monitor, and the Preview monitor (also for any other
+/// output).
+const PROGRAM_ART: BuiltIn = BuiltIn {
+    png: include_bytes!("../../../assets/toaster/monitor-program.png"),
+    panel: &monitor_panel::PROGRAM_PANEL,
+};
+const PREVIEW_ART: BuiltIn = BuiltIn {
+    png: include_bytes!("../../../assets/toaster/monitor-preview.png"),
+    panel: &monitor_panel::PREVIEW_PANEL,
+};
 
 /// How far the picture runs past the glass on each side, as a fraction of
 /// the glass: a monitor overscans.
 const OVERSCAN: f32 = 0.03;
+/// UNDER SCAN: the whole raster inside the glass, a margin all round.
+const UNDERSCAN: f32 = -0.06;
 
 /// The monitor artwork and the tube found in it.
 pub(super) struct MonitorArt {
@@ -61,8 +83,7 @@ pub(super) struct MonitorArt {
     glass: Vec<u8>,
     /// The glass's bounding box, `(x0, y0, x1, y1)`, exclusive.
     screen: (usize, usize, usize, usize),
-    lamp: Option<(f32, f32, f32)>,
-    button: Option<(u32, u32, u32, u32)>,
+    panel: Option<&'static Panel>,
 }
 
 fn rgba_u32(r: u8, g: u8, b: u8) -> u32 {
@@ -70,13 +91,19 @@ fn rgba_u32(r: u8, g: u8, b: u8) -> u32 {
 }
 
 impl MonitorArt {
-    /// The artwork in `media_root` if there is one, else the built-in one.
-    pub(super) fn load(media_root: Option<&std::path::Path>) -> Option<Arc<Self>> {
-        if let Some(path) = media_root.map(|r| r.join("monitor.png")) {
+    /// The artwork for output `name`: `monitor-<name>.png` or
+    /// `monitor.png` in `media_root` if there is one, else the built-in
+    /// one.
+    pub(super) fn load(media_root: Option<&std::path::Path>, name: &str) -> Option<Arc<Self>> {
+        let own = format!("monitor-{}.png", name.to_ascii_lowercase());
+        for file in [own.as_str(), "monitor.png"] {
+            let Some(path) = media_root.map(|r| r.join(file)) else {
+                break;
+            };
             if path.is_file() {
                 match std::fs::read(&path)
                     .map_err(|e| e.to_string())
-                    .and_then(|bytes| Self::decode(&bytes, false))
+                    .and_then(|bytes| Self::decode(&bytes))
                 {
                     Ok(art) => {
                         info!("toaster monitors: artwork {}", path.display());
@@ -86,7 +113,15 @@ impl MonitorArt {
                 }
             }
         }
-        match Self::decode(DEFAULT_ART, true) {
+        let built_in = if name == "Program" {
+            &PROGRAM_ART
+        } else {
+            &PREVIEW_ART
+        };
+        match Self::decode(built_in.png).map(|mut art| {
+            art.panel = Some(built_in.panel);
+            art
+        }) {
             Ok(art) => Some(Arc::new(art)),
             Err(e) => {
                 warn!("toaster monitors: built-in artwork: {e}");
@@ -95,7 +130,7 @@ impl MonitorArt {
         }
     }
 
-    fn decode(bytes: &[u8], default: bool) -> Result<Self, String> {
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
         let img = image::load_from_memory(bytes)
             .map_err(|e| e.to_string())?
             .to_rgba8();
@@ -125,8 +160,7 @@ impl MonitorArt {
             mask,
             glass,
             screen,
-            lamp: default.then_some(DEFAULT_LAMP),
-            button: default.then_some(DEFAULT_BUTTON),
+            panel: None,
         })
     }
 
@@ -281,10 +315,11 @@ pub(super) struct Layer {
     mask: Vec<u8>,
     glass: Vec<u8>,
     screen: (usize, usize, usize, usize),
-    /// Where the picture lands: the glass grown by the overscan, at 4:3
-    /// across the glass's width, `(x, y, w, h)` in window pixels.
+    /// Where the picture lands: the glass grown by the overscan (or
+    /// shrunk by the underscan), at 4:3 across the glass's width, `(x, y,
+    /// w, h)` in window pixels.
     picture: (f32, f32, f32, f32),
-    lamp: Option<(f32, f32, f32)>,
+    under_scan: bool,
 }
 
 /// How the artwork fits a `w` x `h` window, centred: `(scale, aw, ah, ox,
@@ -298,28 +333,38 @@ fn fit(art: &MonitorArt, w: usize, h: usize) -> (f32, usize, usize, usize, usize
     (scale, aw, ah, (w - aw) / 2, (h - ah) / 2)
 }
 
-/// Where the artwork's power button lands in a `w` x `h` window, `(x0, y0,
-/// x1, y1)`.
-fn button_in(art: &MonitorArt, w: usize, h: usize) -> Option<(f32, f32, f32, f32)> {
+/// A rectangle in the artwork's pixels, in a `w` x `h` window's.
+fn art_px_rect(art: &MonitorArt, w: usize, h: usize, r: (u32, u32, u32, u32)) -> Rect4 {
     let (scale, _, _, ox, oy) = fit(art, w, h);
-    art.button.map(|(x0, y0, x1, y1)| {
-        (
-            ox as f32 + x0 as f32 * scale,
-            oy as f32 + y0 as f32 * scale,
-            ox as f32 + x1 as f32 * scale,
-            oy as f32 + y1 as f32 * scale,
-        )
-    })
+    (
+        ox as f32 + r.0 as f32 * scale,
+        oy as f32 + r.1 as f32 * scale,
+        ox as f32 + r.2 as f32 * scale,
+        oy as f32 + r.3 as f32 * scale,
+    )
 }
 
-fn hits(button: Option<(f32, f32, f32, f32)>, x: f64, y: f64) -> bool {
-    button.is_some_and(|(x0, y0, x1, y1)| {
-        (x as f32) >= x0 && (x as f32) <= x1 && (y as f32) >= y0 && (y as f32) <= y1
-    })
+/// A lamp (centre and radius in the artwork's pixels) in window pixels.
+fn art_px_lamp(art: &MonitorArt, w: usize, h: usize, l: (f32, f32, f32)) -> (f32, f32, f32) {
+    let (scale, _, _, ox, oy) = fit(art, w, h);
+    (
+        ox as f32 + l.0 * scale,
+        oy as f32 + l.1 * scale,
+        l.2 * scale,
+    )
+}
+
+/// The front-panel button under `(x, y)` in a `w` x `h` window.
+fn key_at(art: &MonitorArt, w: usize, h: usize, x: f64, y: f64) -> Option<Key> {
+    art.panel?
+        .keys
+        .iter()
+        .find(|(_, r)| inside(art_px_rect(art, w, h, *r), x, y))
+        .map(|(k, _)| *k)
 }
 
 impl Layer {
-    pub(super) fn new(art: &MonitorArt, w: usize, h: usize, aspect: f32) -> Self {
+    pub(super) fn new(art: &MonitorArt, w: usize, h: usize, aspect: f32, under_scan: bool) -> Self {
         let w = w.max(1);
         let h = h.max(1);
         // Fit the artwork, centred, black around it.
@@ -346,15 +391,12 @@ impl Layer {
             (sx1.ceil() as usize).min(w),
             (sy1.ceil() as usize).min(h),
         );
-        let gw = (sx1 - sx0) * (1.0 + 2.0 * OVERSCAN);
+        let scan = if under_scan { UNDERSCAN } else { OVERSCAN };
+        let gw = (sx1 - sx0) * (1.0 + 2.0 * scan);
         let gh = gw / aspect.max(0.1);
         let cx = (sx0 + sx1) / 2.0;
         let cy = (sy0 + sy1) / 2.0;
         let picture = (cx - gw / 2.0, cy - gh / 2.0, gw, gh);
-        let lamp = art.lamp.map(|(x, y, r)| {
-            let (lx, ly) = map(x, y);
-            (lx, ly, r * scale)
-        });
         let bg_bytes = bg.iter().flat_map(|p| p.to_le_bytes()).collect();
         Self {
             w,
@@ -366,7 +408,7 @@ impl Layer {
             glass,
             screen,
             picture,
-            lamp,
+            under_scan,
         }
     }
 
@@ -384,7 +426,9 @@ impl Layer {
         let mut rows = Vec::with_capacity(y1.saturating_sub(y0) + 1);
         for y in y0..y1 {
             rows.push(taps.len());
-            let vy = ((y as f32 + 0.5 - py) * sy - 0.5).clamp(0.0, (vh - 1) as f32);
+            let raw_y = (y as f32 + 0.5 - py) * sy;
+            let off_y = raw_y < 0.0 || raw_y >= vh as f32;
+            let vy = (raw_y - 0.5).clamp(0.0, (vh - 1) as f32);
             let ya = vy.floor() as usize;
             let ty = vy - ya as f32;
             for x in x0..x1 {
@@ -393,14 +437,21 @@ impl Layer {
                 if m == 0 {
                     continue;
                 }
-                let vx = ((x as f32 + 0.5 - px) * sx - 0.5).clamp(0.0, (vw - 1) as f32);
+                let raw_x = (x as f32 + 0.5 - px) * sx;
+                // Underscanned, the glass past the raster is unlit.
+                let off = off_y || raw_x < 0.0 || raw_x >= vw as f32;
+                let vx = (raw_x - 0.5).clamp(0.0, (vw - 1) as f32);
                 let xa = vx.floor() as usize;
                 let tx = vx - xa as f32;
                 let g = f32::from(self.glass[i]);
                 // The tube's own shading darkens toward its edges; whatever
                 // is brighter than the bare glass (the reflection) lies on
                 // top.
-                let shade = 0.72 + 0.28 * (g / 45.0).min(1.0);
+                let shade = if off {
+                    0.0
+                } else {
+                    0.72 + 0.28 * (g / 45.0).min(1.0)
+                };
                 let sheen = (g - 50.0).max(0.0) * 0.9;
                 let fixed = |t: f32| (t * 256.0).round().min(255.0) as u8;
                 taps.push(Tap {
@@ -423,28 +474,31 @@ impl Layer {
     }
 
     /// The monitor with `video` (`vw` x `vh` RGBA) on the tube, into `out`
-    /// (`w * h`). No video leaves the tube dark.
+    /// (`w * h`), its power lamp lit. No video leaves the tube dark.
     pub(super) fn compose(
         &self,
+        art: &MonitorArt,
         video: Option<(&[u32], usize, usize)>,
-        lamp_on: bool,
         out: &mut [u32],
     ) {
         let mut bytes = vec![0u8; self.w * self.h * 4];
-        self.compose_rgba8(video, lamp_on, &mut bytes, true);
+        self.compose_rgba8(video, &mut bytes, true);
+        if let Some(panel) = art.panel {
+            let lamp = art_px_lamp(art, self.w, self.h, panel.power_lamp);
+            draw_lamp(&mut bytes, self.w, self.h, lamp, POWER_LAMP);
+        }
         for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
             *o = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         }
     }
 
-    /// [`Self::compose`] into a surface's RGBA bytes (`w * h * 4`). With
-    /// `background` false the artwork around the tube is taken to be there
-    /// already (the frame before it was composed by this layer, with the
-    /// same lamp), and only the tube is drawn.
+    /// [`Self::compose`] into a surface's RGBA bytes (`w * h * 4`), lamps
+    /// unlit. With `background` false the artwork around the tube is
+    /// taken to be there already (the frame before it was composed by this
+    /// layer), and only the tube is drawn.
     pub(super) fn compose_rgba8(
         &self,
         video: Option<(&[u32], usize, usize)>,
-        lamp_on: bool,
         frame: &mut [u8],
         background: bool,
     ) {
@@ -501,37 +555,39 @@ impl Layer {
                 });
             }
         }
-        if lamp_on && (background || video.is_none()) {
-            if let Some((lx, ly, r)) = self.lamp {
-                let r = r.max(1.5);
-                let glow = r * 2.2;
-                let ys = ((ly - glow).floor().max(0.0) as usize)
-                    ..((ly + glow).ceil() as usize).min(self.h);
-                for y in ys {
-                    let xs = ((lx - glow).floor().max(0.0) as usize)
-                        ..((lx + glow).ceil() as usize).min(self.w);
-                    for x in xs {
-                        let d =
-                            ((x as f32 + 0.5 - lx).powi(2) + (y as f32 + 0.5 - ly).powi(2)).sqrt();
-                        let a = if d <= r {
-                            1.0
-                        } else {
-                            ((glow - d) / (glow - r)).clamp(0.0, 1.0) * 0.45
-                        };
-                        if a <= 0.0 {
-                            continue;
-                        }
-                        let i = (y * self.w + x) * 4;
-                        let mix = |base: u8, lit: f32| {
-                            (f32::from(base) * (1.0 - a) + lit * a).round() as u8
-                        };
-                        frame[i] = mix(frame[i], 255.0);
-                        frame[i + 1] = mix(frame[i + 1], 40.0);
-                        frame[i + 2] = mix(frame[i + 2], 30.0);
-                        frame[i + 3] = 0xFF;
-                    }
-                }
+    }
+}
+
+/// The power lamp's colour.
+const POWER_LAMP: [u8; 3] = [0x50, 0xFF, 0x60];
+
+/// Light a lamp (`(x, y, r)` in window pixels) with its glow.
+fn draw_lamp(frame: &mut [u8], w: usize, h: usize, lamp: (f32, f32, f32), rgb: [u8; 3]) {
+    let (lx, ly, r) = lamp;
+    let r = r.max(1.5);
+    let glow = r * 2.2;
+    let ys = ((ly - glow).floor().max(0.0) as usize)..((ly + glow).ceil() as usize).min(h);
+    for y in ys {
+        let xs = ((lx - glow).floor().max(0.0) as usize)..((lx + glow).ceil() as usize).min(w);
+        for x in xs {
+            let d = ((x as f32 + 0.5 - lx).powi(2) + (y as f32 + 0.5 - ly).powi(2)).sqrt();
+            let a = if d <= r {
+                1.0
+            } else {
+                ((glow - d) / (glow - r)).clamp(0.0, 1.0) * 0.45
+            };
+            if a <= 0.0 {
+                continue;
             }
+            let i = (y * w + x) * 4;
+            if i + 3 >= frame.len() {
+                continue;
+            }
+            for c in 0..3 {
+                frame[i + c] =
+                    (f32::from(frame[i + c]) * (1.0 - a) + f32::from(rgb[c]) * a).round() as u8;
+            }
+            frame[i + 3] = 0xFF;
         }
     }
 }
@@ -570,13 +626,13 @@ fn tap_pixel(t: &Tap, video: &[u32], vw: usize, bg: u32) -> [u8; 4] {
 /// size (for headless captures).
 pub(super) fn compose_native(art: &MonitorArt, output: &CardOutput) -> (Vec<u32>, usize, usize) {
     let (w, h) = art.size();
-    let layer = Layer::new(art, w, h, output.aspect());
+    let layer = Layer::new(art, w, h, output.aspect(), false);
     let mut video = Vec::new();
     let frame = output.frame_since(u64::MAX, &mut video);
     let mut out = vec![0u32; w * h];
     layer.compose(
+        art,
         frame.map(|(vw, vh, _)| (video.as_slice(), vw, vh)),
-        output.is_recording(),
         &mut out,
     );
     (out, w, h)
@@ -584,13 +640,18 @@ pub(super) fn compose_native(art: &MonitorArt, output: &CardOutput) -> (Vec<u32>
 
 struct MonitorWindow {
     output: Arc<CardOutput>,
+    art: Arc<MonitorArt>,
     window: Arc<Window>,
     /// The thread that paints the window.
     painter: Painter,
-    /// The power button in the window, for the event loop's hit test.
-    button: Option<(f32, f32, f32, f32)>,
     /// The window's size, for the controls' hit tests.
     size: (u32, u32),
+    /// What the front panel is set to.
+    settings: Settings,
+    /// The up or down button held, and when it next repeats.
+    held: Option<(Key, Instant)>,
+    /// Which of the power sounds' two takes this monitor makes.
+    variant: usize,
     /// The recording setup panel is open.
     setup: bool,
     /// What the title shows: recording, saving an MP4.
@@ -605,6 +666,13 @@ enum Paint {
     Redraw,
     /// Show or hide the recording setup panel.
     Setup(bool),
+    /// The front panel's settings changed; show this control's level on
+    /// the screen.
+    Settings(Settings, Option<Knob>),
+    /// The power went on or off.
+    Power(PowerEdge),
+    /// A front-panel button is held down (or none).
+    Pressed(Option<Key>),
     Stop,
 }
 
@@ -648,17 +716,39 @@ struct Canvas {
     painted: Option<Controls>,
     /// The recording setup panel is open.
     setup: bool,
+    /// The front panel.
+    settings: Settings,
+    look: Look,
+    /// The last power change, while the tube is warming or dying.
+    edge: Option<PowerEdge>,
+    pressed: Option<Key>,
+    /// The control whose level is on the screen, and since when.
+    osd: Option<(Knob, Instant)>,
+    /// The picture as the front panel makes it.
+    shown: Vec<u32>,
+    last_paint: Instant,
 }
 
-/// What the window's controls show: recording (the power lamp too), an
-/// MP4 being saved, the setup panel and its settings.
+/// What the window's controls show: recording, an MP4 being saved, the
+/// setup panel and its settings, the front panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Controls {
     recording: bool,
     saving: bool,
     setup: bool,
     settings: RecordSettings,
+    panel: Settings,
+    pressed: Option<Key>,
+    osd: Option<(Knob, i8)>,
 }
+
+/// How long a control's level stays on the screen.
+const OSD_TIME: Duration = Duration::from_millis(2500);
+/// How often the painter repaints while the tube warms or dies.
+const ANIMATION_FRAME: Duration = Duration::from_millis(16);
+/// A held up or down button repeats after this, then at this rate.
+const REPEAT_DELAY: Duration = Duration::from_millis(450);
+const REPEAT_RATE: Duration = Duration::from_millis(110);
 
 /// A control on the Program monitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -826,6 +916,106 @@ fn plastic_button(
     );
 }
 
+/// Draw the front panel's lamps and lit buttons, and darken a button held
+/// down, over the artwork.
+fn draw_panel(frame: &mut [u8], art: &MonitorArt, w: usize, h: usize, c: &Controls) {
+    let Some(panel) = art.panel else {
+        return;
+    };
+    let s = &c.panel;
+    if s.power {
+        let lamp = art_px_lamp(art, w, h, panel.power_lamp);
+        draw_lamp(frame, w, h, lamp, POWER_LAMP);
+        if s.at_presets() {
+            let lamp = art_px_lamp(art, w, h, panel.reset_lamp);
+            draw_lamp(frame, w, h, lamp, [0x60, 0xFF, 0x70]);
+        }
+    }
+    for &(key, r) in panel.keys {
+        let rect = art_px_rect(art, w, h, r);
+        if s.power && s.lit(key) {
+            // The button's lamp shows through its cap.
+            let inset = (rect.2 - rect.0) * 0.12;
+            fill(
+                frame,
+                w,
+                h,
+                (
+                    rect.0 + inset,
+                    rect.1 + inset,
+                    rect.2 - inset,
+                    rect.3 - inset,
+                ),
+                [0xFF, 0xB0, 0x40, 0x70],
+            );
+        }
+        if c.pressed == Some(key) {
+            fill(frame, w, h, rect, [0, 0, 0, 0x60]);
+        }
+    }
+}
+
+/// Show a control's level on the screen, as the monitor's own display
+/// does: its name and a bar, low on the tube.
+fn draw_osd(frame: &mut [u8], w: usize, h: usize, screen: Rect, osd: (Knob, i8)) {
+    let (knob, level) = osd;
+    let (x0, y0, x1, y1) = screen;
+    let (tw, th) = (x1.saturating_sub(x0) as f32, y1.saturating_sub(y0) as f32);
+    if tw < 40.0 || th < 40.0 {
+        return;
+    }
+    let px = ((th / 260.0).floor() as usize).max(1);
+    let green = [0x50, 0xFF, 0x60, 0xFF];
+    let (lo, hi) = knob.range();
+    let label = if knob == Knob::Vol {
+        format!("{}  {level}", knob.label())
+    } else {
+        format!("{}  {level:+}", knob.label())
+    };
+    let text_w = crate::video::font::text_width(&label, px) as f32;
+    let text_h = crate::video::font::text_height(px) as f32;
+    let cx = x0 as f32 + tw / 2.0;
+    let ty = y0 as f32 + th * 0.70;
+    for (dx, dy, rgba) in [(px, px, [0, 0, 0, 0xFF]), (0, 0, green)] {
+        crate::video::font::draw_text(
+            frame,
+            w,
+            h,
+            (cx - text_w / 2.0) as usize + dx,
+            ty as usize + dy,
+            &label,
+            u32::from_le_bytes(rgba),
+            px,
+        );
+    }
+    // The bar: a cell a step, lit up to the level.
+    let steps = (hi - lo) as usize;
+    let bar_w = tw * 0.46;
+    let cell = bar_w / steps as f32;
+    let by = ty + text_h * 1.6;
+    let bh = text_h * 0.9;
+    let bx = cx - bar_w / 2.0;
+    for k in 0..steps {
+        let lit = (lo as i32 + k as i32) < i32::from(level);
+        let x = bx + k as f32 * cell;
+        let gap = (cell * 0.22).max(1.0);
+        fill(
+            frame,
+            w,
+            h,
+            (
+                x + px as f32,
+                by + px as f32,
+                x + cell - gap + px as f32,
+                by + bh + px as f32,
+            ),
+            [0, 0, 0, 0xFF],
+        );
+        let rgba = if lit { green } else { [0x18, 0x50, 0x1C, 0xFF] };
+        fill(frame, w, h, (x, by, x + cell - gap, by + bh), rgba);
+    }
+}
+
 /// Draw the Program monitor's controls (and the setup panel when open).
 fn draw_controls(frame: &mut [u8], art: &MonitorArt, w: usize, h: usize, c: Controls) {
     let (rec_label, lamp) = if c.recording {
@@ -912,6 +1102,24 @@ impl Canvas {
                         self.setup = open;
                         redraw = true;
                     }
+                    Ok(Paint::Settings(settings, osd)) => {
+                        self.settings = settings;
+                        self.look = Look::of(&settings);
+                        if let Some(k) = osd {
+                            self.osd = Some((k, Instant::now()));
+                        }
+                        redraw = true;
+                    }
+                    Ok(Paint::Power(edge)) => {
+                        self.settings.power = edge.on;
+                        self.edge = Some(edge);
+                        self.osd = None;
+                        redraw = true;
+                    }
+                    Ok(Paint::Pressed(key)) => {
+                        self.pressed = key;
+                        redraw = true;
+                    }
                     Ok(Paint::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
                     Err(mpsc::TryRecvError::Empty) => break,
                 }
@@ -924,6 +1132,17 @@ impl Canvas {
                 self.video_size = (vw, vh);
                 redraw = true;
             }
+            // While the tube warms or dies, a frame every so often
+            // whether or not the card sends one.
+            if self.animating() && self.last_paint.elapsed() >= ANIMATION_FRAME {
+                redraw = true;
+            }
+            if self
+                .osd
+                .is_some_and(|(_, since)| since.elapsed() >= OSD_TIME)
+            {
+                self.osd = None;
+            }
             let controls = self.controls();
             if redraw || self.painted != Some(controls) {
                 self.paint(controls);
@@ -931,8 +1150,32 @@ impl Canvas {
         }
     }
 
-    /// What the controls show now; a Preview monitor has none, only its
-    /// lamp.
+    /// The tube is warming up or going dark.
+    fn animating(&self) -> bool {
+        self.edge.is_some_and(|e| {
+            let t = e.at.saturating_duration_since(Instant::now()).as_secs_f32();
+            let since = e.at.elapsed().as_secs_f32();
+            t > 0.0
+                || since
+                    < if e.on {
+                        monitor_panel::WARM_UP
+                    } else {
+                        monitor_panel::COOL_DOWN
+                    }
+        })
+    }
+
+    /// Where the beam is: `None` with the tube dark.
+    fn beam(&self) -> Option<Beam> {
+        match self.edge {
+            Some(e) => Beam::at(e.on, e.at.elapsed().as_secs_f32()),
+            None if self.settings.power => Some(Beam::STEADY),
+            None => None,
+        }
+    }
+
+    /// What the controls show now; a Preview monitor has no recording
+    /// controls.
     fn controls(&self) -> Controls {
         let program = self.output.name() == "Program";
         Controls {
@@ -940,40 +1183,81 @@ impl Canvas {
             saving: program && self.output.saving(),
             setup: program && self.setup,
             settings: self.output.record_settings(),
+            panel: self.settings,
+            pressed: self.pressed,
+            osd: self
+                .osd
+                .filter(|_| self.settings.power)
+                .map(|(k, _)| (k, self.settings.knob(k))),
         }
     }
 
     fn paint(&mut self, controls: Controls) {
-        let recording = controls.recording;
+        self.last_paint = Instant::now();
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return;
         }
-        if self
-            .layer
-            .as_ref()
-            .is_none_or(|l| (l.w, l.h) != (w as usize, h as usize))
-        {
+        if self.layer.as_ref().is_none_or(|l| {
+            (l.w, l.h) != (w as usize, h as usize) || l.under_scan != self.settings.under_scan
+        }) {
             self.layer = Some(Layer::new(
                 &self.art,
                 w as usize,
                 h as usize,
                 self.output.aspect(),
+                self.settings.under_scan,
             ));
             self.painted = None;
         }
         let Some(layer) = self.layer.as_ref() else {
             return;
         };
-        let video = (!self.video.is_empty()).then_some((
-            self.video.as_slice(),
-            self.video_size.0,
-            self.video_size.1,
-        ));
+        let (vw, vh) = self.video_size;
+        // INPUT B and C carry nothing; a tube that is off shows nothing.
+        let beam = self
+            .beam()
+            .filter(|_| self.settings.input == 0 && !self.video.is_empty());
+        let video = match beam {
+            // The tube dark as it is when lit with nothing on it, so going
+            // dark does not change the glass.
+            None if vw * vh > 0 => {
+                self.shown.clear();
+                self.shown
+                    .resize(vw * vh, u32::from_le_bytes([0, 0, 0, 0xFF]));
+                Some((self.shown.as_slice(), vw, vh))
+            }
+            None => None,
+            Some(b) if b == Beam::STEADY && self.look.is_plain() => {
+                Some((self.video.as_slice(), vw, vh))
+            }
+            Some(b) => {
+                monitor_panel::process(&self.video, vw, vh, &self.look, &b, &mut self.shown);
+                Some((self.shown.as_slice(), vw, vh))
+            }
+        };
         // The artwork around the tube stays in the surface's buffer from
         // frame to frame; it is painted again only when it changes.
         let background = self.painted != Some(controls);
-        layer.compose_rgba8(video, recording, self.pixels.frame_mut(), background);
+        layer.compose_rgba8(video, self.pixels.frame_mut(), background);
+        if background || video.is_none() {
+            draw_panel(
+                self.pixels.frame_mut(),
+                &self.art,
+                w as usize,
+                h as usize,
+                &controls,
+            );
+        }
+        if let Some(osd) = controls.osd {
+            draw_osd(
+                self.pixels.frame_mut(),
+                w as usize,
+                h as usize,
+                layer.screen,
+                osd,
+            );
+        }
         if self.output.name() == "Program" {
             draw_controls(
                 self.pixels.frame_mut(),
@@ -1021,38 +1305,57 @@ impl MonitorWindow {
         self.output.name() == "Program"
     }
 
-    fn resized(&mut self, art: &MonitorArt, w: u32, h: u32) {
+    fn resized(&mut self, w: u32, h: u32) {
         let (w, h) = (w.max(1), h.max(1));
         self.size = (w, h);
-        self.button = button_in(art, w as usize, h as usize);
         self.painter.send(Paint::Resized(w, h));
+    }
+
+    /// Press a front-panel button.
+    fn press(&mut self, key: Key) {
+        let name = self.output.name().to_string();
+        let osd = self.settings.press(key);
+        if key == Key::Power {
+            monitor_sounds::power(self.settings.power, self.variant, 0.0);
+            self.painter.send(Paint::Power(PowerEdge {
+                on: self.settings.power,
+                at: Instant::now(),
+            }));
+        } else {
+            monitor_sounds::button_click();
+            self.painter.send(Paint::Settings(self.settings, osd));
+        }
+        monitor_panel::save(self.output.media_root().as_deref(), &name, self.settings);
     }
 }
 
 /// The monitor windows of the fitted card.
 pub(super) struct CardMonitors {
-    /// Loaded on first use: most sessions never fit a card.
-    art: std::cell::OnceCell<Option<Arc<MonitorArt>>>,
+    /// Each output's artwork, loaded on first use: most sessions never fit
+    /// a card.
+    art: std::cell::RefCell<std::collections::HashMap<String, Option<Arc<MonitorArt>>>>,
     windows: Vec<MonitorWindow>,
     /// The Flyer clip converter has been started (or there is none).
     converter_started: bool,
+    /// The card's sound level last given to the machine.
+    speaker: Option<f32>,
 }
 
 impl CardMonitors {
     pub(super) fn new() -> Self {
         Self {
-            art: std::cell::OnceCell::new(),
+            art: std::cell::RefCell::new(std::collections::HashMap::new()),
             windows: Vec::new(),
             converter_started: false,
+            speaker: None,
         }
     }
 
-    fn art(&self, outputs: &[Arc<CardOutput>]) -> Option<Arc<MonitorArt>> {
+    fn art(&self, output: &CardOutput) -> Option<Arc<MonitorArt>> {
         self.art
-            .get_or_init(|| {
-                let root = outputs.iter().find_map(|o| o.media_root());
-                MonitorArt::load(root.as_deref())
-            })
+            .borrow_mut()
+            .entry(output.name().to_string())
+            .or_insert_with(|| MonitorArt::load(output.media_root().as_deref(), output.name()))
             .clone()
     }
 
@@ -1073,17 +1376,19 @@ impl CardMonitors {
             return;
         }
         self.windows.clear();
+        // A new machine's mix starts at its own level.
+        self.speaker = None;
         if outputs.is_empty() {
             return;
         }
-        let Some(art) = self.art(&outputs) else {
-            return;
-        };
-        let (aw, ah) = art.size();
-        // Half the artwork's size, side by side to the right of the main
-        // window where there is room.
-        let size = LogicalSize::new(aw as f64 / 2.0, ah as f64 / 2.0);
         for (n, output) in outputs.into_iter().enumerate() {
+            let Some(art) = self.art(&output) else {
+                continue;
+            };
+            let (aw, ah) = art.size();
+            // Half the artwork's size, stacked to the right of the main
+            // window where there is room.
+            let size = LogicalSize::new(aw as f64 / 2.0, ah as f64 / 2.0);
             let mut attrs = WindowAttributes::default()
                 .with_title(format!("Toaster {}", output.name()))
                 .with_inner_size(size)
@@ -1123,6 +1428,17 @@ impl CardMonitors {
                 }
             };
             info!("toaster monitor window: {}", output.name());
+            let settings = monitor_panel::load(output.media_root().as_deref(), output.name());
+            // Switched on with the machine: the Preview a moment after the
+            // Program, as from a power strip.
+            let delay = 0.3 * n as f32;
+            let edge = settings.power.then(|| {
+                monitor_sounds::power(true, n, delay);
+                PowerEdge {
+                    on: true,
+                    at: Instant::now() + Duration::from_secs_f32(delay),
+                }
+            });
             let canvas = Canvas {
                 output: Arc::clone(&output),
                 art: Arc::clone(&art),
@@ -1134,6 +1450,13 @@ impl CardMonitors {
                 video_size: (0, 0),
                 painted: None,
                 setup: false,
+                settings,
+                look: Look::of(&settings),
+                edge,
+                pressed: None,
+                osd: None,
+                shown: Vec::new(),
+                last_paint: Instant::now(),
             };
             let (tx, rx) = mpsc::channel();
             let thread = std::thread::Builder::new()
@@ -1151,10 +1474,13 @@ impl CardMonitors {
             };
             let mw = MonitorWindow {
                 output,
+                art: Arc::clone(&art),
                 window,
                 painter: Painter { tx, thread },
-                button: button_in(&art, w as usize, h as usize),
                 size: (w, h),
+                settings,
+                held: None,
+                variant: n,
                 setup: false,
                 shown: (false, false),
                 cursor: (0.0, 0.0),
@@ -1178,17 +1504,39 @@ impl CardMonitors {
                 w.shown = shown;
                 w.window.set_title(&w.title());
             }
+            // A held up or down button repeats.
+            if let Some((key, next)) = w.held {
+                if Instant::now() >= next {
+                    w.held = Some((key, next + REPEAT_RATE));
+                    w.press(key);
+                }
+            }
         }
+    }
+
+    /// The card's sound level: the Program monitor's volume, nothing with
+    /// it switched off, as made with no Program monitor. `Some` when it
+    /// changed since last asked.
+    pub(super) fn speaker_change(&mut self) -> Option<f32> {
+        let gain = self
+            .windows
+            .iter()
+            .find(|w| w.is_program())
+            .map_or(1.0, |w| w.settings.speaker_gain());
+        (self.speaker != Some(gain)).then(|| {
+            self.speaker = Some(gain);
+            gain
+        })
     }
 
     /// Handle an event for one of the monitor windows. `Some(message)` is
     /// something to tell the user (a recording started or stopped).
     pub(super) fn window_event(&mut self, id: WindowId, event: &WindowEvent) -> Option<String> {
-        let art = self.art.get().cloned().flatten()?;
         let w = self.windows.iter_mut().find(|w| w.window.id() == id)?;
+        let art = Arc::clone(&w.art);
         match event {
             WindowEvent::RedrawRequested => w.painter.send(Paint::Redraw),
-            WindowEvent::Resized(size) => w.resized(&art, size.width, size.height),
+            WindowEvent::Resized(size) => w.resized(size.width, size.height),
             WindowEvent::CloseRequested => {
                 // Closing a monitor turns it away rather than unplugging
                 // it: the menu brings it back.
@@ -1196,12 +1544,25 @@ impl CardMonitors {
             }
             WindowEvent::CursorMoved { position, .. } => w.cursor = (position.x, position.y),
             WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                w.held = None;
+                w.painter.send(Paint::Pressed(None));
+            }
+            WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if w.is_program() => {
+            } => {
                 let (ww, wh) = (w.size.0 as usize, w.size.1 as usize);
-                match control_at(&art, ww, wh, w.setup, w.cursor.0, w.cursor.1) {
+                let control = if w.is_program() {
+                    control_at(&art, ww, wh, w.setup, w.cursor.0, w.cursor.1)
+                } else {
+                    None
+                };
+                match control {
                     Some(Control::Record) => return Some(toggle_recording(w)),
                     Some(c @ (Control::Setup | Control::Close)) => {
                         w.setup = c == Control::Setup && !w.setup;
@@ -1228,10 +1589,15 @@ impl CardMonitors {
                             open_folder(dir);
                         }
                     }
-                    None if hits(w.button, w.cursor.0, w.cursor.1) => {
-                        return Some(toggle_recording(w));
+                    None => {
+                        if let Some(key) = key_at(&art, ww, wh, w.cursor.0, w.cursor.1) {
+                            w.painter.send(Paint::Pressed(Some(key)));
+                            if matches!(key, Key::Up(_) | Key::Down(_)) {
+                                w.held = Some((key, Instant::now() + REPEAT_DELAY));
+                            }
+                            w.press(key);
+                        }
                     }
-                    None => {}
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -1277,11 +1643,11 @@ impl CardMonitors {
         if outputs.is_empty() {
             return;
         }
-        let Some(art) = self.art(outputs) else {
-            return;
-        };
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("shot");
         for output in outputs {
+            let Some(art) = self.art(output) else {
+                continue;
+            };
             let (pixels, w, h) = compose_native(&art, output);
             let name = format!("{stem}-{}.png", output.name().to_ascii_lowercase());
             let target = path.with_file_name(name);
@@ -1362,6 +1728,9 @@ impl super::App {
         });
         self.card_monitors.sync(event_loop, outputs, beside);
         self.card_monitors.poll();
+        if let Some(gain) = self.card_monitors.speaker_change() {
+            self.emu.bus_mut().set_video_slot_volume(gain);
+        }
         self.start_flyer_converter();
     }
 
@@ -1435,26 +1804,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_built_in_artwork_has_a_tube() {
-        let art = MonitorArt::decode(DEFAULT_ART, true).expect("artwork");
-        let (x0, y0, x1, y1) = art.screen;
-        // The glass measured off the artwork: 925 x 681 at (265, 119).
-        assert!(
-            (260..=270).contains(&x0) && (114..=124).contains(&y0),
-            "{:?}",
-            art.screen
-        );
-        assert!(
-            (1185..=1195).contains(&x1) && (795..=805).contains(&y1),
-            "{:?}",
-            art.screen
-        );
+    fn the_built_in_artworks_have_a_tube() {
+        for built_in in [&PROGRAM_ART, &PREVIEW_ART] {
+            let art = MonitorArt::decode(built_in.png).expect("artwork");
+            let (x0, y0, x1, y1) = art.screen;
+            // The glass measured off the artworks: about 925 x 680 at
+            // (265, 120).
+            assert!(
+                (255..=275).contains(&x0) && (110..=130).contains(&y0),
+                "{:?}",
+                art.screen
+            );
+            assert!(
+                (1180..=1200).contains(&x1) && (790..=810).contains(&y1),
+                "{:?}",
+                art.screen
+            );
+            // The front panel's buttons lie on the artwork, below the
+            // glass, and a click on each finds it, in a window of the
+            // artwork's size and of half that.
+            let mut art = art;
+            art.panel = Some(built_in.panel);
+            for &(key, (bx0, by0, bx1, by1)) in built_in.panel.keys {
+                assert!(bx1 as usize <= art.w && by1 as usize <= art.h && by0 as usize > y1);
+                assert!(bx0 < bx1 && by0 < by1);
+                for div in [1, 2] {
+                    let (w, h) = (art.w / div, art.h / div);
+                    let x = f64::from(bx0 + bx1) / 2.0 / div as f64;
+                    let y = f64::from(by0 + by1) / 2.0 / div as f64;
+                    assert_eq!(key_at(&art, w, h, x, y), Some(key));
+                }
+            }
+            assert_eq!(key_at(&art, art.w, art.h, 700.0, 500.0), None);
+        }
     }
 
     #[test]
     fn the_fixed_point_tube_follows_the_float_model() {
-        let art = MonitorArt::decode(DEFAULT_ART, true).expect("artwork");
-        let layer = Layer::new(&art, 1100, 817, 4.0 / 3.0);
+        let art = MonitorArt::decode(PROGRAM_ART.png).expect("artwork");
+        let layer = Layer::new(&art, 1100, 817, 4.0 / 3.0, false);
         // A picture with detail in every channel.
         let (vw, vh) = (752, 480);
         let video: Vec<u32> = (0..vw * vh)
@@ -1464,7 +1852,7 @@ mod tests {
             })
             .collect();
         let mut out = vec![0u32; 1100 * 817];
-        layer.compose(Some((&video, vw, vh)), false, &mut out);
+        layer.compose(&art, Some((&video, vw, vh)), &mut out);
         // The float model this replaced, at a spread of tube pixels.
         let (px, py, pw, ph) = layer.picture;
         let (sx, sy) = (vw as f32 / pw, vh as f32 / ph);
@@ -1508,11 +1896,11 @@ mod tests {
 
     #[test]
     fn a_frame_lands_on_the_glass_only() {
-        let art = MonitorArt::decode(DEFAULT_ART, true).expect("artwork");
-        let layer = Layer::new(&art, 728, 540, 4.0 / 3.0);
+        let art = MonitorArt::decode(PROGRAM_ART.png).expect("artwork");
+        let layer = Layer::new(&art, 728, 540, 4.0 / 3.0, false);
         let red = vec![rgba_u32(255, 0, 0); 16 * 12];
         let mut out = vec![0u32; 728 * 540];
-        layer.compose(Some((&red, 16, 12)), false, &mut out);
+        layer.compose(&art, Some((&red, 16, 12)), &mut out);
         let at = |x: usize, y: usize| out[y * 728 + x].to_le_bytes();
         // The middle of the tube is red, the bezel below it is not.
         let mid = at(364, 230);

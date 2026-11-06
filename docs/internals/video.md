@@ -961,12 +961,34 @@ size gets a table of every tube pixel's bilinear taps, glass shading and
 coverage in fixed point (`Layer::table`), a new frame is one integer pass
 over it straight into the surface's buffer, split across up to four
 threads above 60,000 tube pixels, and the artwork around the tube is
-painted only when the layer or the power lamp changes. The Program
+painted only when the layer or the controls change. The Program
 monitor's REC and SETUP buttons and its setup panel are drawn by the
 painter over the artwork in the 8x8 overlay font; the event loop hit-tests
 them from the same fractions of the artwork. Recordings go through the
 card output (`CardOutput`): the lossless AVI recorder runs on publish, and
-for an MP4 a thread runs ffmpeg on the AVI when the recording stops. (Painted on the
+for an MP4 a thread runs ffmpeg on the AVI when the recording stops.
+
+The front panels (`video/window/monitor_panel.rs`) are hit-tested from
+button rectangles measured off the built-in artworks. The event loop
+keeps each monitor's settings (and saves them) and passes them to the
+painter, which applies them to the frame before the tube table sees it
+(`monitor_panel::process`): one pass of a 3x3 fixed-point matrix built in
+YIQ (contrast scales Y, I and Q; chroma scales I and Q; phase rotates
+them; bright offsets the result), horizontal peaking for APERTURE, the
+blue gun alone, and for H-V DELAY a source map that shifts the raster by
+half a line and half a field with NTSC-proportioned blanking and sync
+between. At the presets the matrix is the identity and the pass is
+skipped. UNDER SCAN builds the tube table for a picture smaller than the
+glass, its taps outside the raster unlit. Power changes animate through
+the same pass (`Beam::at`: a warm-up with a decaying ripple; off, a
+collapse to a line, then a dot), and the painter repaints at about 60
+Hz while one runs. The sounds (`monitor_sounds.rs`) are synthesized once
+(a mains-harmonic degaussing hum, flyback whine, static crackle, switch
+clicks) and mixed by `audio::fx` straight into the host's output
+callback, after the machine's sound, so they bypass the live lead and
+reach no capture. VOL on the Program monitor sets Paula's host-only
+`video_slot_volume` (skipped in save states, like the output volume).
+(Painted on the
 emulation thread, the two windows were the bulk of what a project play
 cost the machine on a fast host: 3.5 ms of host time per NTSC frame
 idle against 15.5 ms with the outputs changing every frame, past real
