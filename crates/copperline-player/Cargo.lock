@@ -590,9 +590,11 @@ dependencies = [
  "embed-resource",
  "env_logger",
  "flate2",
+ "flyerclip",
  "gif",
  "gilrs",
  "hound",
+ "image",
  "libc",
  "log",
  "m68k",
@@ -1292,6 +1294,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flyerclip"
+version = "0.1.0"
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1684,6 +1690,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3042,9 +3050,9 @@ dependencies = [
 
 [[package]]
 name = "ringbuf"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b58b631e416dd7d84549d7e6a50f767e111f9b03e30d04f40072f6618f386aaf"
+checksum = "33d5f59e4145df5f29e84b6389394a8a3fedf7bd8c12570560ae67a917e6eae3"
 dependencies = [
  "crossbeam-utils",
  "portable-atomic",
