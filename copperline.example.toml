@@ -597,6 +597,7 @@ video = "PAL"
 # media = "Amiga Toaster Files"
 # monitors = true
 # preview_overlay = false
+# generation = "4000"
 # flyer = false
 # converter = true
 

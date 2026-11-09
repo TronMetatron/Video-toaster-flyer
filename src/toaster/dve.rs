@@ -69,11 +69,21 @@ fn colour_quad(code: u8) -> u32 {
 fn warp_label(row: &[u32], quad_col: i64, scale: i64) -> Option<u8> {
     let mut hi = 0u8;
     let mut lo = 0u8;
+    let ecs = super::ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed);
     for j in 0..4i64 {
         let col = usize::try_from(quad_col + j * scale).ok()?;
-        let [r, g, _, _] = row.get(col)?.to_le_bytes();
-        hi |= (g & 1) << (3 - j);
-        lo |= (r & 1) << (3 - j);
+        let px = *row.get(col)?;
+        let (b_line, i_line) = if ecs {
+            // Original card: the B and I lines themselves (the 2.0
+            // switcher's DVE fields use colours $226-$229).
+            let v = super::lines_of(px);
+            ((v >> 2) & 1, (v >> 3) & 1)
+        } else {
+            let [r, g, _, _] = px.to_le_bytes();
+            (r & 1, g & 1)
+        };
+        hi |= i_line << (3 - j);
+        lo |= b_line << (3 - j);
     }
     Some((hi << 4) | lo)
 }

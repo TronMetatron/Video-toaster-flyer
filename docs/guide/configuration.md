@@ -900,6 +900,7 @@ media = "C:/Toaster/Amiga Toaster Files"   # the card's host folder
 # volume = "ToasterFiles"  # also mount media in the Amiga as ToasterFiles:
 # flyer = false           # also fit a Video Flyer (needs card = "toaster")
 # converter = true        # with a Flyer, open the clip converter window too
+# generation = "4000"     # "4000" (default) or "original": the 1990 card's input wiring
 ```
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
@@ -1148,6 +1149,14 @@ which the JIT runs at the same speed as the precise core.
 `preview_overlay` lets the switcher draw its interface over the Preview
 output when its own preference asks for it, as a one-monitor Toaster setup
 does. It is off by default because the interface has a window of its own.
+
+`generation = "original"` wires the card's four input lines as the 1990
+Toaster's were, for the 2.0 switcher on an ECS machine: each line is one
+bit of the 12-bit colour (R = r3, G = g3, B = b3, I = b0, as the non-AA
+switcher's sprite palette sets them) rather than the 4000's pairs of AGA
+low-nibble bits, the digitiser records into the bank the switcher plays,
+and the wipes' source latch and the digital effects' labels are read from
+the same lines. The default, `"4000"`, is the AGA-era card.
 
 Headless screenshots (`--screenshot-after`) also save each output on its
 monitor beside the capture (`shot-preview.png`, `shot-program.png`).

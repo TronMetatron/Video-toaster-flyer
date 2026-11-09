@@ -303,10 +303,28 @@ impl Header {
     }
 }
 
+/// The original (1990, ECS) card's wiring: each input line is one bit of
+/// the 12-bit colour (the non-AA switcher's sprite palette, cop.a
+/// `color17`-`color31`: R = r3, G = g3, B = b3, I = b0). Selected with
+/// `[video_slot] generation = "original"`; the renderer expands ECS
+/// nibbles by duplication, so bit 3 of each 8-bit channel is the nibble's
+/// bit 3.
+pub static ECS_WIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The four-bit value the card's input lines read from one RGBA8 pixel.
 #[inline]
 pub fn lines_of(pixel: u32) -> u8 {
     let [r, g, b, _] = pixel.to_le_bytes();
+    if ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed) {
+        let line_r = (r & 0x08) != 0;
+        let line_g = (g & 0x08) != 0;
+        let line_b = (b & 0x08) != 0;
+        let line_i = (b & 0x01) != 0;
+        return u8::from(line_r)
+            | (u8::from(line_g) << 1)
+            | (u8::from(line_b) << 2)
+            | (u8::from(line_i) << 3);
+    }
     let line_r = (r & 0x06) != 0;
     let line_g = (b & 0x04) != 0 || (g & 0x02) != 0;
     let line_b = (r & 0x01) != 0 || (b & 0x01) != 0;
@@ -715,6 +733,15 @@ impl Toaster {
         self.card().preview_overlay = on;
     }
 
+    /// Model the original (1990) card's input wiring instead of the
+    /// 4000's (`[video_slot] generation = "original"`).
+    pub fn set_original_card(&mut self, on: bool) {
+        ECS_WIRING.store(on, std::sync::atomic::Ordering::Relaxed);
+        if on {
+            log::info!("toaster: original-card (ECS) input wiring selected");
+        }
+    }
+
     /// One framestore byte.
     pub fn frame_store_byte(
         &mut self,
@@ -939,6 +966,18 @@ impl Card {
     /// Bank a write goes to: EH0 `OBR`.
     fn write_bank(&self) -> usize {
         usize::from(self.elh[ELH_EH0].r & EH0R_OBR != 0)
+    }
+
+    /// Bank the digitiser records into. The 4000 card records into the
+    /// `OBR` bank; the original card feeds the play/read bank (2.0's
+    /// freeze keeps `OBR` set and then saves the frozen frame through reads
+    /// that keep `OBR` set too, which the self-test ties to bank 0).
+    fn record_bank(&self) -> usize {
+        if ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed) {
+            self.read_bank()
+        } else {
+            self.write_bank()
+        }
     }
 
     /// Bank a read comes from: the switcher sets `OBR` for bank 0.
@@ -1769,7 +1808,7 @@ impl Card {
     /// is kept, and encoded when the bank is next read (`settle`).
     fn record_input(&mut self, field: &FieldPixels<'_>) {
         let is = self.regs().is();
-        let bank = usize::from(self.regs().obr());
+        let bank = self.record_bank();
         let mut pic = match self.pending_grab[bank].take() {
             Some(old) => old,
             None => self.video.take_picture(),

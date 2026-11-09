@@ -569,6 +569,13 @@ impl TryFrom<RawConfig> for Config {
             .map(PathBuf::from);
         let video_slot_monitors = raw.video_slot.monitors.unwrap_or(true);
         let video_slot_preview_overlay = raw.video_slot.preview_overlay.unwrap_or(false);
+        let video_slot_original_card = match raw.video_slot.generation.as_deref() {
+            None | Some("4000") | Some("") => false,
+            Some("original") | Some("2000") | Some("1990") => true,
+            Some(other) => anyhow::bail!(
+                "[video_slot] generation: unknown value {other:?}: expected \"4000\" or \"original\""
+            ),
+        };
         // `[video_slot] flyer`: the Flyer works only beside a Toaster (its
         // video goes to the Toaster's inputs, its software is the Toaster's).
         let video_slot_flyer = raw.video_slot.flyer.unwrap_or(false);
@@ -1635,6 +1642,7 @@ impl TryFrom<RawConfig> for Config {
             video_slot_media,
             video_slot_monitors,
             video_slot_preview_overlay,
+            video_slot_original_card,
             video_slot_flyer,
             paths: raw.paths,
         })

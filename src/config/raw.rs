@@ -763,6 +763,12 @@ pub(crate) struct RawVideoSlot {
     /// switcher asks (its preview-overlay preference). Default false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) preview_overlay: Option<bool>,
+    /// Which Toaster: `"4000"` (default; the AGA-era card, its input lines
+    /// on the AGA low-nibble bit pairs) or `"original"` (the 1990 card: one
+    /// 12-bit colour bit per line, R=r3 G=g3 B=b3 I=b0, as the non-AA
+    /// switcher's sprite palette sets them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) generation: Option<String>,
     /// Also mount the card's host folder in the Amiga as a volume of this
     /// name (e.g. "ToasterFiles"), so the Toaster software can load and
     /// save there and the control link can reach the Amiga. Default: not

@@ -477,6 +477,12 @@ fn amiga_row<'a>(
     }))
 }
 
+/// Whether the card is the original (ECS) one, whose four lines are
+/// single bits of the 12-bit colour (see [`super::lines_of`]).
+fn ecs_wiring() -> bool {
+    super::ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The visible colour of an AGA pixel: the high nibbles, which the
 /// switcher keeps for what the Amiga monitor shows (the low nibbles carry
 /// the card's control bits).
@@ -523,9 +529,19 @@ pub fn latch_codes_into(field: &FieldPixels<'_>, x0: i64, codes: &mut Vec<Option
         let mut held = None;
         for (slot, px) in line.iter_mut().zip(row) {
             if let Some(px) = px {
-                let [r, _, b, a] = px.to_le_bytes();
-                if a == 0 {
-                    held = Some(((b >> 2) & 1) | (((r >> 2) & 1) << 1) | (((r >> 1) & 1) << 2));
+                if ecs_wiring() {
+                    // Original card: the R line marks a latching pixel and
+                    // the G, B and I lines carry the source code (seen on
+                    // the 2.0 switcher's wipes: colours $876, $886, $879).
+                    let v = super::lines_of(px);
+                    if v & 1 != 0 {
+                        held = Some((v >> 1) & 7);
+                    }
+                } else {
+                    let [r, _, b, a] = px.to_le_bytes();
+                    if a == 0 {
+                        held = Some(((b >> 2) & 1) | (((r >> 2) & 1) << 1) | (((r >> 1) & 1) << 2));
+                    }
                 }
             }
             *slot = held;
@@ -547,16 +563,18 @@ pub fn amiga_key_into(field: &FieldPixels<'_>, x0: i64, mode: Cds, cd: u8, key: 
                 continue;
             };
             let [r, g, b, a] = px.to_le_bytes();
+            // The same bits by card line: R, G, B, I = r1, g1, b0, b1 of
+            // the AGA low nibbles, or the original card's four lines.
+            let lines = if ecs_wiring() {
+                super::lines_of(px)
+            } else {
+                ((r >> 1) & 1) | (((g >> 1) & 1) << 1) | ((b & 3) << 2)
+            };
             let k = match mode {
-                // Two bits: b0, b1. 0 shows A, 3 shows B.
-                Cds::Dib => u32::from(b & 3) * 255 / 3,
-                // Four bits: r1, g1, b0, b1, scaled by CD for key fades.
-                Cds::Dibgr => {
-                    let code = u32::from((r >> 1) & 1)
-                        | (u32::from((g >> 1) & 1) << 1)
-                        | (u32::from(b & 3) << 2);
-                    code * u32::from(cd) / 15
-                }
+                // Two bits: the B and I lines. 0 shows A, 3 shows B.
+                Cds::Dib => u32::from((lines >> 2) & 3) * 255 / 3,
+                // Four bits: R, G, B, I, scaled by CD for key fades.
+                Cds::Dibgr => u32::from(lines) * u32::from(cd) / 15,
                 // Genlock transparency: see-through pixels show A.
                 Cds::PixelSw => {
                     if a == 0 {
@@ -583,8 +601,13 @@ pub fn overlay_interface(field: &FieldPixels<'_>, x0: i64, out: &mut [u32]) {
             let Some(px) = px else {
                 continue;
             };
-            let [r, g, _, _] = px.to_le_bytes();
-            if (r | g) & 0x02 != 0 {
+            let on = if ecs_wiring() {
+                super::lines_of(px) & 3 != 0
+            } else {
+                let [r, g, _, _] = px.to_le_bytes();
+                (r | g) & 0x02 != 0
+            };
+            if on {
                 *o = visible_colour(px);
             }
         }
