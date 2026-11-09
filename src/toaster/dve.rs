@@ -157,6 +157,40 @@ impl DveMap {
                 .checked_sub(PICTURE_LINE0)
                 .filter(|&r| r < SOURCE_ROWS);
         }
+        if crate::envcfg::flag("COPPERLINE_DIAG_TOASTER") {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_multiple_of(16) {
+                let mut classes = [0usize; 4];
+                for &q in &self.quads {
+                    classes[match q {
+                        0..=191 => 0,
+                        0xE8..=0xEF => 1,
+                        0xFF => 3,
+                        _ => 2,
+                    }] += 1;
+                }
+                let rows_set = self.rows.iter().flatten().count();
+                let vpos = AMIGA_LINE0 + ((100 + PICTURE_LINE0) >> 1) as u32;
+                let sample: Vec<String> = field
+                    .row(vpos)
+                    .map(|row| {
+                        (0..8)
+                            .filter_map(|k| {
+                                usize::try_from(x0 + (PICTURE_X0 as i64 + 40 * k) * scale)
+                                    .ok()
+                                    .and_then(|c| row.get(c))
+                                    .map(|px| format!("{px:08X}"))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                log::info!(
+                    "toaster dve: quads picture={} colour={} other={} transparent={} rows_set={} row100 px {:?}",
+                    classes[0], classes[1], classes[2], classes[3], rows_set, sample
+                );
+            }
+        }
     }
 
     /// Whether any line shows a framestore line below the picture.

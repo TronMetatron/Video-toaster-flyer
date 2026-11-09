@@ -1187,8 +1187,19 @@ logs, once an emulated second, the host time each stage of the card's work
 took (`toaster perf:` lines: painting the field, scanning its headers,
 each source, the key, the mix, publishing, the Flyer's decodes and waits),
 most of it on the card's own compose thread, with `submit` and
-`compose_wait` the emulation thread's share. How the card works is
-described in [](../internals/video) and in `src/toaster/`.
+`compose_wait` the emulation thread's share. With `COPPERLINE_DIAG_TOASTER`
+on, `COPPERLINE_DIAG_TOASTER_DUMP=f1,f2,...` writes both banks and the
+Program picture as PPM files into the media folder at those fields (and
+every 1200 fields regardless), and `COPPERLINE_DIAG_TOASTER_WLOG=field`
+starts the per-line framestore write log at that field instead of at the
+start. `COPPERLINE_DIAG_TOASTER_TRACE=path` records a gzip-compressed binary
+trace of what the card sees: for every line its header words and its 768
+RGBA pixels, every extended header latched, and per composed frame the
+CRC-32 of Program, Preview and the four bank copies — the input to an
+independent card model; `COPPERLINE_DIAG_TOASTER_TRACE_FROM=field` and
+`_TO=field` limit it to a window of fields (a field is about 800 KB before
+compression). How the card works is described in [](../internals/video)
+and in `src/toaster/`.
 
 ## `[display]`
 
