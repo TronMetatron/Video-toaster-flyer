@@ -118,6 +118,12 @@ impl Video {
         vec![Arc::clone(&self.preview), Arc::clone(&self.program)]
     }
 
+    /// Stream the Program output to `url` once it produces frames
+    /// (`[video_slot] stream`), with `args` as ffmpeg's encoding arguments.
+    pub fn set_program_stream(&self, url: Option<String>, args: Option<String>, audio: bool) {
+        self.program.set_auto_stream(url, args, audio);
+    }
+
     pub fn media_root(&self) -> Option<&std::path::Path> {
         self.media_root.as_deref()
     }

@@ -901,7 +901,23 @@ media = "C:/Toaster/Amiga Toaster Files"   # the card's host folder
 # flyer = false           # also fit a Video Flyer (needs card = "toaster")
 # converter = true        # with a Flyer, open the clip converter window too
 # generation = "4000"     # "4000" (default) or "original": the 1990 card's input wiring
+# stream = "udp://239.1.1.1:5004"  # stream Program live through ffmpeg (default: none)
+# stream_args = "..."     # ffmpeg encoding arguments for the stream (default: low-latency H.264)
+# stream_audio = true     # the stream carries the sound that follows the switcher (default true)
 ```
+
+`stream` sends the Program output live, from the first frame the switcher
+makes: every frame is piped to ffmpeg (found as for the inputs), which
+encodes it at square pixels (640 x 480) as low-latency H.264 and sends it
+as MPEG-TS to a `udp://`, `srt://` or `rist://` URL, or as FLV to an
+`rtmp://` one. VLC plays a UDP stream from **Media > Open Network Stream**
+with the same URL (for a multicast address such as `udp://@239.1.1.1:5004`,
+with the `@`). `stream_args` replaces everything ffmpeg is given between its
+raw input and the URL, for another encoder or container. With
+`stream_audio` (the default) the stream carries the same sound as a
+recording, the inputs' soundtracks mixed as Program shows them, as AAC at
+48 kHz; `stream_audio = false` sends picture only, as the real card did.
+A stream stops when ffmpeg exits and is not restarted.
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
 A4000's video slot: a card that watches the digital RGB output line by line

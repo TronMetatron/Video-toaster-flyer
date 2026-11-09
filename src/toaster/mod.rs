@@ -740,6 +740,18 @@ impl Toaster {
         self.card().preview_overlay = on;
     }
 
+    /// Stream the Program output live to `url` (`[video_slot] stream`),
+    /// through ffmpeg, from the first frame the switcher makes.
+    pub fn set_program_stream(&mut self, url: Option<String>, args: Option<String>, audio: bool) {
+        if let Some(u) = &url {
+            log::info!(
+                "toaster: Program will stream to {u}{}",
+                if audio { " with sound" } else { "" }
+            );
+        }
+        self.card().video.set_program_stream(url, args, audio);
+    }
+
     /// Model the original (1990) card's input wiring instead of the
     /// 4000's (`[video_slot] generation = "original"`).
     pub fn set_original_card(&mut self, on: bool) {
