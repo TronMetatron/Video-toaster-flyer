@@ -603,10 +603,17 @@ pub struct Card {
     /// when something reads the bank (`settle`). What the bank holds is
     /// the same either way.
     pending_grab: [Option<Vec<u32>>; 2],
+    /// The picture each bank was last encoded from, to skip re-encoding an
+    /// unchanged (still) input digitised field after field.
+    last_recorded: [Option<Vec<u32>>; 2],
     video: video::Video,
     /// Lines this field that asked the card to record its input (`CERB`
     /// outside a framestore write).
     record_lines: u32,
+    /// Fields digitised in a row with `ABSE` set: the 4000 card's
+    /// automatic bank select alternates the recording bank every colour
+    /// frame while live, so both banks end up holding the live picture.
+    abse_fields: u64,
     /// Raw extended line headers, last value written.
     elh: [Header; ELH_COUNT],
     /// Seen a valid extended header: the switcher is driving the card.
@@ -879,8 +886,10 @@ impl Card {
         Self {
             frame_store: FrameStore::new(),
             pending_grab: [None, None],
+            last_recorded: [None, None],
             video: video::Video::new(media_root),
             record_lines: 0,
+            abse_fields: 0,
             elh,
             active: false,
             stats: Stats::default(),
@@ -957,7 +966,9 @@ impl Card {
         if let Some(pic) = self.pending_grab[bank & 1].take() {
             let timer = perf::start();
             video::Video::grab(&mut self.frame_store, bank, &pic);
-            self.video.give_back(pic);
+            if let Some(old) = self.last_recorded[bank & 1].replace(pic) {
+                self.video.give_back(old);
+            }
             self.stats.grabs_encoded += 1;
             timer.stop(perf::GRAB_ENCODE);
         }
@@ -1028,6 +1039,10 @@ impl Card {
         let bank = self.write_bank();
         self.settle(bank);
         self.video.invalidate(bank);
+        // Amiga data now differs from what the digitiser last gave.
+        if let Some(old) = self.last_recorded[bank].take() {
+            self.video.give_back(old);
+        }
         let x0 = Self::pixel0_column(field);
         let step = field.canvas_scale as i64;
         // The second pass of a zipper write (LUST clear) lands 16 samples
@@ -1808,12 +1823,31 @@ impl Card {
     /// is kept, and encoded when the bank is next read (`settle`).
     fn record_input(&mut self, field: &FieldPixels<'_>) {
         let is = self.regs().is();
-        let bank = self.record_bank();
+        let mut bank = self.record_bank();
+        // ABSE on the 4000 card: live digitising alternates banks every
+        // colour frame (4 fields), "8 fields to flood both banks"
+        // (CookFreeze, buttons.a). 3.x's FREEZE leaves live mode and then
+        // saves the Main bus bank, which must hold the picture too.
+        if self.regs().abse() && !ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed) {
+            self.abse_fields += 1;
+            if (self.abse_fields / 4) & 1 == 1 {
+                bank ^= 1;
+            }
+        } else {
+            self.abse_fields = 0;
+        }
         let mut pic = match self.pending_grab[bank].take() {
             Some(old) => old,
             None => self.video.take_picture(),
         };
         self.source_picture(is, video::Role::Is, field, &mut pic);
+        // A still input digitised again: the bank already holds it.
+        if self.pending_grab[bank].is_none()
+            && self.last_recorded[bank].as_deref() == Some(&pic[..])
+        {
+            self.video.give_back(pic);
+            return;
+        }
         self.pending_grab[bank] = Some(pic);
         self.video.invalidate(bank);
     }
@@ -2107,14 +2141,25 @@ mod tests {
         assert_eq!(card.stats.grabs_encoded, 1);
         // The other bank was not touched.
         assert_eq!(card.frame_store_byte(1, false, 1, 12), 0);
-        // A write to the bank lands over the digitised picture, as it would
-        // have had the picture been encoded at once: the written line is
-        // the Amiga's, the others the picture's.
+        // The same still digitised again is not encoded again: the bank
+        // already holds it.
         card.record_input(&line.field());
+        assert!(card.pending_grab[0].is_none());
         drop(card);
+        // A write to the bank lands over the digitised picture: the written
+        // line is the Amiga's, the others the picture's.
         write_line(&mut toaster, false, 1, &[9, 8, 7]);
         assert_eq!(toaster.frame_store_byte(0, false, 1, 12), 9);
         assert_eq!(toaster.frame_store_byte(0, false, 3, 15), n[3]);
+        assert_eq!(toaster.stats().grabs_encoded, 1);
+        // The bank no longer holds what the digitiser gave, so digitising
+        // again is kept, and the next write encodes it first, as it would
+        // have had the picture been encoded at once: the picture covers the
+        // earlier written line, the new written line lies over the picture.
+        toaster.card().record_input(&line.field());
+        write_line(&mut toaster, false, 2, &[9, 8, 7]);
+        assert_eq!(toaster.frame_store_byte(0, false, 1, 12), n[0]);
+        assert_eq!(toaster.frame_store_byte(0, false, 2, 12), 9);
         assert_eq!(toaster.stats().grabs_encoded, 2);
     }
 
