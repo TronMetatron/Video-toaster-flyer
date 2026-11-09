@@ -4660,6 +4660,10 @@ fn build_machine_inner(
             cfg.video_slot_stream_args.clone(),
             cfg.video_slot_stream_audio,
         );
+        crate::toaster::MONITOR_FRAME.store(
+            cfg.video_slot_monitor_frame,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(link) = flyer_link {
             card.set_flyer_link(link);
         }

@@ -311,6 +311,10 @@ impl Header {
 /// bit 3.
 pub static ECS_WIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `[video_slot] monitor_frame`: draw the monitor artwork (tube, bezel and
+/// front panel) in the output windows; off, they show the bare picture.
+pub static MONITOR_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// The four-bit value the card's input lines read from one RGBA8 pixel.
 #[inline]
 pub fn lines_of(pixel: u32) -> u8 {

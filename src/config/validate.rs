@@ -587,6 +587,7 @@ impl TryFrom<RawConfig> for Config {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         let video_slot_stream_audio = raw.video_slot.stream_audio.unwrap_or(true);
+        let video_slot_monitor_frame = raw.video_slot.monitor_frame.unwrap_or(true);
         let video_slot_original_card = match raw.video_slot.generation.as_deref() {
             None | Some("4000") | Some("") => false,
             Some("original") | Some("2000") | Some("1990") => true,
@@ -1664,6 +1665,7 @@ impl TryFrom<RawConfig> for Config {
             video_slot_stream,
             video_slot_stream_args,
             video_slot_stream_audio,
+            video_slot_monitor_frame,
             video_slot_flyer,
             paths: raw.paths,
         })

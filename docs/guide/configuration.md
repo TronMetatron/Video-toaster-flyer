@@ -904,6 +904,7 @@ media = "C:/Toaster/Amiga Toaster Files"   # the card's host folder
 # stream = "udp://239.1.1.1:5004"  # stream Program live through ffmpeg (default: none)
 # stream_args = "..."     # ffmpeg encoding arguments for the stream (default: low-latency H.264)
 # stream_audio = true     # the stream carries the sound that follows the switcher (default true)
+# monitor_frame = true    # draw the monitor artwork in the output windows (false: bare picture)
 ```
 
 `stream` sends the Program output live, from the first frame the switcher
@@ -918,6 +919,10 @@ raw input and the URL, for another encoder or container. With
 recording, the inputs' soundtracks mixed as Program shows them, as AAC at
 48 kHz; `stream_audio = false` sends picture only, as the real card did.
 A stream stops when ffmpeg exits and is not restarted.
+
+`monitor_frame = false` shows the Preview and Program windows as the bare
+picture inside a thin black surround, with no monitor artwork and no
+front panel; recordings, captures and the stream never carry the artwork.
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
 A4000's video slot: a card that watches the digital RGB output line by line

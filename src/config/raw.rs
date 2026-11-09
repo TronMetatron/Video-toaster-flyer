@@ -783,6 +783,11 @@ pub(crate) struct RawVideoSlot {
     /// mixed as Program shows them) on `stream`. Default true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stream_audio: Option<bool>,
+    /// Draw the monitor artwork (tube, bezel, front panel) around the
+    /// Preview and Program windows; `false` shows the bare picture.
+    /// Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) monitor_frame: Option<bool>,
     /// Also mount the card's host folder in the Amiga as a volume of this
     /// name (e.g. "ToasterFiles"), so the Toaster software can load and
     /// save there and the control link can reach the Amiga. Default: not

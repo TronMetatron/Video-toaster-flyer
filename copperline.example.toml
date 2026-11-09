@@ -601,6 +601,7 @@ video = "PAL"
 # stream = "udp://239.1.1.1:5004"
 # stream_args = ""
 # stream_audio = true
+# monitor_frame = true
 # flyer = false
 # converter = true
 
