@@ -10,7 +10,9 @@ Support: [Patreon](https://www.patreon.com/cw/Copperline)
 > **This fork: Video Toaster 4000 and Video Toaster Flyer.** The
 > `main` branch of this repository is Copperline with an emulated NewTek
 > Video Toaster 4000 in the video slot (the real 4.2 switcher, CG, effects,
-> framestores and keys run on it) and a high-level emulation of the Video
+> framestores and keys run on it), the original 1990 Video Toaster card
+> (`[video_slot] generation = "original"`, for Toaster 2.0 and the ECS
+> switchers on an A2000/A3000) and a high-level emulation of the Video
 > Toaster Flyer, with `flyer-convert`, a window in the Toaster's style
 > that turns video, stills and picture sequences into Flyer clips.
 >
