@@ -514,6 +514,17 @@ pub struct Config {
     pub video_slot_monitors: bool,
     /// `[video_slot] preview_overlay`: the Toaster's interface over Preview.
     pub video_slot_preview_overlay: bool,
+    /// `[video_slot] generation = "original"`: the 1990 card's input wiring.
+    pub video_slot_original_card: bool,
+    /// `[video_slot] stream`: where the Program output streams to live.
+    pub video_slot_stream: Option<String>,
+    /// `[video_slot] stream_args`: ffmpeg's encoding arguments for it.
+    pub video_slot_stream_args: Option<String>,
+    /// `[video_slot] stream_audio`: the stream carries the switcher's sound.
+    pub video_slot_stream_audio: bool,
+    /// `[video_slot] monitor_frame`: draw the monitor artwork in the
+    /// output windows (false: the bare picture).
+    pub video_slot_monitor_frame: bool,
     /// `[video_slot] flyer`: a Video Flyer on the Zorro chain beside the
     /// Toaster.
     pub video_slot_flyer: bool,
@@ -3000,6 +3011,11 @@ impl Default for Config {
             video_slot_media: None,
             video_slot_monitors: true,
             video_slot_preview_overlay: false,
+            video_slot_original_card: false,
+            video_slot_stream: None,
+            video_slot_stream_args: None,
+            video_slot_stream_audio: true,
+            video_slot_monitor_frame: true,
             video_slot_flyer: false,
             paths: crate::pathconf::Paths::default(),
         }

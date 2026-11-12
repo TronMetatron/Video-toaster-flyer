@@ -900,7 +900,29 @@ media = "C:/Toaster/Amiga Toaster Files"   # the card's host folder
 # volume = "ToasterFiles"  # also mount media in the Amiga as ToasterFiles:
 # flyer = false           # also fit a Video Flyer (needs card = "toaster")
 # converter = true        # with a Flyer, open the clip converter window too
+# generation = "4000"     # "4000" (default) or "original": the 1990 card's input wiring
+# stream = "udp://239.1.1.1:5004"  # stream Program live through ffmpeg (default: none)
+# stream_args = "..."     # ffmpeg encoding arguments for the stream (default: low-latency H.264)
+# stream_audio = true     # the stream carries the sound that follows the switcher (default true)
+# monitor_frame = true    # draw the monitor artwork in the output windows (false: bare picture)
 ```
+
+`stream` sends the Program output live, from the first frame the switcher
+makes: every frame is piped to ffmpeg (found as for the inputs), which
+encodes it at square pixels (640 x 480) as low-latency H.264 and sends it
+as MPEG-TS to a `udp://`, `srt://` or `rist://` URL, or as FLV to an
+`rtmp://` one. VLC plays a UDP stream from **Media > Open Network Stream**
+with the same URL (for a multicast address such as `udp://@239.1.1.1:5004`,
+with the `@`). `stream_args` replaces everything ffmpeg is given between its
+raw input and the URL, for another encoder or container. With
+`stream_audio` (the default) the stream carries the same sound as a
+recording, the inputs' soundtracks mixed as Program shows them, as AAC at
+48 kHz; `stream_audio = false` sends picture only, as the real card did.
+A stream stops when ffmpeg exits and is not restarted.
+
+`monitor_frame = false` shows the Preview and Program windows as the bare
+picture inside a thin black surround, with no monitor artwork and no
+front panel; recordings, captures and the stream never carry the artwork.
 
 `card = "toaster"` fits an emulated NewTek Video Toaster 4000 in the
 A4000's video slot: a card that watches the digital RGB output line by line
@@ -1149,6 +1171,14 @@ which the JIT runs at the same speed as the precise core.
 output when its own preference asks for it, as a one-monitor Toaster setup
 does. It is off by default because the interface has a window of its own.
 
+`generation = "original"` wires the card's four input lines as the 1990
+Toaster's were, for the 2.0 switcher on an ECS machine: each line is one
+bit of the 12-bit colour (R = r3, G = g3, B = b3, I = b0, as the non-AA
+switcher's sprite palette sets them) rather than the 4000's pairs of AGA
+low-nibble bits, the digitiser records into the bank the switcher plays,
+and the wipes' source latch and the digital effects' labels are read from
+the same lines. The default, `"4000"`, is the AGA-era card.
+
 Headless screenshots (`--screenshot-after`) also save each output on its
 monitor beside the capture (`shot-preview.png`, `shot-program.png`).
 `COPPERLINE_DIAG_TOASTER=1` logs what the card decodes and the bus state it
@@ -1157,8 +1187,19 @@ logs, once an emulated second, the host time each stage of the card's work
 took (`toaster perf:` lines: painting the field, scanning its headers,
 each source, the key, the mix, publishing, the Flyer's decodes and waits),
 most of it on the card's own compose thread, with `submit` and
-`compose_wait` the emulation thread's share. How the card works is
-described in [](../internals/video) and in `src/toaster/`.
+`compose_wait` the emulation thread's share. With `COPPERLINE_DIAG_TOASTER`
+on, `COPPERLINE_DIAG_TOASTER_DUMP=f1,f2,...` writes both banks and the
+Program picture as PPM files into the media folder at those fields (and
+every 1200 fields regardless), and `COPPERLINE_DIAG_TOASTER_WLOG=field`
+starts the per-line framestore write log at that field instead of at the
+start. `COPPERLINE_DIAG_TOASTER_TRACE=path` records a gzip-compressed binary
+trace of what the card sees: for every line its header words and its 768
+RGBA pixels, every extended header latched, and per composed frame the
+CRC-32 of Program, Preview and the four bank copies — the input to an
+independent card model; `COPPERLINE_DIAG_TOASTER_TRACE_FROM=field` and
+`_TO=field` limit it to a window of fields (a field is about 800 KB before
+compression). How the card works is described in [](../internals/video)
+and in `src/toaster/`.
 
 ## `[display]`
 

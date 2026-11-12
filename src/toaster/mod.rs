@@ -303,10 +303,79 @@ impl Header {
     }
 }
 
+impl Drop for Card {
+    fn drop(&mut self) {
+        if let Some(w) = self.trace.take() {
+            let _ = w.finish();
+        }
+    }
+}
+
+/// The field trace's file (`COPPERLINE_DIAG_TOASTER_TRACE`).
+type TraceWriter = flate2::write::GzEncoder<std::io::BufWriter<std::fs::File>>;
+
+/// CRC-32 (IEEE 802.3) for the field trace.
+struct Crc32(u32);
+
+impl Crc32 {
+    fn table() -> &'static [u32; 256] {
+        static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            let mut t = [0u32; 256];
+            for (i, e) in t.iter_mut().enumerate() {
+                let mut c = i as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+                *e = c;
+            }
+            t
+        })
+    }
+    fn new() -> Self {
+        Self(0xFFFF_FFFF)
+    }
+    fn update(&mut self, bytes: &[u8]) {
+        let t = Self::table();
+        for &b in bytes {
+            self.0 = t[((self.0 ^ u32::from(b)) & 0xFF) as usize] ^ (self.0 >> 8);
+        }
+    }
+    fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
+/// The original (1990, ECS) card's wiring: each input line is one bit of
+/// the 12-bit colour (the non-AA switcher's sprite palette, cop.a
+/// `color17`-`color31`: R = r3, G = g3, B = b3, I = b0). Selected with
+/// `[video_slot] generation = "original"`; the renderer expands ECS
+/// nibbles by duplication, so bit 3 of each 8-bit channel is the nibble's
+/// bit 3.
+pub static ECS_WIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `[video_slot] monitor_frame`: draw the monitor artwork (tube, bezel and
+/// front panel) in the output windows; off, they show the bare picture.
+pub static MONITOR_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// The four-bit value the card's input lines read from one RGBA8 pixel.
 #[inline]
 pub fn lines_of(pixel: u32) -> u8 {
     let [r, g, b, _] = pixel.to_le_bytes();
+    if ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed) {
+        let line_r = (r & 0x08) != 0;
+        let line_g = (g & 0x08) != 0;
+        let line_b = (b & 0x08) != 0;
+        let line_i = (b & 0x01) != 0;
+        return u8::from(line_r)
+            | (u8::from(line_g) << 1)
+            | (u8::from(line_b) << 2)
+            | (u8::from(line_i) << 3);
+    }
     let line_r = (r & 0x06) != 0;
     let line_g = (b & 0x04) != 0 || (g & 0x02) != 0;
     let line_b = (r & 0x01) != 0 || (b & 0x01) != 0;
@@ -585,10 +654,17 @@ pub struct Card {
     /// when something reads the bank (`settle`). What the bank holds is
     /// the same either way.
     pending_grab: [Option<Vec<u32>>; 2],
+    /// The picture each bank was last encoded from, to skip re-encoding an
+    /// unchanged (still) input digitised field after field.
+    last_recorded: [Option<Vec<u32>>; 2],
     video: video::Video,
     /// Lines this field that asked the card to record its input (`CERB`
     /// outside a framestore write).
     record_lines: u32,
+    /// Fields digitised in a row with `ABSE` set: the 4000 card's
+    /// automatic bank select alternates the recording bank every colour
+    /// frame while live, so both banks end up holding the live picture.
+    abse_fields: u64,
     /// Raw extended line headers, last value written.
     elh: [Header; ELH_COUNT],
     /// Seen a valid extended header: the switcher is driving the card.
@@ -597,6 +673,24 @@ pub struct Card {
     diag: bool,
     diag_lines_logged: u32,
     diag_fields: bool,
+    /// `COPPERLINE_DIAG_TOASTER_DUMP=f1,f2,...`: fields at which to dump the
+    /// banks and Program as PPMs (besides every 1200th field).
+    diag_dump_at: Vec<u64>,
+    /// `COPPERLINE_DIAG_TOASTER_WLOG=field`: log written line samples only
+    /// from this field on (the 40000-line cap then starts there).
+    diag_wlog_from: u64,
+    /// Whether the previous field digitised (for the diag record line).
+    diag_recording: bool,
+    /// `COPPERLINE_DIAG_TOASTER_TRACE=path`: binary trace of every line header
+    /// and line's samples, and per-frame CRCs of outputs and banks.
+    trace: Option<TraceWriter>,
+    /// The trace's header has been written (at the first record, once the
+    /// card's generation is known).
+    trace_header: bool,
+    trace_from: u64,
+    trace_to: u64,
+    /// CRC of the last input picture written to the trace, per input.
+    trace_input_crc: [Option<u32>; 4],
     diag_outputs: String,
     /// Show the switcher's interface over Preview when it asks to
     /// (`USERON`, the Toaster's "preview overlay" for one-monitor setups).
@@ -713,6 +807,27 @@ impl Toaster {
     /// monitor). Off by default: the interface has a window of its own.
     pub fn set_preview_overlay(&mut self, on: bool) {
         self.card().preview_overlay = on;
+    }
+
+    /// Stream the Program output live to `url` (`[video_slot] stream`),
+    /// through ffmpeg, from the first frame the switcher makes.
+    pub fn set_program_stream(&mut self, url: Option<String>, args: Option<String>, audio: bool) {
+        if let Some(u) = &url {
+            log::info!(
+                "toaster: Program will stream to {u}{}",
+                if audio { " with sound" } else { "" }
+            );
+        }
+        self.card().video.set_program_stream(url, args, audio);
+    }
+
+    /// Model the original (1990) card's input wiring instead of the
+    /// 4000's (`[video_slot] generation = "original"`).
+    pub fn set_original_card(&mut self, on: bool) {
+        ECS_WIRING.store(on, std::sync::atomic::Ordering::Relaxed);
+        if on {
+            log::info!("toaster: original-card (ECS) input wiring selected");
+        }
     }
 
     /// One framestore byte.
@@ -852,8 +967,10 @@ impl Card {
         Self {
             frame_store: FrameStore::new(),
             pending_grab: [None, None],
+            last_recorded: [None, None],
             video: video::Video::new(media_root),
             record_lines: 0,
+            abse_fields: 0,
             elh,
             active: false,
             stats: Stats::default(),
@@ -861,6 +978,40 @@ impl Card {
             diag_lines_logged: 0,
             diag_fields: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER")
                 .is_some_and(|v| v == "fields"),
+            diag_dump_at: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER_DUMP")
+                .map(|v| {
+                    v.to_string_lossy()
+                        .split(',')
+                        .filter_map(|f| f.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            diag_wlog_from: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER_WLOG")
+                .and_then(|v| v.to_string_lossy().trim().parse().ok())
+                .unwrap_or(0),
+            diag_recording: false,
+            trace_from: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER_TRACE_FROM")
+                .and_then(|v| v.to_string_lossy().trim().parse().ok())
+                .unwrap_or(0),
+            trace_to: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER_TRACE_TO")
+                .and_then(|v| v.to_string_lossy().trim().parse().ok())
+                .unwrap_or(u64::MAX),
+            trace_input_crc: [None; 4],
+            trace: crate::envcfg::var_os("COPPERLINE_DIAG_TOASTER_TRACE").and_then(|path| {
+                let file = match std::fs::File::create(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::warn!("toaster: trace {}: {e}", path.to_string_lossy());
+                        return None;
+                    }
+                };
+                log::info!("toaster: tracing fields to {}", path.to_string_lossy());
+                Some(flate2::write::GzEncoder::new(
+                    std::io::BufWriter::new(file),
+                    flate2::Compression::fast(),
+                ))
+            }),
+            trace_header: false,
             diag_outputs: String::new(),
             preview_overlay: false,
             dve: dve::DveMap::empty(),
@@ -930,7 +1081,9 @@ impl Card {
         if let Some(pic) = self.pending_grab[bank & 1].take() {
             let timer = perf::start();
             video::Video::grab(&mut self.frame_store, bank, &pic);
-            self.video.give_back(pic);
+            if let Some(old) = self.last_recorded[bank & 1].replace(pic) {
+                self.video.give_back(old);
+            }
             self.stats.grabs_encoded += 1;
             timer.stop(perf::GRAB_ENCODE);
         }
@@ -939,6 +1092,18 @@ impl Card {
     /// Bank a write goes to: EH0 `OBR`.
     fn write_bank(&self) -> usize {
         usize::from(self.elh[ELH_EH0].r & EH0R_OBR != 0)
+    }
+
+    /// Bank the digitiser records into. The 4000 card records into the
+    /// `OBR` bank; the original card feeds the play/read bank (2.0's
+    /// freeze keeps `OBR` set and then saves the frozen frame through reads
+    /// that keep `OBR` set too, which the self-test ties to bank 0).
+    fn record_bank(&self) -> usize {
+        if ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed) {
+            self.read_bank()
+        } else {
+            self.write_bank()
+        }
     }
 
     /// Bank a read comes from: the switcher sets `OBR` for bank 0.
@@ -989,6 +1154,10 @@ impl Card {
         let bank = self.write_bank();
         self.settle(bank);
         self.video.invalidate(bank);
+        // Amiga data now differs from what the digitiser last gave.
+        if let Some(old) = self.last_recorded[bank].take() {
+            self.video.give_back(old);
+        }
         let x0 = Self::pixel0_column(field);
         let step = field.canvas_scale as i64;
         // The second pass of a zipper write (LUST clear) lands 16 samples
@@ -996,6 +1165,8 @@ impl Card {
         // pixels left of the bitmap stay out of the picture.
         let shift = if self.regs().lust() { 0 } else { ZIPPER_SHIFT };
         let store = self.frame_store.line_mut(bank, complemented, line);
+        let mut stored = 0usize;
+        let mut sampled: [u8; 16] = [0xFF; 16];
         for (p, byte) in store.iter_mut().enumerate() {
             let Some(src) = p.checked_sub(shift) else {
                 continue;
@@ -1010,6 +1181,10 @@ impl Card {
                 break;
             };
             let v = lines_of(pixel);
+            if (360..376).contains(&p) {
+                sampled[p - 360] = v;
+            }
+            stored += 1;
             *byte = if high_nibble {
                 (*byte & 0x0F) | (v << 4)
             } else {
@@ -1018,12 +1193,138 @@ impl Card {
         }
         self.stats.write_lines += 1;
         timer.stop(perf::WRITE_LINES);
-        if self.diag && self.diag_lines_logged < 400 {
+        if self.diag && self.stats.fields >= self.diag_wlog_from && self.diag_lines_logged < 40000 {
             self.diag_lines_logged += 1;
-            let bytes: Vec<u8> = self.frame_store.line(bank, complemented, line)[8..56].to_vec();
+            let bytes: Vec<u8> = self.frame_store.line(bank, complemented, line)[360..376].to_vec();
+            let raw: Vec<u32> = (360..364)
+                .filter_map(|p| usize::try_from(x0 + (p as i64 - shift as i64) * step).ok())
+                .filter_map(|col| row.get(col).copied())
+                .collect();
             log::info!(
-                "toaster: write vpos={vpos} line={line} hi={high_nibble} comp={complemented} bank={bank} pixels 8.. {bytes:02X?}"
+                "toaster: write vpos={vpos} line={line} hi={high_nibble} comp={complemented} bank={bank} x0={x0} shift={shift} step={step} rowlen={} stored={stored} nibbles {sampled:X?} raw {raw:08X?} pixels 8.. {bytes:02X?}",
+                row.len()
             );
+        }
+    }
+
+    /// The trace's writer, after its header. The header is written at the
+    /// first record rather than when the card is made, so that it carries
+    /// the generation (`set_original_card`), which is set afterwards.
+    fn trace_writer(&mut self) -> Option<&mut TraceWriter> {
+        use std::io::Write;
+        let w = self.trace.as_mut()?;
+        if !self.trace_header {
+            self.trace_header = true;
+            let ecs = ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = w.write_all(b"TCTR");
+            let _ = w.write_all(&2u16.to_le_bytes());
+            let _ = w.write_all(&(LINE_PIXELS as u16).to_le_bytes());
+            let _ = w.write_all(&[u8::from(ecs)]);
+        }
+        Some(w)
+    }
+
+    /// Trace: an input picture as a Vid mux delivered it, when it differs from the last one traced.
+    fn trace_input(&mut self, n: usize, pic: &[u32]) {
+        use std::io::Write;
+        let mut c = Crc32::new();
+        for px in pic {
+            c.update(&px.to_le_bytes());
+        }
+        let crc = c.finish();
+        if self.trace_input_crc[n & 3] == Some(crc) {
+            return;
+        }
+        self.trace_input_crc[n & 3] = Some(crc);
+        let f = self.stats.fields as u32;
+        let Some(w) = self.trace_writer() else {
+            return;
+        };
+        let _ = w.write_all(b"I");
+        let _ = w.write_all(&f.to_le_bytes());
+        let _ = w.write_all(&[n as u8]);
+        let _ = w.write_all(&(pic.len() as u32).to_le_bytes());
+        for px in pic {
+            let _ = w.write_all(&px.to_le_bytes());
+        }
+    }
+
+    fn trace_in_window(&self) -> bool {
+        self.stats.fields >= self.trace_from && self.stats.fields <= self.trace_to
+    }
+
+    /// Trace: one line's header and its samples as the card's four lines see them.
+    fn trace_line(&mut self, field: &FieldPixels<'_>, vpos: u32, header: Header) {
+        use std::io::Write;
+        let Some(row) = field.row(vpos) else {
+            return;
+        };
+        let x0 = Self::pixel0_column(field);
+        let step = field.canvas_scale as i64;
+        let mut packed = [0u8; LINE_PIXELS * 4];
+        for p in 0..LINE_PIXELS {
+            let px = usize::try_from(x0 + p as i64 * step)
+                .ok()
+                .and_then(|col| row.get(col))
+                .copied()
+                .unwrap_or(0);
+            packed[p * 4..p * 4 + 4].copy_from_slice(&px.to_le_bytes());
+        }
+        let f = self.stats.fields as u32;
+        let Some(w) = self.trace_writer() else {
+            return;
+        };
+        let _ = w.write_all(b"L");
+        let _ = w.write_all(&f.to_le_bytes());
+        let _ = w.write_all(&(vpos as u16).to_le_bytes());
+        for v in [header.r, header.g, header.b, header.i] {
+            let _ = w.write_all(&v.to_le_bytes());
+        }
+        let _ = w.write_all(&(LINE_PIXELS as u16).to_le_bytes());
+        let _ = w.write_all(&packed);
+    }
+
+    /// Trace: CRCs of the composed outputs and of both banks after this frame.
+    fn trace_outputs(&mut self, program: &[u32], preview: &[u32]) {
+        use std::io::Write;
+        let n = video::PICTURE_W * video::PICTURE_H;
+        let crc_pic = |pic: &[u32]| {
+            let mut c = Crc32::new();
+            for px in pic.iter().take(n) {
+                c.update(&px.to_le_bytes());
+            }
+            c.finish()
+        };
+        let cp = crc_pic(program);
+        let cv = crc_pic(preview);
+        self.settle(0);
+        self.settle(1);
+        let mut bank_crcs = [0u32; 4];
+        for (k, (bank, comp)) in [(0, false), (0, true), (1, false), (1, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut c = Crc32::new();
+            for line in 0..LINES {
+                c.update(self.frame_store.line(bank, comp, line));
+            }
+            bank_crcs[k] = c.finish();
+        }
+        let f = self.stats.fields as u32;
+        let Some(w) = self.trace_writer() else {
+            return;
+        };
+        let _ = w.write_all(b"O");
+        let _ = w.write_all(&f.to_le_bytes());
+        for v in [
+            cp,
+            cv,
+            bank_crcs[0],
+            bank_crcs[1],
+            bank_crcs[2],
+            bank_crcs[3],
+        ] {
+            let _ = w.write_all(&v.to_le_bytes());
         }
     }
 
@@ -1050,6 +1351,19 @@ impl Card {
                 }
                 self.elh[index] = header;
                 self.stats.elh_lines += 1;
+                if self.trace.is_some() && self.trace_in_window() {
+                    use std::io::Write;
+                    let f = self.stats.fields as u32;
+                    let Some(w) = self.trace_writer() else {
+                        unreachable!("the trace is open");
+                    };
+                    let _ = w.write_all(b"E");
+                    let _ = w.write_all(&f.to_le_bytes());
+                    let _ = w.write_all(&[index as u8]);
+                    for v in [header.r, header.g, header.b, header.i] {
+                        let _ = w.write_all(&v.to_le_bytes());
+                    }
+                }
             }
             // `G` bit 15 is CERB, "record this line". In write mode (EH0
             // WERB set, ABSE clear) what is recorded is the Amiga's data on
@@ -1115,6 +1429,13 @@ impl Card {
         // field in forty.
         let dump = self.diag_fields && self.active && self.stats.fields.is_multiple_of(40);
         let scan = perf::start();
+        // Per-field summary (COPPERLINE_DIAG_TOASTER=fields): header kinds
+        // and the write line range, one line per field that carries any
+        // write or extended header.
+        let mut sum = [0u32; 4];
+        let mut wmin = usize::MAX;
+        let mut wmax = 0usize;
+        let mut spr1_zero = 0u32;
         for row in 0..field.rows {
             let vpos = field.visible_start_vpos + row as u32;
             if vpos < first_unscanned {
@@ -1123,6 +1444,24 @@ impl Card {
             let Some(header) = Self::header(field, vpos) else {
                 continue;
             };
+            if self.trace.is_some() && self.trace_in_window() {
+                self.trace_line(field, vpos, header);
+            }
+            if self.diag_fields {
+                match header.kind() {
+                    LineKind::Elh { .. } => sum[0] += 1,
+                    LineKind::Dummy => sum[1] += 1,
+                    LineKind::Write { line, .. } => {
+                        sum[2] += 1;
+                        wmin = wmin.min(line);
+                        wmax = wmax.max(line);
+                    }
+                    LineKind::Read { .. } => sum[3] += 1,
+                }
+                if header.b == 0 && header.i == 0 && header.r != 0 {
+                    spr1_zero += 1;
+                }
+            }
             if dump {
                 log::info!(
                     "toaster: field {} line {vpos}: R={:04X} G={:04X} B={:04X} I={:04X} {:?}",
@@ -1135,6 +1474,29 @@ impl Card {
                 );
             }
             self.take_line(field, vpos, header);
+        }
+        if self.diag_fields && (sum[0] > 0 || sum[2] > 0) {
+            log::info!(
+                "toaster: field {} summary: elh={} dummy={} write={} read={} wlines={}-{} spr1zero={} rows={} start={} wmode={} obr={} eh0=R{:04X}/G{:04X}/B{:04X}/I{:04X} wbank={} rbank={}",
+                self.stats.fields,
+                sum[0],
+                sum[1],
+                sum[2],
+                sum[3],
+                wmin,
+                wmax,
+                spr1_zero,
+                field.rows,
+                field.visible_start_vpos,
+                self.regs().write_mode(),
+                self.regs().obr(),
+                self.elh[ELH_EH0].r,
+                self.elh[ELH_EH0].g,
+                self.elh[ELH_EH0].b,
+                self.elh[ELH_EH0].i,
+                self.write_bank(),
+                self.read_bank()
+            );
         }
         scan.stop(perf::HEADER_SCAN);
         // A field with CERB lines outside a framestore write digitised the
@@ -1157,10 +1519,21 @@ impl Card {
             outputs.stop(perf::OUTPUTS);
         }
         if record {
+            if self.diag_fields && !self.diag_recording {
+                log::info!(
+                    "toaster: field {} record: IS={:?} into bank {} (abse={} werb={})",
+                    self.stats.fields,
+                    self.regs().is(),
+                    self.record_bank(),
+                    self.regs().abse(),
+                    self.regs().werb()
+                );
+            }
             let rec = perf::start();
             self.record_input(field);
             rec.stop(perf::RECORD_INPUT);
         }
+        self.diag_recording = record;
         timer.stop(perf::FIELD_COMPLETE);
         if perf::on() && self.stats.fields.is_multiple_of(60) {
             let flyer = self
@@ -1411,6 +1784,9 @@ impl Card {
                 if !self.input_into(n, out) {
                     out.fill(video::black());
                 }
+                if self.trace.is_some() && self.trace_in_window() {
+                    self.trace_input(n, out);
+                }
                 timer.stop(if flyer {
                     perf::SRC_FLYER
                 } else {
@@ -1653,6 +2029,47 @@ impl Card {
         if self.preview_overlay && self.regs().useron() {
             video::overlay_interface(field, Self::pixel0_column(field), &mut preview);
         }
+        if self.trace.is_some() && self.trace_in_window() {
+            self.trace_outputs(&program, &preview);
+        }
+        if self.diag
+            && (self.stats.fields.is_multiple_of(1200)
+                || self.diag_dump_at.contains(&self.stats.fields))
+        {
+            // Dump both banks' decoded pictures and the composed program as
+            // PPM files next to the media folder.
+            for bank in 0..BANKS {
+                self.settle(bank);
+                let pic = self
+                    .video
+                    .framestore_picture(&self.frame_store, bank, false)
+                    .to_vec();
+                let path = self
+                    .video
+                    .media_root()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(format!("diag-bank{bank}-{}.ppm", self.stats.fields));
+                let mut out =
+                    format!("P6 {} {} 255\n", video::PICTURE_W, video::PICTURE_H).into_bytes();
+                for px in &pic {
+                    let [r, g, b, _] = px.to_le_bytes();
+                    out.extend_from_slice(&[r, g, b]);
+                }
+                let _ = std::fs::write(&path, out);
+            }
+            let path = self
+                .video
+                .media_root()
+                .unwrap_or(std::path::Path::new("."))
+                .join(format!("diag-program-{}.ppm", self.stats.fields));
+            let mut out =
+                format!("P6 {} {} 255\n", video::PICTURE_W, video::PICTURE_H).into_bytes();
+            for px in program.iter().take(video::PICTURE_W * video::PICTURE_H) {
+                let [r, g, b, _] = px.to_le_bytes();
+                out.extend_from_slice(&[r, g, b]);
+            }
+            let _ = std::fs::write(&path, out);
+        }
         if self.diag {
             let r = self.regs();
             let state = format!(
@@ -1672,7 +2089,7 @@ impl Card {
                 r.obr()
             );
             if state != self.diag_outputs {
-                log::info!("toaster: outputs {state}");
+                log::info!("toaster: field {} outputs {state}", self.stats.fields);
                 self.diag_outputs = state;
             }
         }
@@ -1769,12 +2186,31 @@ impl Card {
     /// is kept, and encoded when the bank is next read (`settle`).
     fn record_input(&mut self, field: &FieldPixels<'_>) {
         let is = self.regs().is();
-        let bank = usize::from(self.regs().obr());
+        let mut bank = self.record_bank();
+        // ABSE on the 4000 card: live digitising alternates banks every
+        // colour frame (4 fields), "8 fields to flood both banks"
+        // (CookFreeze, buttons.a). 3.x's FREEZE leaves live mode and then
+        // saves the Main bus bank, which must hold the picture too.
+        if self.regs().abse() && !ECS_WIRING.load(std::sync::atomic::Ordering::Relaxed) {
+            self.abse_fields += 1;
+            if (self.abse_fields / 4) & 1 == 1 {
+                bank ^= 1;
+            }
+        } else {
+            self.abse_fields = 0;
+        }
         let mut pic = match self.pending_grab[bank].take() {
             Some(old) => old,
             None => self.video.take_picture(),
         };
         self.source_picture(is, video::Role::Is, field, &mut pic);
+        // A still input digitised again: the bank already holds it.
+        if self.pending_grab[bank].is_none()
+            && self.last_recorded[bank].as_deref() == Some(&pic[..])
+        {
+            self.video.give_back(pic);
+            return;
+        }
         self.pending_grab[bank] = Some(pic);
         self.video.invalidate(bank);
     }
@@ -2068,14 +2504,25 @@ mod tests {
         assert_eq!(card.stats.grabs_encoded, 1);
         // The other bank was not touched.
         assert_eq!(card.frame_store_byte(1, false, 1, 12), 0);
-        // A write to the bank lands over the digitised picture, as it would
-        // have had the picture been encoded at once: the written line is
-        // the Amiga's, the others the picture's.
+        // The same still digitised again is not encoded again: the bank
+        // already holds it.
         card.record_input(&line.field());
+        assert!(card.pending_grab[0].is_none());
         drop(card);
+        // A write to the bank lands over the digitised picture: the written
+        // line is the Amiga's, the others the picture's.
         write_line(&mut toaster, false, 1, &[9, 8, 7]);
         assert_eq!(toaster.frame_store_byte(0, false, 1, 12), 9);
         assert_eq!(toaster.frame_store_byte(0, false, 3, 15), n[3]);
+        assert_eq!(toaster.stats().grabs_encoded, 1);
+        // The bank no longer holds what the digitiser gave, so digitising
+        // again is kept, and the next write encodes it first, as it would
+        // have had the picture been encoded at once: the picture covers the
+        // earlier written line, the new written line lies over the picture.
+        toaster.card().record_input(&line.field());
+        write_line(&mut toaster, false, 2, &[9, 8, 7]);
+        assert_eq!(toaster.frame_store_byte(0, false, 1, 12), n[0]);
+        assert_eq!(toaster.frame_store_byte(0, false, 2, 12), 9);
         assert_eq!(toaster.stats().grabs_encoded, 2);
     }
 

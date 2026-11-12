@@ -597,6 +597,11 @@ video = "PAL"
 # media = "Amiga Toaster Files"
 # monitors = true
 # preview_overlay = false
+# generation = "4000"
+# stream = "udp://239.1.1.1:5004"
+# stream_args = ""
+# stream_audio = true
+# monitor_frame = true
 # flyer = false
 # converter = true
 

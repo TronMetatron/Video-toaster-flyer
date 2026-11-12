@@ -449,6 +449,9 @@ pub struct CardOutput {
     settings: Mutex<RecordSettings>,
     /// Recordings still being made into MP4s.
     saving: std::sync::atomic::AtomicUsize,
+    /// A stream to start on the first frame: its URL, ffmpeg arguments
+    /// and whether it carries sound.
+    auto_stream: Mutex<Option<(String, Option<String>, bool)>>,
 }
 
 /// The file a recording ends up as.
@@ -497,6 +500,198 @@ struct OutputState {
     /// The MP4 the recording becomes when it stops (it is recorded into
     /// an AVI beside it first).
     mp4: Option<std::path::PathBuf>,
+    /// A live stream of every frame, through ffmpeg.
+    streamer: Option<Streamer>,
+}
+
+/// A live stream of an output: every published frame is piped raw into an
+/// ffmpeg process that encodes it and sends it on (MPEG-TS over UDP, SRT
+/// or RIST; FLV over RTMP), with the output's sound on a second pipe when
+/// the stream carries it.
+struct Streamer {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    /// The sound's pipe to ffmpeg (a local TCP socket ffmpeg listens on),
+    /// when the stream carries sound.
+    audio: Option<std::net::TcpStream>,
+    url: String,
+    width: usize,
+    height: usize,
+    frames: u64,
+    bytes: Vec<u8>,
+    /// Fractional samples owed to the sound track.
+    audio_carry: f64,
+}
+
+impl Streamer {
+    /// ffmpeg's arguments between the raw input and the URL: a low-latency
+    /// H.264 encode at square pixels, unless `args` gives its own.
+    fn encode_args(url: &str, args: Option<&str>, aspect: f32, audio: bool) -> Vec<String> {
+        if let Some(a) = args.map(str::trim).filter(|a| !a.is_empty()) {
+            return a.split_whitespace().map(str::to_string).collect();
+        }
+        let width = ((480.0 * aspect / 2.0).round() as u32 * 2).max(2);
+        let container = if url.starts_with("rtmp") {
+            "flv"
+        } else {
+            "mpegts"
+        };
+        let scale = format!("scale={width}:480:flags=bilinear,setsar=1");
+        let sound: &[&str] = if audio {
+            &["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+        } else {
+            &["-an"]
+        };
+        [
+            "-vf",
+            scale.as_str(),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "30",
+            "-b:v",
+            "8M",
+            "-maxrate",
+            "8M",
+            "-bufsize",
+            "2M",
+        ]
+        .iter()
+        .chain(sound.iter())
+        .chain(["-f", container].iter())
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn spawn(
+        ffmpeg: &std::path::Path,
+        url: &str,
+        args: Option<&str>,
+        width: usize,
+        height: usize,
+        aspect: f32,
+        audio: bool,
+    ) -> anyhow::Result<Self> {
+        // The sound goes to ffmpeg over a local TCP socket it listens on
+        // (a second pipe; stdin carries the picture). A free port is
+        // found by binding one and letting it go.
+        let port = if audio {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .map_err(|e| anyhow::anyhow!("finding a port for the stream's sound: {e}"))?;
+            Some(l.local_addr()?.port())
+        } else {
+            None
+        };
+        let mut cmd = std::process::Command::new(ffmpeg);
+        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+        if let Some(port) = port {
+            cmd.args(["-f", "f32le", "-ac", "2", "-ar"])
+                .arg(crate::audio::MIX_SAMPLE_RATE.to_string())
+                .arg("-i")
+                .arg(format!("tcp://127.0.0.1:{port}?listen=1"));
+        }
+        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba"])
+            .arg("-video_size")
+            .arg(format!("{width}x{height}"))
+            .args(["-framerate", "30000/1001", "-i", "-"])
+            .args(Self::encode_args(url, args, aspect, audio))
+            .arg(url)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("starting ffmpeg for the stream: {e}"))?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let audio = match port {
+            None => None,
+            Some(port) => {
+                // ffmpeg opens its inputs in order, so it listens for the
+                // sound before it reads any picture; give it a moment.
+                let mut sock = None;
+                for _ in 0..300 {
+                    match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                        Ok(s) => {
+                            sock = Some(s);
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    }
+                }
+                match sock {
+                    Some(s) => {
+                        let _ = s.set_nodelay(true);
+                        Some(s)
+                    }
+                    None => {
+                        let _ = child.kill();
+                        anyhow::bail!("ffmpeg did not take the stream's sound connection");
+                    }
+                }
+            }
+        };
+        Ok(Self {
+            child,
+            stdin,
+            audio,
+            url: url.to_string(),
+            width,
+            height,
+            frames: 0,
+            bytes: Vec::with_capacity(width * height * 4),
+            audio_carry: 0.0,
+        })
+    }
+
+    /// Send one frame `seconds` long with its sound (silence without any);
+    /// `Err` once ffmpeg has gone.
+    fn push_frame(
+        &mut self,
+        pixels: &[u32],
+        seconds: f64,
+        sound: Option<&[(f32, f32)]>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(sock) = self.audio.as_mut() {
+            let owed = self.audio_carry + seconds * f64::from(crate::audio::MIX_SAMPLE_RATE);
+            let n = owed.floor() as usize;
+            self.audio_carry = owed - n as f64;
+            let samples = match sound {
+                Some(s) => resample(s, n),
+                None => vec![(0.0, 0.0); n],
+            };
+            self.bytes.clear();
+            for (l, r) in &samples {
+                self.bytes.extend_from_slice(&l.to_le_bytes());
+                self.bytes.extend_from_slice(&r.to_le_bytes());
+            }
+            sock.write_all(&self.bytes)?;
+        }
+        self.bytes.clear();
+        let n = self.width * self.height;
+        for px in pixels.iter().take(n) {
+            self.bytes.extend_from_slice(&px.to_le_bytes());
+        }
+        self.bytes.resize(n * 4, 0);
+        self.stdin.write_all(&self.bytes)?;
+        self.frames += 1;
+        Ok(())
+    }
+
+    fn stop(mut self) -> String {
+        drop(self.stdin);
+        if let Some(s) = self.audio.take() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        let _ = self.child.wait();
+        self.url
+    }
 }
 
 impl CardOutput {
@@ -513,7 +708,61 @@ impl CardOutput {
             state: Mutex::new(OutputState::default()),
             published: Condvar::new(),
             saving: std::sync::atomic::AtomicUsize::new(0),
+            auto_stream: Mutex::new(None),
         })
+    }
+
+    /// Stream the output to `url` from its first frame on (`[video_slot]
+    /// stream`); `args` replaces the default ffmpeg encoding arguments.
+    pub fn set_auto_stream(&self, url: Option<String>, args: Option<String>, audio: bool) {
+        *self.auto_stream.lock().unwrap_or_else(|e| e.into_inner()) = url.map(|u| (u, args, audio));
+    }
+
+    /// Start streaming the output to `url` from the next frame, with the
+    /// sound that follows the switcher when `audio`.
+    pub fn start_stream(&self, url: &str, args: Option<&str>, audio: bool) -> anyhow::Result<()> {
+        let mut st = self.state();
+        if st.width == 0 || st.height == 0 {
+            anyhow::bail!("{} has not produced a frame yet", self.name);
+        }
+        let ffmpeg = self
+            .ffmpeg()
+            .ok_or_else(|| anyhow::anyhow!("no ffmpeg found to stream {}", self.name))?;
+        if let Some(old) = st.streamer.take() {
+            old.stop();
+        }
+        st.streamer = Some(Streamer::spawn(
+            &ffmpeg,
+            url,
+            args,
+            st.width,
+            st.height,
+            self.aspect,
+            audio,
+        )?);
+        log::info!("{} streaming to {url}", self.name);
+        Ok(())
+    }
+
+    /// Stop streaming; the URL that was streamed to.
+    pub fn stop_stream(&self) -> Option<String> {
+        let s = self.state().streamer.take()?;
+        let frames = s.frames;
+        let url = s.stop();
+        log::info!(
+            "{} stream to {url} stopped after {frames} frames",
+            self.name
+        );
+        Some(url)
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.state().streamer.is_some()
+    }
+
+    /// Where the output streams to, while it does.
+    pub fn stream_url(&self) -> Option<String> {
+        self.state().streamer.as_ref().map(|s| s.url.clone())
     }
 
     /// How this output records.
@@ -577,6 +826,46 @@ impl CardOutput {
         st.pixels
             .extend_from_slice(&pixels[..(width * height).min(pixels.len())]);
         st.serial = st.serial.wrapping_add(1);
+        if st.streamer.is_none() {
+            let pending = self
+                .auto_stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some((url, args, audio)) = pending {
+                match self.ffmpeg() {
+                    Some(ffmpeg) => match Streamer::spawn(
+                        &ffmpeg,
+                        &url,
+                        args.as_deref(),
+                        width,
+                        height,
+                        self.aspect,
+                        audio,
+                    ) {
+                        Ok(s) => {
+                            log::info!("{} streaming to {url}", self.name);
+                            st.streamer = Some(s);
+                        }
+                        Err(e) => log::warn!("{} stream to {url}: {e:#}", self.name),
+                    },
+                    None => log::warn!("{}: no ffmpeg found to stream to {url}", self.name),
+                }
+            }
+        }
+        if st.streamer.is_some() {
+            let OutputState {
+                streamer, pixels, ..
+            } = &mut *st;
+            if let Some(s) = streamer.as_mut() {
+                if let Err(e) = s.push_frame(pixels, seconds, sound) {
+                    log::warn!("{} stream to {} stopped: {e}", self.name, s.url);
+                    if let Some(s) = streamer.take() {
+                        s.stop();
+                    }
+                }
+            }
+        }
         if st.recorder.is_some() {
             // The recorder times video against its audio track: the
             // frame's sound, or silence of the frame's length.
@@ -766,8 +1055,12 @@ impl CardOutput {
 
 impl Drop for CardOutput {
     fn drop(&mut self) {
-        if let Some(mut rec) = self.state().recorder.take() {
+        let mut st = self.state();
+        if let Some(mut rec) = st.recorder.take() {
             let _ = rec.finish();
+        }
+        if let Some(s) = st.streamer.take() {
+            s.stop();
         }
     }
 }

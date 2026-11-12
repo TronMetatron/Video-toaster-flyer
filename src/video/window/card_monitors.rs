@@ -95,6 +95,15 @@ impl MonitorArt {
     /// `monitor.png` in `media_root` if there is one, else the built-in
     /// one.
     pub(super) fn load(media_root: Option<&std::path::Path>, name: &str) -> Option<Arc<Self>> {
+        if !crate::toaster::MONITOR_FRAME.load(std::sync::atomic::Ordering::Relaxed) {
+            return match Self::bare() {
+                Ok(art) => Some(Arc::new(art)),
+                Err(e) => {
+                    warn!("toaster monitors: bare artwork: {e}");
+                    None
+                }
+            };
+        }
         let own = format!("monitor-{}.png", name.to_ascii_lowercase());
         for file in [own.as_str(), "monitor.png"] {
             let Some(path) = media_root.map(|r| r.join(file)) else {
@@ -130,6 +139,24 @@ impl MonitorArt {
         }
     }
 
+    /// No frame at all (`[video_slot] monitor_frame = false`): a 4:3
+    /// tube on black, with no front panel, so the window shows the bare
+    /// picture inside a thin black surround. The glass is a flat grey of
+    /// 46: bright enough for full shading, below the sheen threshold, so
+    /// the picture is shown exactly as the card made it. (The tube finder
+    /// wants the glass to be less than nine tenths of the artwork.)
+    fn bare() -> Result<Self, String> {
+        let (w, h) = (640usize, 480usize);
+        let (mx, my) = (32usize, 24usize);
+        let mut rgba = vec![rgba_u32(0, 0, 0); w * h];
+        for y in my..h - my {
+            for x in mx..w - mx {
+                rgba[y * w + x] = rgba_u32(46, 46, 46);
+            }
+        }
+        Self::from_rgba(rgba, w, h)
+    }
+
     fn decode(bytes: &[u8]) -> Result<Self, String> {
         let img = image::load_from_memory(bytes)
             .map_err(|e| e.to_string())?
@@ -140,6 +167,10 @@ impl MonitorArt {
             .chunks_exact(4)
             .map(|p| rgba_u32(p[0], p[1], p[2]))
             .collect();
+        Self::from_rgba(rgba, w, h)
+    }
+
+    fn from_rgba(rgba: Vec<u32>, w: usize, h: usize) -> Result<Self, String> {
         let (mask, screen) = find_glass(&rgba, w, h).ok_or("no tube face found in the artwork")?;
         let glass = rgba
             .iter()

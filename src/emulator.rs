@@ -4654,6 +4654,16 @@ fn build_machine_inner(
             .unwrap_or_else(crate::paths::toaster_files_dir);
         let mut card = crate::toaster::Toaster::with_media(Some(media));
         card.set_preview_overlay(cfg.video_slot_preview_overlay);
+        card.set_original_card(cfg.video_slot_original_card);
+        card.set_program_stream(
+            cfg.video_slot_stream.clone(),
+            cfg.video_slot_stream_args.clone(),
+            cfg.video_slot_stream_audio,
+        );
+        crate::toaster::MONITOR_FRAME.store(
+            cfg.video_slot_monitor_frame,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(link) = flyer_link {
             card.set_flyer_link(link);
         }
